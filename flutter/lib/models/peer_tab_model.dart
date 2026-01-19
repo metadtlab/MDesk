@@ -23,8 +23,9 @@ class PeerTabModel with ChangeNotifier {
   WeakReference<FFI> parent;
   int get currentTab => _currentTab;
   int _currentTab = 0; // index in tabNames
-  static const int maxTabCount = 6;
+  static const int maxTabCount = 7;
   static const List<String> tabNames = [
+    'Tree View', // 팀뷰어 스타일 트리뷰
     'Recent sessions',
     'Favorites',
     'Discovered',
@@ -33,6 +34,7 @@ class PeerTabModel with ChangeNotifier {
     'Custom Remote', // 사용자 정의 원격
   ];
   static const List<IconData> icons = [
+    Icons.account_tree, // 트리뷰 아이콘
     Icons.access_time_filled,
     Icons.star,
     Icons.explore,
@@ -41,11 +43,12 @@ class PeerTabModel with ChangeNotifier {
     Icons.settings_remote, // 사용자 정의 원격 아이콘
   ];
   List<bool> get isEnabled => [
-        true,
-        true,
+        true, // Tree View - 항상 활성화
+        false, // Recent sessions - 숨김
+        false, // Favorites - 숨김
         !isWeb && bind.mainGetLocalOption(key: "disable-discovery-panel") != "Y",
-        !(bind.isDisableAb() || bind.isDisableAccount()),
-        !(bind.isDisableGroupPanel() || bind.isDisableAccount()),
+        false, // Address book - 숨김
+        false, // Accessible devices - 숨김
         !bind.isDisableAccount(), // Custom Remote - 로그인 시 활성화 (멤버십 체크는 내부 뷰에서 수행)
       ];
   final List<bool> _isVisible = List.filled(maxTabCount, true, growable: false);

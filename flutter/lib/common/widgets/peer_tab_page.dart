@@ -9,6 +9,7 @@ import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/common/widgets/my_group.dart';
 import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/common/widgets/peer_card.dart';
+import 'package:flutter_hbb/common/widgets/peer_tree_view.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
 import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
@@ -46,6 +47,9 @@ EdgeInsets? _menuPadding() {
 class _PeerTabPageState extends State<PeerTabPage>
     with SingleTickerProviderStateMixin {
   final List<_TabEntry> entries = [
+    _TabEntry(PeerTreeView(
+      menuPadding: _menuPadding(),
+    )),
     _TabEntry(RecentPeersView(
       menuPadding: _menuPadding(),
     )),
@@ -89,23 +93,30 @@ class _PeerTabPageState extends State<PeerTabPage>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_hasAgentIdInFilename()) {
         debugPrint('PeerTabPage: agentid detected, switching to Custom Remote tab');
-        gFFI.peerTabModel.setCurrentTab(5); // Custom Remote tab index
+        gFFI.peerTabModel.setCurrentTab(6); // Custom Remote tab index (트리뷰 추가로 인덱스 변경)
       }
     });
   }
 
-  /// 파일명에서 agentid가 있는지 확인
+  /// 파일명에서 포터블 모드 인자가 있는지 확인
+  /// (단순히 'portable' 키워드만 있으면 포터블 모드 아님)
   bool _hasAgentIdInFilename() {
     try {
       // 환경변수 우선 확인
       final envName = Platform.environment['MDESK_APPNAME'] ?? 
                       Platform.environment['RUSTDESK_APPNAME'] ?? '';
-      if (envName.toLowerCase().contains('agentid=')) {
+      final envLower = envName.toLowerCase();
+      if (envLower.contains('agentid=') || 
+          envLower.contains('id=') || 
+          envLower.contains('certno=')) {
         return true;
       }
       // 실행 파일명 확인
       final filename = Platform.resolvedExecutable.split(Platform.isWindows ? '\\' : '/').last;
-      return filename.toLowerCase().contains('agentid=');
+      final filenameLower = filename.toLowerCase();
+      return filenameLower.contains('agentid=') || 
+             filenameLower.contains('id=') || 
+             filenameLower.contains('certno=');
     } catch (e) {
       return false;
     }
@@ -141,33 +152,50 @@ class _PeerTabPageState extends State<PeerTabPage>
       return model.multiSelectionMode ? createMultiSelectionBar(model) : widget;
     }
 
-    return Column(
-      textBaseline: TextBaseline.ideographic,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Obx(() => SizedBox(
-              height: 32,
-              child: Container(
-                padding: stateGlobal.isPortrait.isTrue
-                    ? EdgeInsets.symmetric(horizontal: 2)
-                    : null,
-                child: selectionWrap(Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    Expanded(
-                        child: visibleContextMenuListener(
-                            _createSwitchBar(context))),
-                    if (stateGlobal.isPortrait.isTrue)
-                      ..._portraitRightActions(context)
-                    else
-                      ..._landscapeRightActions(context)
-                  ],
-                )),
+    return Obx(() {
+      final isLoggedIn = gFFI.userModel.isLogin;
+      return Column(
+        textBaseline: TextBaseline.ideographic,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Obx(() => Opacity(
+                opacity: isLoggedIn ? 1.0 : 0.5,
+                child: IgnorePointer(
+                  ignoring: !isLoggedIn,
+                  child: SizedBox(
+                    height: 32,
+                    child: Container(
+                      padding: stateGlobal.isPortrait.isTrue
+                          ? EdgeInsets.symmetric(horizontal: 2)
+                          : null,
+                      child: selectionWrap(Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          Expanded(
+                              child: visibleContextMenuListener(
+                                  _createSwitchBar(context))),
+                          if (stateGlobal.isPortrait.isTrue)
+                            ..._portraitRightActions(context)
+                          else
+                            ..._landscapeRightActions(context)
+                        ],
+                      )),
+                    ),
+                  ).paddingOnly(right: stateGlobal.isPortrait.isTrue ? 0 : 12),
+                ),
+              )),
+          Expanded(
+            child: Opacity(
+              opacity: isLoggedIn ? 1.0 : 0.5,
+              child: IgnorePointer(
+                ignoring: !isLoggedIn,
+                child: _createPeersViewContent(),
               ),
-            ).paddingOnly(right: stateGlobal.isPortrait.isTrue ? 0 : 12)),
-        _createPeersView(),
-      ],
-    );
+            ),
+          ),
+        ],
+      );
+    });
   }
 
   Widget _createSwitchBar(BuildContext context) {
@@ -242,6 +270,28 @@ class _PeerTabPageState extends State<PeerTabPage>
     return Expanded(
         child: child.marginSymmetric(
             vertical: (isDesktop || isWebDesktop) ? 12.0 : 6.0));
+  }
+
+  Widget _createPeersViewContent() {
+    final model = Provider.of<PeerTabModel>(context);
+    Widget child;
+    if (model.visibleEnabledOrderedIndexs.isEmpty) {
+      child = visibleContextMenuListener(Row(
+        children: [Expanded(child: InkWell())],
+      ));
+    } else {
+      if (model.visibleEnabledOrderedIndexs.contains(model.currentTab)) {
+        child = entries[model.currentTab].widget;
+      } else {
+        debugPrint("should not happen! currentTab not in visibleIndexs");
+        Future.delayed(Duration.zero, () {
+          model.setCurrentTab(model.visibleEnabledOrderedIndexs[0]);
+        });
+        child = entries[0].widget;
+      }
+    }
+    return child.marginSymmetric(
+        vertical: (isDesktop || isWebDesktop) ? 12.0 : 6.0);
   }
 
   Widget _createRefresh(

@@ -115,10 +115,80 @@ pub fn global_init() -> bool {
             crate::server::wayland::init();
         }
     }
+    
+    // 포터블 모드에서 시작 시 고정 비밀번호 삭제
+    #[cfg(windows)]
+    {
+        if is_running_portable() {
+            clear_permanent_password_on_start();
+        }
+        // 관리자 권한이 있을 때만 방화벽 규칙 자동 추가
+        if crate::platform::windows::is_elevated(None).unwrap_or(false) {
+            crate::platform::windows::try_add_firewall_rule_on_first_run();
+        }
+    }
+    
     true
 }
 
-pub fn global_clean() {}
+/// 포터블 모드에서 시작 시 고정 비밀번호 삭제
+#[cfg(windows)]
+fn clear_permanent_password_on_start() {
+    // 고정 비밀번호가 설정되어 있으면 삭제
+    let password = config::Config::get_permanent_password();
+    if !password.is_empty() {
+        log::info!("Portable mode: Clearing permanent password on start");
+        config::Config::set_permanent_password("");
+    }
+}
+
+/// 포터블 모드에서 설정 파일 삭제 (수동 호출용)
+/// UI에서 종료 버튼 클릭 시 호출
+#[cfg(windows)]
+pub fn cleanup_portable_config() {
+    if is_running_portable() {
+        config::Config::cleanup_config_files();
+    }
+}
+
+/// 현재 실행 파일이 포터블 모드인지 확인
+#[cfg(windows)]
+pub fn is_running_portable() -> bool {
+    // 현재 실행 파일 경로 가져오기
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_lowercase(),
+        Err(_) => return true, // 경로를 알 수 없으면 포터블로 간주
+    };
+    
+    // 설치 경로 확인
+    let install_path = {
+        let mut pf = "c:\\program files".to_owned();
+        if let Ok(x) = std::env::var("ProgramFiles") {
+            pf = x.to_lowercase();
+        }
+        format!("{}\\{}\\", pf, crate::get_app_name().to_lowercase())
+    };
+    
+    // 현재 실행 파일이 설치 경로에 있지 않으면 포터블 모드
+    !current_exe.starts_with(&install_path)
+}
+
+#[cfg(not(windows))]
+pub fn is_running_portable() -> bool {
+    !crate::platform::is_installed()
+}
+
+pub fn global_clean() {
+    // 포터블 모드에서 설정 파일 삭제
+    // 주의: 이 기능은 현재 비활성화됨 (실행 문제 방지)
+    // 수동 삭제는 cleanup_portable_config() 함수 사용
+    // #[cfg(windows)]
+    // {
+    //     if is_running_portable() {
+    //         config::Config::cleanup_config_files();
+    //     }
+    // }
+}
 
 #[inline]
 pub fn set_server_running(b: bool) {
@@ -1003,7 +1073,7 @@ pub fn get_custom_rendezvous_server(custom: String) -> String {
         return config::PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
     }
     // 기본 ID 서버 (Rendezvous 서버) 하드코딩
-    "222.239.231.91".to_owned()
+    "mdesk.imedixerp.co.kr".to_owned()
 }
 
 #[inline]
@@ -1081,10 +1151,14 @@ pub fn get_local_option(key: &str) -> String {
 
 pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
     let url = get_api_server(api, custom);
+    log::debug!("get_audit_server: api_server={}, typ={}", url, typ);
     if url.is_empty() || is_public(&url) {
+        log::debug!("Audit server skipped (empty or public URL)");
         return "".to_owned();
     }
-    format!("{}/api/audit/{}", url, typ)
+    let audit_url = format!("{}/api/audit/{}", url, typ);
+    log::debug!("Audit server URL: {}", audit_url);
+    audit_url
 }
 
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
@@ -1193,6 +1267,47 @@ async fn post_request_(
 #[tokio::main(flavor = "current_thread")]
 pub async fn post_request_sync(url: String, body: String, header: &str) -> ResultType<String> {
     post_request(url, body, header).await
+}
+
+// 간단한 GET 요청 함수 (agentclose API 등에 사용)
+pub fn get_request_fire_and_forget(url: String) {
+    tokio::spawn(async move {
+        let proxy_conf = Config::get_socks();
+        let tls_url = get_url_for_tls(&url, &proxy_conf);
+        let mut tls_type = get_cached_tls_type(tls_url.clone());
+        let mut danger_accept = get_cached_tls_accept_invalid_cert(tls_url.clone());
+        
+        // 최대 2번 재시도 (rustls 실패 시 native-tls, invalid cert 허용)
+        for attempt in 0..2 {
+            let client = create_http_client_async(
+                tls_type.unwrap_or(TlsType::Rustls),
+                danger_accept.unwrap_or(false),
+            );
+            
+            match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+                Ok(resp) => {
+                    log::info!("[MDesk] agentclose API success: {} - status: {}", url, resp.status());
+                    return;
+                }
+                Err(e) => {
+                    if attempt == 0 && e.is_request() {
+                        // 첫 번째 시도 실패 시 invalid cert 허용으로 재시도
+                        log::debug!("[MDesk] GET request failed, retrying with invalid cert allowed: {}", e);
+                        danger_accept = Some(true);
+                        continue;
+                    } else if attempt == 0 {
+                        // TLS 타입 문제일 수 있음
+                        log::debug!("[MDesk] GET request failed, retrying with native-tls: {}", e);
+                        tls_type = Some(TlsType::NativeTls);
+                        continue;
+                    } else {
+                        log::warn!("[MDesk] GET request failed after retries: {} - {}", url, e);
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[async_recursion]

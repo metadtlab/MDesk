@@ -892,7 +892,17 @@ class FfiModel with ChangeNotifier {
     } else if (type == 'elevation-error') {
       showElevationError(sessionId, type, title, text, dialogManager);
     } else if (type == 'relay-hint' || type == 'relay-hint2') {
-      showRelayHintDialog(sessionId, type, title, text, dialogManager, peerId);
+      // 직접 연결 실패 시 팝업 없이 자동으로 릴레이 연결 시도
+      debugPrint('Direct connection failed, auto-switching to relay...');
+      dialogManager.dismissAll();
+      // 릴레이 연결 안내 메시지 표시 (2.5초)
+      showToast('직접 연결 실패, 릴레이 연결로 진행합니다...', timeout: const Duration(milliseconds: 2500));
+      dialogManager.showLoading(translate('Connecting via relay...'),
+          onCancel: closeConnection);
+      // 2.5초 후 릴레이 연결 시도
+      Future.delayed(const Duration(milliseconds: 2500), () {
+        reconnect(dialogManager, sessionId, true);  // forceRelay: true
+      });
     } else if (text == kMsgboxTextWaitingForImage) {
       showConnectedWaitingForImage(dialogManager, sessionId, type, title, text);
     } else if (title == 'Privacy mode') {

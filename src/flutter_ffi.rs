@@ -1016,6 +1016,39 @@ pub fn main_set_options(json: String) {
     }
 }
 
+/// 등록된 원격자 목록 조회 (JSON)
+pub fn main_get_remote_users() -> String {
+    hbb_common::config::Config2::get_remote_users_json()
+}
+
+/// 원격자 추가
+pub fn main_add_remote_user(id: String, name: String, connection_password: String) {
+    hbb_common::config::Config2::add_remote_user(hbb_common::config::RemoteUser {
+        id,
+        name,
+        connection_password,
+    });
+}
+
+/// 원격자 업데이트
+pub fn main_update_remote_user(id: String, name: String, connection_password: String) {
+    hbb_common::config::Config2::update_remote_user(hbb_common::config::RemoteUser {
+        id,
+        name,
+        connection_password,
+    });
+}
+
+/// 원격자 삭제
+pub fn main_remove_remote_user(id: String) {
+    hbb_common::config::Config2::remove_remote_user(&id);
+}
+
+/// 원격자 인증 확인
+pub fn main_verify_remote_user(id: String, connection_password: String) -> bool {
+    hbb_common::config::Config2::verify_remote_user(&id, &connection_password)
+}
+
 pub fn main_test_if_valid_server(server: String, test_with_proxy: bool) -> String {
     test_if_valid_server(server, test_with_proxy)
 }
@@ -2091,6 +2124,18 @@ pub fn main_is_installed() -> SyncReturn<bool> {
     SyncReturn(is_installed())
 }
 
+/// 포터블 모드에서 실행 중인지 확인
+pub fn main_is_portable() -> SyncReturn<bool> {
+    SyncReturn(crate::is_running_portable())
+}
+
+/// 포터블 모드에서 설정 파일 삭제
+pub fn main_cleanup_portable_config() -> SyncReturn<()> {
+    #[cfg(windows)]
+    crate::cleanup_portable_config();
+    SyncReturn(())
+}
+
 pub fn main_init_input_source() -> SyncReturn<()> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     crate::keyboard::input_source::init_input_source();
@@ -2771,6 +2816,70 @@ pub fn main_set_common(_key: String, _value: String) {
         crate::hbbs_http::downloader::remove(&_value);
     } else if _key == "cancel-downloader" {
         crate::hbbs_http::downloader::cancel(&_value);
+    }
+}
+
+/// 원격 기기를 API 서버에 등록
+/// 
+/// # Arguments
+/// * `user_id` - 로그인된 유저 ID (username)
+/// * `user_pkid` - 유저 고유 번호
+/// * `remote_id` - 원격 ID (peer ID)
+/// * `alias` - 사용자 지정 별칭
+/// 
+/// # Returns
+/// * JSON 형식의 응답 문자열
+pub fn main_register_device(
+    user_id: String,
+    user_pkid: String,
+    remote_id: String,
+    alias: String,
+) -> String {
+    match crate::hbbs_http::device_register::register_device(
+        &user_id,
+        &user_pkid,
+        &remote_id,
+        &alias,
+    ) {
+        Ok(response) => {
+            serde_json::to_string(&response).unwrap_or_else(|e| {
+                format!(r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}"}}"#, e)
+            })
+        }
+        Err(e) => {
+            format!(r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}"}}"#, e)
+        }
+    }
+}
+
+/// 기기 등록 해제
+pub fn main_unregister_device(
+    user_pkid: String,
+    remote_id: String,
+) -> String {
+    match crate::hbbs_http::device_register::unregister_device(&user_pkid, &remote_id) {
+        Ok(response) => {
+            serde_json::to_string(&response).unwrap_or_else(|e| {
+                format!(r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}"}}"#, e)
+            })
+        }
+        Err(e) => {
+            format!(r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}"}}"#, e)
+        }
+    }
+}
+
+/// 등록된 기기 목록 조회
+pub fn main_get_registered_devices(user_pkid: String) -> String {
+    match crate::hbbs_http::device_register::get_registered_devices(&user_pkid) {
+        Ok(response) => {
+            serde_json::to_string(&response).unwrap_or_else(|e| {
+                format!(r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}","data":[]}}"#, e)
+            })
+        }
+        Err(e) => {
+            format!(r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}","data":[]}}"#, e)
+        }
     }
 }
 

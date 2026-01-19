@@ -1,7 +1,7 @@
 use hbb_common::{
     anyhow::anyhow,
     bail,
-    config::Config,
+    config::{self, Config},
     get_time,
     password_security::{decrypt_vec_or_original, encrypt_vec_or_original},
     ResultType,
@@ -14,8 +14,11 @@ lazy_static::lazy_static! {
     static ref CURRENT_2FA: Mutex<Option<(TOTPInfo, TOTP)>> = Mutex::new(None);
 }
 
-const ISSUER: &str = "RustDesk";
 const TAG_LOGIN: &str = "Connection";
+
+fn get_issuer() -> String {
+    config::APP_NAME.read().unwrap().clone()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TOTPInfo {
@@ -27,13 +30,14 @@ pub struct TOTPInfo {
 
 impl TOTPInfo {
     fn new_totp(&self) -> ResultType<TOTP> {
+        let issuer = get_issuer();
         let totp = TOTP::new(
             Algorithm::SHA1,
             self.digits,
             1,
             30,
             self.secret.clone(),
-            Some(format!("{} {}", ISSUER, TAG_LOGIN)),
+            Some(format!("{} {}", issuer, TAG_LOGIN)),
             self.name.clone(),
         )?;
         Ok(totp)

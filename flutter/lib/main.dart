@@ -38,7 +38,9 @@ int? kWindowId;
 WindowType? kWindowType;
 late List<String> kBootArgs;
 
-/// 파일명에서 agentid가 있는지 확인
+/// 파일명에서 포터블 모드 인자가 있는지 확인
+/// agentid=, id=, certno= 파라미터가 있어야 포터블 모드로 인식
+/// (단순히 'portable' 키워드만 있으면 포터블 모드 아님)
 bool hasAgentIdInFilename() {
   try {
     // 환경변수 우선 확인 (포터블 패커에서 설정)
@@ -46,8 +48,12 @@ bool hasAgentIdInFilename() {
                     Platform.environment['RUSTDESK_APPNAME'] ?? '';
     debugPrint('hasAgentIdInFilename: MDESK_APPNAME="$envName"');
     
-    if (envName.isNotEmpty && envName.toLowerCase().contains('agentid=')) {
-      debugPrint('hasAgentIdInFilename: Found agentid in env -> TRUE');
+    final envLower = envName.toLowerCase();
+    if (envName.isNotEmpty && 
+        (envLower.contains('agentid=') || 
+         envLower.contains('id=') || 
+         envLower.contains('certno='))) {
+      debugPrint('hasAgentIdInFilename: Found portable args in env -> TRUE');
       return true;
     }
     
@@ -55,9 +61,12 @@ bool hasAgentIdInFilename() {
     final filename = Platform.resolvedExecutable.split(Platform.isWindows ? '\\' : '/').last;
     debugPrint('hasAgentIdInFilename: resolvedExecutable filename="$filename"');
     
-    final hasAgentId = filename.toLowerCase().contains('agentid=');
-    debugPrint('hasAgentIdInFilename: Result -> $hasAgentId');
-    return hasAgentId;
+    final filenameLower = filename.toLowerCase();
+    final isPortable = filenameLower.contains('agentid=') || 
+                       filenameLower.contains('id=') || 
+                       filenameLower.contains('certno=');
+    debugPrint('hasAgentIdInFilename: Result -> $isPortable');
+    return isPortable;
   } catch (e) {
     debugPrint('hasAgentIdInFilename: Error -> $e');
     return false;

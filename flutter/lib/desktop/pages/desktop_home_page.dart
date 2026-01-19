@@ -459,38 +459,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              InkWell(
-                onTap: () async {
-                  await launchUrl(Uri.parse('https://admin.787.kr'));
-                },
-                child: Text(
-                  'https://admin.787.kr',
-                  style: TextStyle(
-                    color: MyTheme.accent,
-                    fontSize: 13,
-                    decoration: TextDecoration.underline,
-                    decorationColor: MyTheme.accent,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 6),
-              InkWell(
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: 'https://admin.787.kr'));
-                  showToast(translate("Copied"));
-                },
-                child: Icon(
-                  Icons.content_copy,
-                  size: 16,
-                  color: textColor?.withOpacity(0.5),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
           Obx(() {
             final isLoggedIn = gFFI.userModel.userName.value.isNotEmpty;
             final userName = gFFI.userModel.userName.value;
@@ -505,7 +473,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // username 링크
+                  // username 링크 (접속URL 1)
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -514,7 +482,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                           await launchUrl(Uri.parse(usernameUrl));
                         },
                         child: Text(
-                          usernameUrl,
+                          '접속URL 1',
                           style: TextStyle(
                             color: MyTheme.accent,
                             fontSize: 13,
@@ -537,7 +505,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       ),
                     ],
                   ),
-                  // user_pkid 링크 (있는 경우에만)
+                  // user_pkid 링크 (접속URL 2, 있는 경우에만)
                   if (pkidUrl.isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Row(
@@ -548,7 +516,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                             await launchUrl(Uri.parse(pkidUrl));
                           },
                           child: Text(
-                            pkidUrl,
+                            '접속URL 2',
                             style: TextStyle(
                               color: MyTheme.accent,
                               fontSize: 13,
@@ -588,7 +556,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                     await launchUrl(Uri.parse(url));
                   },
                   child: Text(
-                    url,
+                    '접속URL 1',
                     style: TextStyle(
                       color: MyTheme.accent,
                       fontSize: 13,
@@ -701,7 +669,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               "다운로드",
               () async {
                 // 다운로드 페이지로 이동
-                final Uri url = Uri.parse('https://admin.787.kr/download');
+                final Uri url = Uri.parse('https://admin.787.kr/executables/MDesk_portable.exe');
                 await launchUrl(url);
               },
               closeButton: true);

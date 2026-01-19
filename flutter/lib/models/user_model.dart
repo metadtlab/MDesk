@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/hbbs/hbbs.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
+import 'package:flutter_hbb/utils/device_register_service.dart';
 import 'package:get/get.dart';
 import 'package:http/http.dart' as flutter_http;
 
@@ -98,6 +100,9 @@ class UserModel {
         debugPrint('UserModel: Raw userData keys: ${userData.keys.toList()}');
         debugPrint('UserModel: Raw user_pkid value: ${userData['user_pkid']}');
         _parseAndUpdateUser(user);
+        
+        // 기기 등록은 "원격자 등록" 다이얼로그에서만 수행
+        // (로그인 시 자동 등록 제거)
       } else {
         debugPrint('UserModel: API response code is not 1 or data is null');
       }
@@ -155,6 +160,71 @@ class UserModel {
     if (isWeb) {
       // ugly here, tmp solution
       bind.mainSetLocalOption(key: 'verifier', value: user.verifier ?? '');
+    }
+  }
+
+  /// 현재 기기를 API 서버에 등록
+  Future<void> _registerCurrentDevice(String accessToken, String userId, String userPkid) async {
+    try {
+      // 필수 정보 확인
+      if (accessToken.isEmpty || userId.isEmpty || userPkid.isEmpty) {
+        debugPrint('UserModel: Skipping device registration - missing required info');
+        return;
+      }
+
+      final remoteId = await bind.mainGetMyId();
+      if (remoteId.isEmpty) {
+        debugPrint('UserModel: Skipping device registration - no remote ID');
+        return;
+      }
+
+      // 호스트명과 플랫폼 정보 가져오기
+      String hostname = '';
+      String platform = '';
+      try {
+        if (!isWeb) {
+          hostname = Platform.localHostname;
+          if (Platform.isWindows) {
+            platform = 'Windows';
+          } else if (Platform.isMacOS) {
+            platform = 'macOS';
+          } else if (Platform.isLinux) {
+            platform = 'Linux';
+          } else if (Platform.isAndroid) {
+            platform = 'Android';
+          } else if (Platform.isIOS) {
+            platform = 'iOS';
+          }
+        } else {
+          platform = 'Web';
+        }
+      } catch (e) {
+        debugPrint('UserModel: Error getting platform info: $e');
+      }
+
+      // 별칭: 호스트명 또는 플랫폼
+      final alias = hostname.isNotEmpty ? hostname : platform;
+
+      debugPrint('UserModel: Registering device - remoteId=$remoteId, alias=$alias, platform=$platform');
+
+      final response = await deviceRegisterService.registerDevice(
+        apiServer: 'https://admin.787.kr',
+        accessToken: accessToken,
+        userId: userId,
+        userPkid: userPkid,
+        remoteId: remoteId,
+        alias: alias,
+        hostname: hostname,
+        platform: platform,
+      );
+
+      if (response.success) {
+        debugPrint('UserModel: Device registered successfully - ${response.message}');
+      } else {
+        debugPrint('UserModel: Device registration failed - ${response.message}');
+      }
+    } catch (e) {
+      debugPrint('UserModel: Error registering device: $e');
     }
   }
 

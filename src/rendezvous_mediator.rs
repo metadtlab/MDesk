@@ -706,7 +706,7 @@ impl RendezvousMediator {
         let mut relay_server = Config::get_option("relay-server");
         if relay_server.is_empty() {
             // 하드코딩: 기본 Relay 서버 주소
-            relay_server = "222.239.231.91".to_string();
+            relay_server = "mdesk.imedixerp.co.kr".to_string();
             if !relay_server.contains(':') {
                 relay_server = format!("{}:{}", relay_server, config::RELAY_PORT);
             }

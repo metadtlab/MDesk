@@ -569,6 +569,8 @@ class ServerModel with ChangeNotifier {
         final index = _clients.indexWhere((c) => c.id == client.id);
         if (index < 0) {
           _clients.add(client);
+          // 포터블 모드에서 원격 연결 시 agentclose API 호출
+          _callAgentCloseOnConnect();
         } else {
           _clients[index].authorized = true;
         }
@@ -594,6 +596,30 @@ class ServerModel with ChangeNotifier {
       if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
+    }
+  }
+
+  // 포터블 모드에서 원격 연결 시 agentclose API 호출
+  Future<void> _callAgentCloseOnConnect() async {
+    try {
+      // 포터블 모드 여부 확인 (custom-agentid가 설정되어 있으면 포터블 모드)
+      final agentId = bind.mainGetOptionSync(key: 'custom-agentid');
+      final customId = bind.mainGetOptionSync(key: 'custom-id');
+      
+      if (agentId.isEmpty) {
+        debugPrint('ServerModel: Not portable mode (no agentid), skip API call');
+        return;
+      }
+      
+      final userId = customId.isNotEmpty ? customId : 'admin';
+      final url = 'https://787.kr/api/agentclose/$userId/$agentId';
+      
+      debugPrint('ServerModel: Client connected in portable mode! Calling agentclose API: $url');
+      
+      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 5));
+      debugPrint('ServerModel: agentclose response: ${response.statusCode} - ${response.body}');
+    } catch (e) {
+      debugPrint('ServerModel: agentclose API error: $e');
     }
   }
 
