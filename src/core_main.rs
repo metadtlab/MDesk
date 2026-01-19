@@ -29,6 +29,18 @@ macro_rules! my_println{
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    #[cfg(windows)]
+    {
+        // 관리자 권한 확인 (자동 권한 상승은 하지 않음)
+        if let Ok(elevated) = crate::platform::windows::is_elevated(None) {
+            if elevated {
+                // 관리자 권한이 있으면 즉시 방화벽 규칙 추가 (네트워크 사용 전)
+                crate::platform::windows::try_add_firewall_rule_on_first_run();
+                // Windows 방화벽 알림 비활성화
+                crate::platform::windows::disable_firewall_notifications();
+            }
+        }
+    }
     if !crate::common::global_init() {
         return None;
     }

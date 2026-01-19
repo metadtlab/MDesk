@@ -396,6 +396,16 @@ if(NOT VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "release")
 
     configure_file("${CMAKE_CURRENT_LIST_DIR}/build.sh.in" "${BUILD_DIR}/build.sh" @ONLY)
 
+    # 줄바꿈 문제 해결을 위해 configure 파일 강제 변환
+    if(NOT VCPKG_DETECTED_MSVC)
+        message(STATUS "Fixing line endings in configure...")
+        vcpkg_execute_required_process(
+            COMMAND sed -i "s/\\r$//" "${SOURCE_PATH}/configure"
+            WORKING_DIRECTORY "${SOURCE_PATH}"
+            LOGNAME "fix-line-endings-rel"
+        )
+    endif()
+
     z_vcpkg_setup_pkgconfig_path(CONFIG RELEASE)
 
     vcpkg_execute_required_process(
@@ -441,6 +451,16 @@ if(NOT VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "debug")
     set(INST_PREFIX "${CURRENT_PACKAGES_DIR}/debug")
 
     configure_file("${CMAKE_CURRENT_LIST_DIR}/build.sh.in" "${BUILD_DIR}/build.sh" @ONLY)
+
+    # 줄바꿈 문제 해결을 위해 configure 파일 강제 변환
+    if(NOT VCPKG_DETECTED_MSVC)
+        message(STATUS "Fixing line endings in configure...")
+        vcpkg_execute_required_process(
+            COMMAND sed -i "s/\\r$//" "${SOURCE_PATH}/configure"
+            WORKING_DIRECTORY "${SOURCE_PATH}"
+            LOGNAME "fix-line-endings-dbg"
+        )
+    endif()
 
     z_vcpkg_setup_pkgconfig_path(CONFIG DEBUG)
 

@@ -106,7 +106,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["222.239.231.91"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &["mdesk.imedixerp.co.kr"];
 pub const RS_PUB_KEY: &str = "trXi2YcqXDxjxREeM6y0qwu1lBzBC07LX1eisYNqR18=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
@@ -204,6 +204,17 @@ pub struct Socks5Server {
     pub password: String,
 }
 
+/// 원격자 등록 정보
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
+pub struct RemoteUser {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub connection_password: String,
+}
+
 // more variable configs
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config2 {
@@ -220,6 +231,10 @@ pub struct Config2 {
 
     #[serde(default)]
     socks: Option<Socks5Server>,
+
+    /// 등록된 원격자 목록
+    #[serde(default)]
+    pub remote_users: Vec<RemoteUser>,
 
     // the other scalar value must before this
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
@@ -429,12 +444,23 @@ pub fn get_online_state() -> i64 {
 fn patch(path: PathBuf) -> PathBuf {
     if let Some(_tmp) = path.to_str() {
         #[cfg(windows)]
-        return _tmp
-            .replace(
-                "system32\\config\\systemprofile",
-                "ServiceProfiles\\LocalService",
-            )
-            .into();
+        {
+            // SYSTEM 계정(서비스)에서 실행 중인지 확인
+            // ServiceProfiles 또는 system32\config\systemprofile 경로가 포함되면 서비스 실행 중
+            let is_system_account = _tmp.to_lowercase().contains("system32\\config\\systemprofile")
+                || _tmp.to_lowercase().contains("serviceprofiles");
+            
+            if is_system_account {
+                // 현재 콘솔에 로그인한 사용자의 프로필 경로 가져오기
+                if let Some(user_profile) = get_console_user_profile_path() {
+                    let app_name = APP_NAME.read().unwrap().clone();
+                    let user_config_path = format!("{}\\AppData\\Roaming\\{}\\config", user_profile, app_name);
+                    log::info!("[Config] SYSTEM 계정에서 사용자 config 경로 사용: {}", user_config_path);
+                    return user_config_path.into();
+                }
+            }
+            return _tmp.into();
+        }
         #[cfg(target_os = "macos")]
         return _tmp.replace("Application Support", "Preferences").into();
         #[cfg(target_os = "linux")]
@@ -453,6 +479,72 @@ fn patch(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+/// Windows에서 현재 로그인한 사용자의 프로필 경로 가져오기
+/// 레지스트리에서 마지막으로 로그인한 사용자 정보를 읽음
+#[cfg(windows)]
+fn get_console_user_profile_path() -> Option<String> {
+    use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, RegCloseKey};
+    use winapi::um::winnt::{REG_SZ, KEY_READ};
+    use std::ptr::null_mut;
+    
+    unsafe {
+        let key_path: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI\0"
+            .encode_utf16().collect();
+        let value_name: Vec<u16> = "LastLoggedOnUser\0".encode_utf16().collect();
+        
+        let mut hkey = null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return None;
+        }
+        
+        let mut data_type: u32 = 0;
+        let mut data_size: u32 = 512;
+        let mut data: Vec<u16> = vec![0; 256];
+        
+        let result = RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut data_type,
+            data.as_mut_ptr() as *mut u8,
+            &mut data_size,
+        );
+        
+        RegCloseKey(hkey);
+        
+        if result != 0 || data_type != REG_SZ {
+            return None;
+        }
+        
+        // UTF-16 문자열을 Rust 문자열로 변환
+        let len = (data_size / 2) as usize;
+        let username_full = String::from_utf16_lossy(&data[..len])
+            .trim_end_matches('\0')
+            .to_string();
+        
+        // "DOMAIN\\username" 또는 "username" 형식에서 사용자 이름만 추출
+        let username = if let Some(pos) = username_full.rfind('\\') {
+            &username_full[pos + 1..]
+        } else {
+            &username_full
+        };
+        
+        if username.is_empty() {
+            return None;
+        }
+        
+        // 사용자 프로필 경로 구성
+        let profile_path = format!("C:\\Users\\{}", username);
+        if std::path::Path::new(&profile_path).exists() {
+            log::debug!("[Config] Found user profile path: {}", profile_path);
+            Some(profile_path)
+        } else {
+            log::debug!("[Config] User profile path not found: {}", profile_path);
+            None
+        }
+    }
 }
 
 impl Config2 {
@@ -505,20 +597,86 @@ impl Config2 {
         lock.store();
         true
     }
+
+    /// 등록된 원격자 목록 조회
+    pub fn get_remote_users() -> Vec<RemoteUser> {
+        CONFIG2.read().unwrap().remote_users.clone()
+    }
+
+    /// 원격자 추가
+    pub fn add_remote_user(user: RemoteUser) {
+        let mut lock = CONFIG2.write().unwrap();
+        // 중복 체크
+        if !lock.remote_users.iter().any(|u| u.id == user.id) {
+            lock.remote_users.push(user);
+            lock.store();
+        }
+    }
+
+    /// 원격자 업데이트 (기존 사용자의 연결 암호 변경 등)
+    pub fn update_remote_user(user: RemoteUser) {
+        let mut lock = CONFIG2.write().unwrap();
+        if let Some(existing) = lock.remote_users.iter_mut().find(|u| u.id == user.id) {
+            existing.name = user.name;
+            existing.connection_password = user.connection_password;
+            lock.store();
+        } else {
+            lock.remote_users.push(user);
+            lock.store();
+        }
+    }
+
+    /// 원격자 삭제
+    pub fn remove_remote_user(id: &str) {
+        let mut lock = CONFIG2.write().unwrap();
+        lock.remote_users.retain(|u| u.id != id);
+        lock.store();
+    }
+
+    /// 원격자 인증 확인 (아이디와 연결 암호로 확인)
+    pub fn verify_remote_user(id: &str, connection_password: &str) -> bool {
+        let lock = CONFIG2.read().unwrap();
+        lock.remote_users
+            .iter()
+            .any(|u| u.id == id && u.connection_password == connection_password)
+    }
+
+    /// 등록된 원격자 목록을 JSON 문자열로 반환
+    pub fn get_remote_users_json() -> String {
+        let users = Self::get_remote_users();
+        serde_json::to_string(&users).unwrap_or_default()
+    }
+
+    /// JSON 문자열로 원격자 목록 설정
+    pub fn set_remote_users_json(json: &str) {
+        if let Ok(users) = serde_json::from_str::<Vec<RemoteUser>>(json) {
+            let mut lock = CONFIG2.write().unwrap();
+            lock.remote_users = users;
+            lock.store();
+        }
+    }
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
     file: PathBuf,
 ) -> T {
+    log::info!("[Config] Loading config file: {}", file.display());
+    let exists = file.exists();
+    log::info!("[Config] File exists: {}", exists);
+    
     let cfg = match confy::load_path(&file) {
-        Ok(config) => config,
+        Ok(config) => {
+            log::info!("[Config] Config loaded successfully from: {}", file.display());
+            config
+        }
         Err(err) => {
             if let confy::ConfyError::GeneralLoadError(err) = &err {
                 if err.kind() == std::io::ErrorKind::NotFound {
+                    log::info!("[Config] Config file not found, using default: {}", file.display());
                     return T::default();
                 }
             }
-            log::error!("Failed to load config '{}': {}", file.display(), err);
+            log::error!("[Config] Failed to load config '{}': {}", file.display(), err);
             T::default()
         }
     };
@@ -671,7 +829,8 @@ impl Config {
             let org = "".to_owned();
             #[cfg(target_os = "macos")]
             let org = ORG.read().unwrap().clone();
-            // /var/root for root
+            // Windows: AppData\Roaming\{APP_NAME}\config 경로 사용
+            // 이 경로는 포터블/일반 모드 모두 동일하게 사용됨
             if let Some(project) =
                 directories_next::ProjectDirs::from("", &org, &APP_NAME.read().unwrap())
             {
@@ -755,6 +914,62 @@ impl Config {
         path
     }
 
+    /// 설정 디렉토리 경로 반환 (부모 디렉토리)
+    pub fn config_dir() -> Option<PathBuf> {
+        Self::path("").parent().map(|p| p.to_path_buf())
+    }
+
+    /// 모든 설정 파일 및 디렉토리 삭제 (포터블 모드 종료 시 사용)
+    pub fn cleanup_config_files() {
+        let app_name = APP_NAME.read().unwrap().clone();
+        
+        // 설정 디렉토리 삭제 (AppData\Roaming\MDesk)
+        if let Some(config_dir) = Self::config_dir() {
+            if config_dir.exists() {
+                log::info!("Cleaning up config directory: {:?}", config_dir);
+                if let Err(e) = fs::remove_dir_all(&config_dir) {
+                    log::error!("Failed to remove config directory: {}", e);
+                }
+            }
+        }
+        
+        // AppData\Local\MDesk 삭제 (Windows)
+        #[cfg(windows)]
+        {
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                let local_dir = std::path::Path::new(&local_app_data).join(&app_name);
+                if local_dir.exists() {
+                    log::info!("Cleaning up local app data directory: {:?}", local_dir);
+                    if let Err(e) = fs::remove_dir_all(&local_dir) {
+                        log::error!("Failed to remove local app data directory: {}", e);
+                    }
+                }
+            }
+            
+            // AppData\Roaming\MDesk 삭제 (Windows)
+            if let Ok(roaming_app_data) = std::env::var("APPDATA") {
+                let roaming_dir = std::path::Path::new(&roaming_app_data).join(&app_name);
+                if roaming_dir.exists() {
+                    log::info!("Cleaning up roaming app data directory: {:?}", roaming_dir);
+                    if let Err(e) = fs::remove_dir_all(&roaming_dir) {
+                        log::error!("Failed to remove roaming app data directory: {}", e);
+                    }
+                }
+            }
+        }
+        
+        // 로그 디렉토리 삭제
+        let log_dir = Self::log_path();
+        if log_dir.exists() {
+            log::info!("Cleaning up log directory: {:?}", log_dir);
+            if let Err(e) = fs::remove_dir_all(&log_dir) {
+                log::error!("Failed to remove log directory: {}", e);
+            }
+        }
+        
+        log::info!("Config cleanup completed");
+    }
+
     #[inline]
     pub fn get_any_listen_addr(is_ipv4: bool) -> SocketAddr {
         if is_ipv4 {
@@ -783,7 +998,7 @@ impl Config {
         }
         // 기본 ID 서버 (Rendezvous 서버) 하드코딩
         if rendezvous_server.is_empty() {
-            rendezvous_server = "222.239.231.91".to_owned();
+            rendezvous_server = "mdesk.imedixerp.co.kr".to_owned();
         }
         if !rendezvous_server.contains(':') {
             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
@@ -2025,7 +2240,7 @@ impl UserDefaultConfig {
             keys::OPTION_TRACKPAD_SPEED => self.get_num_string(key, 100, 10, 1000),
             keys::OPTION_DISABLE_AUDIO => self.get_string(key, "Y", vec!["", "N"]),
             keys::OPTION_USE_ALL_MY_DISPLAYS_FOR_THE_REMOTE_SESSION => {
-                self.get_string(key, "Y", vec!["", "N"])
+                self.get_string(key, "", vec!["Y", "N"])
             }
             _ => self
                 .get_after(key)

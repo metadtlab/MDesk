@@ -28,6 +28,10 @@ class StateGlobal {
 
   final updateUrl = ''.obs;
   final latestVersion = ''.obs;
+  
+  // 강제 업데이트 관련
+  final forceUpdate = false.obs;  // 강제 업데이트 필요 여부
+  final forceUpdateMessage = ''.obs;  // 강제 업데이트 메시지
 
   String _inputSource = '';
 

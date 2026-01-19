@@ -218,44 +218,48 @@ class _ConnectionPageState extends State<ConnectionPage> {
                         VoidCallback onFieldSubmitted) {
                       updateTextAndPreserveSelection(
                           fieldTextEditingController, _idController.text);
-                      return AutoSizeTextField(
-                        controller: fieldTextEditingController,
-                        focusNode: fieldFocusNode,
-                        minFontSize: 18,
-                        autocorrect: false,
-                        enableSuggestions: false,
-                        keyboardType: TextInputType.visiblePassword,
-                        // keyboardType: TextInputType.number,
-                        onChanged: (String text) {
-                          _idController.id = text;
-                        },
-                        style: const TextStyle(
-                          fontFamily: 'WorkSans',
-                          fontWeight: FontWeight.bold,
-                          fontSize: 30,
-                          color: MyTheme.idColor,
-                        ),
-                        decoration: InputDecoration(
-                          labelText: translate('Remote ID'),
-                          // hintText: 'Enter your remote ID',
-                          border: InputBorder.none,
-                          helperStyle: const TextStyle(
+                      return Obx(() {
+                        final isLoggedIn = gFFI.userModel.isLogin;
+                        return AutoSizeTextField(
+                          enabled: isLoggedIn,
+                          controller: fieldTextEditingController,
+                          focusNode: fieldFocusNode,
+                          minFontSize: 18,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          keyboardType: TextInputType.visiblePassword,
+                          // keyboardType: TextInputType.number,
+                          onChanged: (String text) {
+                            _idController.id = text;
+                          },
+                          style: const TextStyle(
+                            fontFamily: 'WorkSans',
                             fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                            color: MyTheme.darkGray,
+                            fontSize: 30,
+                            color: MyTheme.idColor,
                           ),
-                          labelStyle: const TextStyle(
-                            fontWeight: FontWeight.w600,
-                            fontSize: 16,
-                            letterSpacing: 0.2,
-                            color: MyTheme.darkGray,
+                          decoration: InputDecoration(
+                            labelText: translate('Remote ID'),
+                            // hintText: 'Enter your remote ID',
+                            border: InputBorder.none,
+                            helperStyle: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                              color: MyTheme.darkGray,
+                            ),
+                            labelStyle: const TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 16,
+                              letterSpacing: 0.2,
+                              color: MyTheme.darkGray,
+                            ),
                           ),
-                        ),
-                        inputFormatters: [IDTextInputFormatter()],
-                        onSubmitted: (_) {
-                          onConnect();
-                        },
-                      );
+                          inputFormatters: [IDTextInputFormatter()],
+                          onSubmitted: (_) {
+                            onConnect();
+                          },
+                        );
+                      });
                     },
                     onSelected: (option) {
                       setState(() {
@@ -333,15 +337,21 @@ class _ConnectionPageState extends State<ConnectionPage> {
                         },
                         icon: Icon(Icons.clear, color: MyTheme.darkGray)),
                   )),
-              SizedBox(
-                width: 60,
-                height: 60,
-                child: IconButton(
-                  icon: const Icon(Icons.arrow_forward,
-                      color: MyTheme.darkGray, size: 45),
-                  onPressed: onConnect,
-                ),
-              ),
+              Obx(() {
+                final isLoggedIn = gFFI.userModel.isLogin;
+                return Opacity(
+                  opacity: isLoggedIn ? 1.0 : 0.5,
+                  child: SizedBox(
+                    width: 60,
+                    height: 60,
+                    child: IconButton(
+                      icon: const Icon(Icons.arrow_forward,
+                          color: MyTheme.darkGray, size: 45),
+                      onPressed: isLoggedIn ? onConnect : null,
+                    ),
+                  ),
+                );
+              }),
             ],
           ),
         ),

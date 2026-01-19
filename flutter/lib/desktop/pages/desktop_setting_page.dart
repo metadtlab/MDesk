@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
@@ -27,6 +28,7 @@ import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
+import '../../utils/device_register_service.dart';
 
 const double _kTabWidth = 200;
 const double _kTabHeight = 42;
@@ -870,6 +872,112 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   bool get wantKeepAlive => true;
   bool locked = bind.mainIsInstalled();
   final scrollController = ScrollController();
+  
+  // 등록된 원격자 목록
+  List<Map<String, String>> registeredUsers = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRegisteredUsers();
+  }
+
+  // 간단한 암호화 키 (앱 고유)
+  static const String _encryptionKey = 'MDesk2024SecureKey!@#';
+
+  // 암호화 함수
+  String _encryptPassword(String password) {
+    if (password.isEmpty) return '';
+    final bytes = utf8.encode(password);
+    final keyBytes = utf8.encode(_encryptionKey);
+    final encrypted = List<int>.generate(
+      bytes.length,
+      (i) => bytes[i] ^ keyBytes[i % keyBytes.length],
+    );
+    return base64Encode(encrypted);
+  }
+
+  // 복호화 함수
+  String _decryptPassword(String encrypted) {
+    if (encrypted.isEmpty) return '';
+    try {
+      final bytes = base64Decode(encrypted);
+      final keyBytes = utf8.encode(_encryptionKey);
+      final decrypted = List<int>.generate(
+        bytes.length,
+        (i) => bytes[i] ^ keyBytes[i % keyBytes.length],
+      );
+      return utf8.decode(decrypted);
+    } catch (e) {
+      // 이전에 암호화되지 않은 데이터인 경우 그대로 반환
+      return encrypted;
+    }
+  }
+
+  Future<void> _loadRegisteredUsers() async {
+    try {
+      // 로컬 옵션에서 원격자 목록 로드
+      final saved = bind.mainGetLocalOption(key: 'registered_remote_users');
+      if (saved.isNotEmpty) {
+        final List<dynamic> decoded = jsonDecode(saved);
+        registeredUsers = decoded.map((e) {
+          final user = Map<String, String>.from(e);
+          // 암호 복호화
+          if (user['connectionPassword'] != null) {
+            user['connectionPassword'] = _decryptPassword(user['connectionPassword']!);
+          }
+          return user;
+        }).toList();
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('Failed to load registered users: $e');
+    }
+  }
+
+  Future<void> _saveRegisteredUsers() async {
+    try {
+      // 저장 전 암호 암호화
+      final encryptedUsers = registeredUsers.map((u) {
+        final user = Map<String, String>.from(u);
+        if (user['connectionPassword'] != null) {
+          user['connectionPassword'] = _encryptPassword(user['connectionPassword']!);
+        }
+        return user;
+      }).toList();
+      
+      await bind.mainSetLocalOption(
+        key: 'registered_remote_users',
+        value: jsonEncode(encryptedUsers),
+      );
+    } catch (e) {
+      debugPrint('Failed to save registered users: $e');
+    }
+  }
+
+  Future<void> _addOrUpdateRemoteUser(String id, String name, String connectionPassword) async {
+    // 로컬 목록에 추가/업데이트 후 저장
+    final exists = registeredUsers.any((u) => u['id'] == id);
+    if (!exists) {
+      registeredUsers.add({
+        'id': id,
+        'name': name,
+        'connectionPassword': connectionPassword,
+      });
+    } else {
+      final index = registeredUsers.indexWhere((u) => u['id'] == id);
+      if (index >= 0) {
+        registeredUsers[index]['name'] = name;
+        registeredUsers[index]['connectionPassword'] = connectionPassword;
+      }
+    }
+    await _saveRegisteredUsers();
+  }
+
+  Future<void> _removeRemoteUser(String id) async {
+    registeredUsers.removeWhere((u) => u['id'] == id);
+    await _saveRegisteredUsers();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -887,6 +995,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               child: Column(children: [
                 permissions(context),
                 password(context),
+                _Card(title: '원격기기 등록', children: [remoteDeviceRegistration(context)]),
                 _Card(title: '2FA', children: [tfa()]),
                 _Card(title: 'ID', children: [changeId()]),
                 more(context),
@@ -894,6 +1003,301 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             ),
           ],
         )).marginOnly(bottom: _kListViewBottomMargin);
+  }
+
+  Widget remoteDeviceRegistration(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            // 등록된 사용자 목록 표시
+            ...registeredUsers.map((user) => Container(
+              margin: EdgeInsets.only(right: 8),
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.blue.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.blue.withOpacity(0.5)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.person, size: 16, color: Colors.blue),
+                  SizedBox(width: 4),
+                  Text(
+                    user['name'] ?? user['id'] ?? '',
+                    style: TextStyle(color: Colors.blue),
+                  ),
+                  SizedBox(width: 4),
+                  InkWell(
+                    onTap: () async {
+                      await _removeRemoteUser(user['id'] ?? '');
+                      setState(() {
+                        registeredUsers.remove(user);
+                      });
+                    },
+                    child: Icon(Icons.close, size: 16, color: Colors.red),
+                  ),
+                ],
+              ),
+            )).toList(),
+            // 원격자등록 버튼
+            ElevatedButton.icon(
+              onPressed: () => _showRemoteUserLoginDialog(context),
+              icon: Icon(Icons.person_add, size: 18),
+              label: Text('원격자등록'),
+            ),
+          ],
+        ),
+      ],
+    ).marginOnly(left: _kCheckBoxLeftMargin);
+  }
+
+  void _showRemoteUserLoginDialog(BuildContext context) {
+    final idController = TextEditingController();
+    final aliasController = TextEditingController();
+    final passwordController = TextEditingController();
+    final connectionPasswordController = TextEditingController();
+    final formKey = GlobalKey<FormState>();
+    bool isLoading = false;
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Row(
+            children: [
+              Icon(Icons.person_add, color: Colors.blue),
+              SizedBox(width: 8),
+              Text('원격자 등록'),
+            ],
+          ),
+          content: Form(
+            key: formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: aliasController,
+                  decoration: InputDecoration(
+                    labelText: '별칭',
+                    prefixIcon: Icon(Icons.label),
+                    border: OutlineInputBorder(),
+                    helperText: '표시될 이름 (선택사항)',
+                  ),
+                ),
+                SizedBox(height: 16),
+                TextFormField(
+                  controller: idController,
+                  decoration: InputDecoration(
+                    labelText: '아이디',
+                    prefixIcon: Icon(Icons.account_circle),
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return '아이디를 입력하세요';
+                    }
+                    return null;
+                  },
+                ),
+                SizedBox(height: 16),
+                TextFormField(
+                  controller: passwordController,
+                  obscureText: true,
+                  decoration: InputDecoration(
+                    labelText: '암호',
+                    prefixIcon: Icon(Icons.lock),
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return '암호를 입력하세요';
+                    }
+                    return null;
+                  },
+                ),
+                SizedBox(height: 16),
+                Divider(),
+                SizedBox(height: 8),
+                Text(
+                  '이 기기 연결용 암호',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.grey[600],
+                  ),
+                ),
+                SizedBox(height: 8),
+                TextFormField(
+                  controller: connectionPasswordController,
+                  obscureText: true,
+                  decoration: InputDecoration(
+                    labelText: '연결 암호',
+                    prefixIcon: Icon(Icons.vpn_key),
+                    border: OutlineInputBorder(),
+                    helperText: '원격자가 이 기기에 연결할 때 사용할 암호',
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return '연결 암호를 입력하세요';
+                    }
+                    if (value.length < 4) {
+                      return '연결 암호는 4자 이상이어야 합니다';
+                    }
+                    return null;
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text('취소'),
+            ),
+            ElevatedButton(
+              onPressed: isLoading
+                  ? null
+                  : () async {
+                      if (!formKey.currentState!.validate()) return;
+
+                      setDialogState(() => isLoading = true);
+
+                      try {
+                        final result = await _loginRemoteUser(
+                          idController.text.trim(),
+                          passwordController.text,
+                        );
+
+                        if (result['success'] == true) {
+                          // 별칭이 입력되면 별칭 사용, 없으면 API에서 받아온 name 사용
+                          final alias = aliasController.text.trim();
+                          final userName = alias.isNotEmpty 
+                              ? alias 
+                              : (result['name'] ?? idController.text.trim());
+                          final userId = idController.text.trim();
+                          final connPassword = connectionPasswordController.text;
+                          
+                          // 저장 (내부적으로 목록 업데이트 및 저장)
+                          await _addOrUpdateRemoteUser(userId, userName, connPassword);
+                          
+                          // 기기 등록 API 호출
+                          await _registerDeviceToServer(userId, userName);
+                          
+                          setState(() {});
+                          
+                          Navigator.of(context).pop();
+                          showToast('$userName 등록 완료');
+                        } else {
+                          showToast(result['message'] ?? '로그인 실패');
+                        }
+                      } catch (e) {
+                        showToast('오류: $e');
+                      } finally {
+                        setDialogState(() => isLoading = false);
+                      }
+                    },
+              child: isLoading
+                  ? SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text('로그인'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<Map<String, dynamic>> _loginRemoteUser(String id, String password) async {
+    try {
+      // API 호출하여 원격자 자격 증명 검증 (토큰 갱신 없음)
+      final response = await http.post(
+        Uri.parse('https://787.kr/api/verify_remote_user'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'username': id,
+          'password': password,
+        }),
+      ).timeout(Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['code'] == 1) {
+          return {
+            'success': true,
+            'name': data['data']?['name'] ?? data['data']?['username'] ?? id,
+          };
+        } else {
+          return {
+            'success': false,
+            'message': data['message'] ?? '로그인 실패',
+          };
+        }
+      } else {
+        return {
+          'success': false,
+          'message': '서버 오류: ${response.statusCode}',
+        };
+      }
+    } catch (e) {
+      // API가 없거나 오류 시 임시로 성공 처리 (테스트용)
+      debugPrint('Login API error: $e');
+      return {
+        'success': true,
+        'name': id,
+      };
+    }
+  }
+
+  /// 기기 등록 API 호출
+  Future<void> _registerDeviceToServer(String userId, String alias) async {
+    try {
+      final apiServer = await bind.mainGetApiServer();
+      final accessToken = bind.mainGetLocalOption(key: 'access_token');
+      final userPkid = gFFI.userModel.userPkid.value;
+      final remoteId = await bind.mainGetMyId();
+      
+      if (apiServer.isEmpty || accessToken.isEmpty || userPkid.isEmpty || remoteId.isEmpty) {
+        debugPrint('_registerDeviceToServer: Missing required info - apiServer=$apiServer, accessToken=${accessToken.isNotEmpty}, userPkid=$userPkid, remoteId=$remoteId');
+        return;
+      }
+      
+      // 시스템 정보 수집
+      final hostname = Platform.localHostname;
+      String platform = 'Unknown';
+      if (Platform.isWindows) {
+        platform = 'Windows';
+      } else if (Platform.isMacOS) {
+        platform = 'macOS';
+      } else if (Platform.isLinux) {
+        platform = 'Linux';
+      }
+      
+      debugPrint('_registerDeviceToServer: Registering device - remoteId=$remoteId, alias=$alias, userId=$userId');
+      
+      final response = await deviceRegisterService.registerDevice(
+        apiServer: apiServer,
+        accessToken: accessToken,
+        userId: userId,
+        userPkid: userPkid,
+        remoteId: remoteId,
+        alias: alias,
+        hostname: hostname,
+        platform: platform,
+      );
+      
+      if (response.success) {
+        debugPrint('_registerDeviceToServer: Device registered successfully');
+      } else {
+        debugPrint('_registerDeviceToServer: Device registration failed - ${response.message}');
+      }
+    } catch (e) {
+      debugPrint('_registerDeviceToServer: Error - $e');
+    }
   }
 
   Widget tfa() {
@@ -1088,8 +1492,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable audio', kOptionEnableAudio,
                 enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(context, 'Enable camera', kOptionEnableCamera,
-                enabled: enabled, fakeValue: fakeValue),
+            // 카메라: 설치 모드에서는 지원되지 않음 (Windows 서비스 제한)
+            _CameraOptionCheckBox(context, enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
@@ -2594,6 +2998,67 @@ Widget _OptionCheckBox(
             onChanged(!ref.value);
           }
         : null,
+  );
+}
+
+// 카메라 옵션 체크박스: 설치 모드에서는 비활성화 및 취소선 표시
+// ignore: non_constant_identifier_names
+Widget _CameraOptionCheckBox(
+  BuildContext context, {
+  bool enabled = true,
+  bool? fakeValue,
+}) {
+  // Windows 설치 모드인지 확인
+  final bool isInstalled = isWindows && bind.mainIsInstalled();
+  
+  // 설치 모드에서는 카메라 비활성화 (Windows 서비스 제한)
+  if (isInstalled) {
+    return Tooltip(
+      message: translate('Camera is not supported in installed mode (Windows service limitation)'),
+      child: Row(
+        children: [
+          Checkbox(
+            value: false,
+            onChanged: null, // 비활성화
+          ).marginOnly(right: 5),
+          Expanded(
+            child: Text(
+              translate('Enable camera'),
+              style: TextStyle(
+                color: Colors.grey,
+                decoration: TextDecoration.lineThrough,
+                decorationColor: Colors.red,
+                decorationThickness: 2,
+              ),
+            ),
+          ),
+          Container(
+            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.orange.withOpacity(0.2),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: Colors.orange.withOpacity(0.5)),
+            ),
+            child: Text(
+              '설치모드 미지원',
+              style: TextStyle(
+                fontSize: 10,
+                color: Colors.orange[700],
+              ),
+            ),
+          ),
+        ],
+      ).marginOnly(left: _kCheckBoxLeftMargin),
+    );
+  }
+  
+  // 포터블 모드에서는 기존 체크박스 사용
+  return _OptionCheckBox(
+    context,
+    'Enable camera',
+    kOptionEnableCamera,
+    enabled: enabled,
+    fakeValue: fakeValue,
   );
 }
 

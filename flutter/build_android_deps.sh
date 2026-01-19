@@ -66,7 +66,21 @@ function build {
 
   echo "*** [$ANDROID_ABI][Start] Build and install vcpkg dependencies"
   pushd "$SCRIPTDIR/.."
-  $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TARGET --x-install-root="$VCPKG_ROOT/installed"
+  
+  # ffmpeg configure 스크립트의 CRLF 줄바꿈 문제 해결 (더 넓은 범위)
+  echo "*** Fixing ffmpeg configure script line endings in all locations..."
+  find "${VCPKG_ROOT}/buildtrees/ffmpeg" -name "configure" -type f -exec sed -i 's/\r$//' {} \; 2>/dev/null || true
+  
+  # vcpkg install 실행
+  if ! $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TARGET --x-install-root="$VCPKG_ROOT/installed"; then
+    # 실패 시 다시 한 번 모든 configure 파일을 찾아서 변환 후 재시도
+    echo "*** Build failed, applying aggressive line ending fix and retrying..."
+    find "${VCPKG_ROOT}/buildtrees" -name "configure" -type f -exec sed -i 's/\r$//' {} \; 2>/dev/null || true
+    # 일부 시스템에서는 build.sh 자체도 문제가 될 수 있음
+    find "${VCPKG_ROOT}/buildtrees" -name "*.sh" -type f -exec sed -i 's/\r$//' {} \; 2>/dev/null || true
+    $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TARGET --x-install-root="$VCPKG_ROOT/installed"
+  fi
+  
   popd
   head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-$VCPKG_TARGET-rel-out.log" || true
   echo "*** [$ANDROID_ABI][Finished] Build and install vcpkg dependencies"

@@ -361,6 +361,20 @@ class LoginWidgetUserPass extends StatelessWidget {
             // NOT use Offstage to wrap LinearProgressIndicator
             if (isInProgress) const LinearProgressIndicator(),
             const SizedBox(height: 12.0),
+            Align(
+              alignment: Alignment.centerRight,
+              child: InkWell(
+                onTap: () => launchUrl(Uri.parse('https://admin.787.kr')),
+                child: Text(
+                  '비밀번호찾기',
+                  style: TextStyle(
+                    color: Colors.blue,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8.0),
             FittedBox(
                 child:
                     Row(mainAxisAlignment: MainAxisAlignment.center, children: [

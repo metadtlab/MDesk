@@ -2533,6 +2533,21 @@ connect(BuildContext context, String id,
     String? connToken,
     bool? isSharedPassword}) async {
   if (id == '') return;
+  
+  // 강제 업데이트가 필요하면 연결 차단
+  if (stateGlobal.forceUpdate.value) {
+    showToast('업데이트 후 사용해 주세요');
+    showForceUpdateDialog(context);
+    return;
+  }
+  
+  // 자기 자신의 ID로 연결 시도 차단
+  final cleanId = id.replaceAll(' ', '');
+  final myId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
+  if (myId.isNotEmpty && myId == cleanId) {
+    showToast('자기 자신에게는 연결할 수 없습니다');
+    return;
+  }
   if (!isDesktop || desktopType == DesktopType.main) {
     try {
       if (Get.isRegistered<IDTextEditingController>()) {
@@ -3619,7 +3634,7 @@ Widget loadPowered(BuildContext context) {
     cursor: SystemMouseCursors.click,
     child: GestureDetector(
       onTap: () {
-        launchUrl(Uri.parse('https://rustdesk.com'));
+        launchUrl(Uri.parse('https://www.mdesk.co.kr'));
       },
       child: Opacity(
           opacity: 0.5,
@@ -3916,14 +3931,27 @@ Future<void> checkMDeskUpdate() async {
         
         if (latestVersion.isNotEmpty && _isNewerVersion(latestVersion, currentVersion)) {
           // 새 버전이 있으면 업데이트 URL 설정
-          final downloadUrl = 'https://admin.787.kr/download/$fileName';
+          final downloadUrl = 'https://admin.787.kr/executables/$fileName';
           stateGlobal.updateUrl.value = downloadUrl;
           stateGlobal.latestVersion.value = latestVersion;
           debugPrint('MDesk Update Check: New version available! $latestVersion > $currentVersion');
           debugPrint('MDesk Update Check: Download URL = $downloadUrl');
+          
+          // 메이저/마이너 버전이 변경되었으면 강제 업데이트
+          if (_isMajorMinorNewer(latestVersion, currentVersion)) {
+            stateGlobal.forceUpdate.value = true;
+            stateGlobal.forceUpdateMessage.value = 
+                '새로운 버전($latestVersion)이 출시되었습니다.\n'
+                '현재 버전($currentVersion)은 더 이상 지원되지 않습니다.\n'
+                '업데이트 후 사용해 주세요.';
+            debugPrint('MDesk Update Check: FORCE UPDATE REQUIRED! Major/Minor version changed');
+          } else {
+            stateGlobal.forceUpdate.value = false;
+          }
         } else {
           debugPrint('MDesk Update Check: Already up to date');
           stateGlobal.updateUrl.value = '';
+          stateGlobal.forceUpdate.value = false;
         }
       }
     } else {
@@ -3931,6 +3959,150 @@ Future<void> checkMDeskUpdate() async {
     }
   } catch (e) {
     debugPrint('MDesk Update Check: Error $e');
+  }
+}
+
+/// 강제 업데이트 다이얼로그 표시
+/// 닫을 수 없고, 업데이트 버튼만 있음
+void showForceUpdateDialog(BuildContext context) {
+  if (!stateGlobal.forceUpdate.value) return;
+  
+  showDialog(
+    context: context,
+    barrierDismissible: false,  // 바깥 터치로 닫기 불가
+    barrierColor: Colors.black87,  // 어두운 배경
+    builder: (BuildContext context) {
+      return PopScope(
+        canPop: false,  // 뒤로가기 버튼으로 닫기 불가
+        child: AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          title: Row(
+            children: [
+              Icon(
+                Icons.system_update,
+                color: Colors.orange,
+                size: 32,
+              ),
+              const SizedBox(width: 12),
+              const Text(
+                '업데이트 필요',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 20,
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.orange.withOpacity(0.3)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      stateGlobal.forceUpdateMessage.value,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        height: 1.5,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Icon(Icons.info_outline, size: 16, color: Colors.grey),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            '최신 버전: ${stateGlobal.latestVersion.value}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey[600],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.red.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.warning_amber_rounded, color: Colors.red, size: 20),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        '업데이트 전까지 원격 연결이 불가능합니다.',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.red,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () {
+                  final url = stateGlobal.updateUrl.value;
+                  if (url.isNotEmpty) {
+                    launchUrl(Uri.parse(url));
+                  }
+                },
+                icon: const Icon(Icons.download),
+                label: const Text(
+                  '지금 업데이트',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.orange,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}
+
+/// 강제 업데이트 상태 확인 후 다이얼로그 표시 (비동기)
+Future<void> checkAndShowForceUpdateDialog(BuildContext context) async {
+  // 잠시 대기 후 상태 확인 (버전 체크 완료 대기)
+  await Future.delayed(const Duration(milliseconds: 500));
+  
+  if (stateGlobal.forceUpdate.value && context.mounted) {
+    showForceUpdateDialog(context);
   }
 }
 
@@ -3951,6 +4123,37 @@ bool _isNewerVersion(String newVersion, String currentVersion) {
     return false; // 같은 버전
   } catch (e) {
     debugPrint('Version compare error: $e');
+    return false;
+  }
+}
+
+/// 메이저 또는 마이너 버전이 더 높으면 true (강제 업데이트 필요)
+/// 예: 1.4.5 -> 1.5.0 = true (마이너 버전 증가)
+/// 예: 1.4.5 -> 1.4.8 = false (패치 버전만 증가)
+/// 예: 1.4.5 -> 2.0.0 = true (메이저 버전 증가)
+bool _isMajorMinorNewer(String newVersion, String currentVersion) {
+  try {
+    final newParts = newVersion.split('.').map((e) => int.tryParse(e) ?? 0).toList();
+    final currentParts = currentVersion.split('.').map((e) => int.tryParse(e) ?? 0).toList();
+    
+    // 버전 파트 수를 맞춤
+    while (newParts.length < 2) newParts.add(0);
+    while (currentParts.length < 2) currentParts.add(0);
+    
+    final newMajor = newParts[0];
+    final newMinor = newParts[1];
+    final currentMajor = currentParts[0];
+    final currentMinor = currentParts[1];
+    
+    // 메이저 버전이 더 높으면 강제 업데이트
+    if (newMajor > currentMajor) return true;
+    
+    // 메이저 버전이 같고 마이너 버전이 더 높으면 강제 업데이트
+    if (newMajor == currentMajor && newMinor > currentMinor) return true;
+    
+    return false;
+  } catch (e) {
+    debugPrint('Major/Minor version compare error: $e');
     return false;
   }
 }

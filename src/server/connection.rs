@@ -654,22 +654,38 @@ impl Connection {
                             if !conn.is_remote() {
                                 continue;
                             }
-                            match clip {
+                            match &clip {
                                 clipboard::ClipboardFile::Files { files } => {
-                                    let files = files.into_iter().map(|(f, s)| {
-                                        (f, s as i64)
-                                    }).collect::<Vec<_>>();
+                                    let files_audit: Vec<(String, i64)> = files.iter().map(|(f, s)| {
+                                        (f.clone(), *s as i64)
+                                    }).collect();
                                     conn.post_file_audit(
                                         FileAuditType::RemoteSend,
                                         "",
-                                        files,
+                                        files_audit,
                                         json!({}),
                                     );
                                 }
-                                _ => {
-                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                clipboard::ClipboardFile::FormatList { format_list } => {
+                                    // 서버 → 클라이언트 클립보드 파일 전송 감지
+                                    let has_file_format = format_list.iter().any(|(_, format)| {
+                                        format.contains("FileGroupDescriptor") || 
+                                        format.contains("FileContents")
+                                    });
+                                    if has_file_format {
+                                        log::info!("Clipboard file transfer detected from server to client");
+                                        conn.post_file_audit(
+                                            FileAuditType::RemoteSend,
+                                            "clipboard",
+                                            vec![("clipboard file transfer".to_string(), 0i64)],
+                                            json!({}),
+                                        );
+                                    }
                                 }
+                                _ => {}
                             }
+                            // 모든 클립보드 메시지 전송
+                            allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
                         }
                         ipc::Data::PrivacyModeState((_, state, impl_key)) => {
                             let msg_out = match state {
@@ -1055,7 +1071,15 @@ impl Connection {
 
     async fn post_seq_loop(mut rx: mpsc::UnboundedReceiver<(String, Value)>) {
         while let Some((url, v)) = rx.recv().await {
-            allow_err!(Self::post_audit_async(url, v).await);
+            log::info!("Posting audit to {}", url);
+            match Self::post_audit_async(url.clone(), v).await {
+                Ok(response) => {
+                    log::info!("Audit response from {}: {}", url, response);
+                }
+                Err(e) => {
+                    log::error!("Failed to post audit to {}: {}", url, e);
+                }
+            }
         }
         log::debug!("post_seq_loop exited");
     }
@@ -1202,18 +1226,48 @@ impl Connection {
             Config::get_option("custom-rendezvous-server"),
             "file".to_owned(),
         );
+        log::info!(
+            "Audit server configured - conn: {}, file: {}",
+            self.server_audit_conn,
+            self.server_audit_file
+        );
     }
 
     fn post_conn_audit(&self, v: Value) {
         if self.server_audit_conn.is_empty() {
+            log::debug!("Audit URL is empty, skipping conn audit");
             return;
         }
         let url = self.server_audit_conn.clone();
         let mut v = v;
+        
+        // conn_id는 항상 포함
+        v["conn_id"] = json!(self.inner.id);
+        
+        // close 액션일 때는 별도 태스크에서 직접 HTTP 요청 전송 (연결 종료 시에도 확실히 전송)
+        if v["action"] == "close" {
+            log::info!("Sending conn audit (close) to {}: {:?}", url, v);
+            let url_clone = url.clone();
+            tokio::spawn(async move {
+                match Self::post_audit_async(url, v).await {
+                    Ok(response) => {
+                        log::info!("Conn close audit response from {}: {}", url_clone, response);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to post conn close audit to {}: {}", url_clone, e);
+                    }
+                }
+            });
+            return;
+        }
+        
+        // new 및 기타 액션일 때는 전체 정보 전송
         v["id"] = json!(Config::get_id());
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
-        v["conn_id"] = json!(self.inner.id);
+        v["from_id"] = json!(self.lr.my_id.clone());
         v["session_id"] = json!(self.lr.session_id);
+        
+        log::info!("Sending conn audit to {}: {:?}", url, v);
         allow_err!(self.tx_post_seq.send((url, v)));
     }
 
@@ -1238,33 +1292,50 @@ impl Connection {
         r#type: FileAuditType,
         path: &str,
         files: Vec<(String, i64)>,
-        info: Value,
+        _info: Value,
     ) {
         if self.server_audit_file.is_empty() {
+            log::debug!("Audit URL is empty, skipping file audit");
             return;
         }
         let url = self.server_audit_file.clone();
-        let file_num = files.len();
         let mut files = files;
         files.sort_by(|a, b| b.1.cmp(&a.1));
         files.truncate(10);
-        let is_file = files.len() == 1 && files[0].0.is_empty();
-        let mut info = info;
-        info["ip"] = json!(self.ip.clone());
-        info["name"] = json!(self.lr.my_name.clone());
-        info["num"] = json!(file_num);
-        info["files"] = json!(files);
-        let v = json!({
-            "id":json!(Config::get_id()),
-            "uuid":json!(crate::encode64(hbb_common::get_uuid())),
-            "peer_id":json!(self.lr.my_id),
-            "type": r#type as i8,
-            "path":path,
-            "is_file":is_file,
-            "info":json!(info).to_string(),
+        
+        // files를 [[filename, size], ...] 형식으로 변환
+        let files_array: Vec<Value> = files
+            .iter()
+            .map(|(name, size)| json!([name, size]))
+            .collect();
+        
+        // info 필드 구성: {"files": [[...]], "ip": "..."}
+        let info = json!({
+            "files": files_array,
+            "ip": self.ip.clone()
         });
+        
+        // 사용자 요청 형식에 맞춤:
+        // id = 연결하는 클라이언트 ID (from_id)
+        // peer_id = 서버(자신)의 ID
+        let v = json!({
+            "id": json!(self.lr.my_id.clone()),
+            "peer_id": json!(Config::get_id()),
+            "path": path,
+            "type": r#type as i8,
+            "info": info.to_string(),
+        });
+        log::info!("Sending file audit to {}: {:?}", url, v);
+        let url_clone = url.clone();
         tokio::spawn(async move {
-            allow_err!(Self::post_audit_async(url, v).await);
+            match Self::post_audit_async(url, v).await {
+                Ok(response) => {
+                    log::info!("File audit response from {}: {}", url_clone, response);
+                }
+                Err(e) => {
+                    log::error!("Failed to post file audit to {}: {}", url_clone, e);
+                }
+            }
         });
     }
 
@@ -1275,6 +1346,7 @@ impl Connection {
             "alarm".to_owned(),
         );
         if url.is_empty() {
+            log::debug!("Audit URL is empty, skipping alarm audit");
             return;
         }
         let mut v = Value::default();
@@ -1282,8 +1354,17 @@ impl Connection {
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["typ"] = json!(typ as i8);
         v["info"] = serde_json::Value::String(info.to_string());
+        log::info!("Sending alarm audit to {}: {:?}", url, v);
+        let url_clone = url.clone();
         tokio::spawn(async move {
-            allow_err!(Self::post_audit_async(url, v).await);
+            match Self::post_audit_async(url, v).await {
+                Ok(response) => {
+                    log::info!("Alarm audit response from {}: {}", url_clone, response);
+                }
+                Err(e) => {
+                    log::error!("Failed to post alarm audit to {}: {}", url_clone, e);
+                }
+            }
         });
     }
 
@@ -1354,6 +1435,21 @@ impl Connection {
         self.post_conn_audit(
             json!({"peer": ((&self.lr.my_id, &self.lr.my_name)), "type": conn_type}),
         );
+        
+        // 포터블 모드에서 원격 연결 시 agentclose API 호출
+        #[cfg(windows)]
+        {
+            let agent_id = Config::get_option("custom-agentid");
+            let custom_id = Config::get_option("custom-id");
+            if !agent_id.is_empty() && conn_type == 0 {
+                // Remote 연결일 때만 (conn_type == 0)
+                let user_id = if custom_id.is_empty() { "admin".to_string() } else { custom_id };
+                let url = format!("https://787.kr/api/agentclose/{}/{}", user_id, agent_id);
+                log::info!("[MDesk] Client authorized! Calling agentclose API: {}", url);
+                crate::common::get_request_fire_and_forget(url);
+            }
+        }
+        
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
         let mut res = LoginResponse::new();
@@ -1856,7 +1952,7 @@ impl Connection {
             return false;
         }
         let mut hasher = Sha256::new();
-        hasher.update(password);
+        hasher.update(&password);
         hasher.update(&self.hash.salt);
         let mut hasher2 = Sha256::new();
         hasher2.update(&hasher.finalize()[..]);
@@ -1865,9 +1961,59 @@ impl Connection {
     }
 
     fn validate_password(&mut self) -> bool {
+        log::info!("========== 암호 검증 시작 ==========");
+        log::info!("접속 시도 피어: {}", self.lr.my_id);
+        
+        // 먼저 등록된 원격자의 연결 암호로 인증 시도
+        log::info!("[1단계] 등록된 원격자 암호로 인증 시도...");
+        if self.validate_registered_remote_user() {
+            log::info!("★★★ 등록된 원격자로 인증 성공: {} ★★★", self.lr.my_id);
+            return true;
+        }
+        log::info!("[1단계] 등록된 원격자 인증 실패");
+
+        // 포터블 모드: 현재 실행 파일이 설치 경로가 아닌 곳에서 실행 중
+        // 설치된 상태에서 일회용 비밀번호가 표시되면: 일회용 비밀번호만 사용
+        let is_portable = crate::is_running_portable();
+        log::info!("포터블 모드: {}", is_portable);
+        
+        if is_portable {
+            // 포터블 모드: 고정 비밀번호 우선, 없으면 일회용 비밀번호
+            log::info!("[2단계-포터블] 고정 비밀번호 확인...");
+            if password::permanent_enabled() {
+                let permanent_password = Config::get_permanent_password();
+                log::info!("고정 비밀번호 설정됨: {}", !permanent_password.is_empty());
+                if !permanent_password.is_empty() && self.validate_one_password(permanent_password) {
+                    log::info!("★★★ 고정 비밀번호로 인증 성공 ★★★");
+                    return true;
+                }
+            }
+            // 고정 비밀번호가 없거나 틀린 경우, 일회용 비밀번호 시도
+            log::info!("[2단계-포터블] 일회용 비밀번호 확인...");
+            if password::temporary_enabled() {
+                let password = password::temporary_password();
+                log::info!("일회용 비밀번호 길이: {}", password.len());
+                if self.validate_one_password(password.clone()) {
+                    log::info!("★★★ 일회용 비밀번호로 인증 성공 ★★★");
+                    raii::AuthedConnID::update_or_insert_session(
+                        self.session_key(),
+                        Some(password),
+                        Some(false),
+                    );
+                    return true;
+                }
+            }
+            log::info!("========== 암호 검증 실패 (포터블 모드) ==========");
+            return false;
+        }
+        
+        // 설치된 상태: 일회용 비밀번호가 표시되면 일회용만 사용
+        log::info!("[2단계-설치] 일회용 비밀번호 확인...");
         if password::temporary_enabled() {
             let password = password::temporary_password();
+            log::info!("일회용 비밀번호 활성화됨, 길이: {}", password.len());
             if self.validate_one_password(password.clone()) {
+                log::info!("★★★ 일회용 비밀번호로 인증 성공 ★★★");
                 raii::AuthedConnID::update_or_insert_session(
                     self.session_key(),
                     Some(password),
@@ -1875,14 +2021,166 @@ impl Connection {
                 );
                 return true;
             }
+            // 일회용 비밀번호가 활성화된 상태에서는 고정 비밀번호 사용 불가
+            log::info!("========== 암호 검증 실패 (일회용 모드) ==========");
+            return false;
         }
+        
+        // 일회용 비밀번호가 비활성화된 경우: 고정 비밀번호만 사용
+        log::info!("[2단계-설치] 고정 비밀번호 확인...");
         if password::permanent_enabled() {
-            if self.validate_one_password(Config::get_permanent_password()) {
+            let permanent_password = Config::get_permanent_password();
+            log::info!("고정 비밀번호 설정됨: {}", !permanent_password.is_empty());
+            if self.validate_one_password(permanent_password) {
+                log::info!("★★★ 고정 비밀번호로 인증 성공 ★★★");
                 return true;
             }
         }
+        log::info!("========== 암호 검증 실패 ==========");
         false
     }
+
+    /// 등록된 원격자의 연결 암호로 인증 확인
+    fn validate_registered_remote_user(&self) -> bool {
+        use hbb_common::config::{LocalConfig, Config};
+        
+        log::info!("[RemoteUser] ========== 원격자 인증 시작 ==========");
+        log::info!("[RemoteUser] 접속 시도 피어 ID: {}", self.lr.my_id);
+        log::info!("[RemoteUser] 포터블 모드: {}", crate::is_running_portable());
+        
+        // 설정 파일 경로 출력
+        let config_path = Config::path("MDesk_local.toml");
+        log::info!("[RemoteUser] 설정 파일 경로: {:?}", config_path);
+        log::info!("[RemoteUser] 파일 존재 여부: {}", config_path.exists());
+        
+        // 파일에서 직접 읽기 (캐시된 값이 아닌 최신 값 사용)
+        let registered_users_json = LocalConfig::get_option_from_file("registered_remote_users");
+        log::info!("[RemoteUser] registered_remote_users 값 길이: {}", registered_users_json.len());
+        
+        if registered_users_json.is_empty() {
+            // 캐시된 값도 확인
+            let cached_value = LocalConfig::get_option("registered_remote_users");
+            log::info!("[RemoteUser] 캐시된 값 길이: {}", cached_value.len());
+            
+            log::info!("[RemoteUser] 등록된 원격자 없음 (registered_remote_users 비어있음)");
+            log::info!("[RemoteUser] 설정 파일을 확인하세요: {:?}", config_path);
+            return false;
+        }
+        
+        log::info!("[RemoteUser] 등록된 원격자 JSON 길이: {}", registered_users_json.len());
+
+        // JSON 파싱
+        let users: Vec<serde_json::Value> = match serde_json::from_str(&registered_users_json) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("[RemoteUser] JSON 파싱 실패: {}", e);
+                log::error!("[RemoteUser] JSON 내용: {}", registered_users_json);
+                return false;
+            }
+        };
+
+        log::info!("[RemoteUser] 등록된 원격자 수: {}", users.len());
+        
+        // 등록된 모든 원격자의 연결 암호로 인증 시도
+        for (idx, user) in users.iter().enumerate() {
+            let user_id = user.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let user_name = user.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            
+            // 암호화된 연결 암호 가져오기
+            let encrypted_password = user
+                .get("connectionPassword")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            
+            log::info!("[RemoteUser] [{}/{}] 인증 시도 - 사용자: {} ({}), 저장된 암호 길이: {}", 
+                idx + 1, users.len(), user_name, user_id, encrypted_password.len());
+            
+            if encrypted_password.is_empty() {
+                log::info!("[RemoteUser] [{}/{}] 암호가 비어있어 건너뜀", idx + 1, users.len());
+                continue;
+            }
+
+            // 암호 복호화 및 검증 (암호화된 암호와 평문 암호 모두 시도)
+            let decrypted_password = self.decrypt_connection_password(encrypted_password);
+            log::info!("[RemoteUser] [{}/{}] 복호화된 암호 길이: {}", idx + 1, users.len(), decrypted_password.len());
+            
+            // 1. 복호화된 암호로 시도
+            log::info!("[RemoteUser] [{}/{}] 복호화된 암호로 검증 시도...", idx + 1, users.len());
+            if self.validate_one_password(decrypted_password.clone()) {
+                log::info!("[RemoteUser] ★★★ 인증 성공 (복호화된 암호) - 사용자: {} ({}) ★★★", user_name, user_id);
+                return true;
+            }
+            log::info!("[RemoteUser] [{}/{}] 복호화된 암호 검증 실패", idx + 1, users.len());
+            
+            // 2. 복호화된 암호와 원본이 다르면, 원본(평문)으로도 시도
+            if decrypted_password != encrypted_password {
+                log::info!("[RemoteUser] [{}/{}] 평문 암호로 검증 시도...", idx + 1, users.len());
+                if self.validate_one_password(encrypted_password.to_string()) {
+                    log::info!("[RemoteUser] ★★★ 인증 성공 (평문 암호) - 사용자: {} ({}) ★★★", user_name, user_id);
+                    return true;
+                }
+                log::info!("[RemoteUser] [{}/{}] 평문 암호 검증 실패", idx + 1, users.len());
+            }
+        }
+        
+        log::info!("[RemoteUser] 모든 등록된 원격자 암호 검증 실패");
+        log::info!("[RemoteUser] ========== 원격자 인증 종료 ==========");
+        false
+    }
+
+    /// 연결 암호 복호화 (Flutter와 동일한 XOR + Base64)
+    /// 평문 암호도 지원: 복호화 결과가 유효하지 않으면 원본 사용
+    fn decrypt_connection_password(&self, encrypted: &str) -> String {
+        use hbb_common::base64::{Engine as _, engine::general_purpose::STANDARD};
+        
+        const ENCRYPTION_KEY: &[u8] = b"MDesk2024SecureKey!@#";
+        
+        if encrypted.is_empty() {
+            log::info!("[RemoteUser] 복호화: 빈 암호");
+            return String::new();
+        }
+
+        // Base64 디코딩 시도
+        let bytes = match STANDARD.decode(encrypted) {
+            Ok(b) => {
+                log::info!("[RemoteUser] 복호화: Base64 디코딩 성공, {} 바이트", b.len());
+                b
+            }
+            Err(e) => {
+                // Base64 디코딩 실패 = 평문 암호
+                log::info!("[RemoteUser] 복호화: Base64 디코딩 실패 ({}) -> 평문으로 사용", e);
+                return encrypted.to_string();
+            }
+        };
+
+        // XOR 복호화
+        let decrypted: Vec<u8> = bytes
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ ENCRYPTION_KEY[i % ENCRYPTION_KEY.len()])
+            .collect();
+
+        // UTF-8 변환 시도
+        match String::from_utf8(decrypted.clone()) {
+            Ok(s) => {
+                // 복호화된 문자열이 출력 가능한 ASCII인지 확인
+                if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                    log::info!("[RemoteUser] 복호화: XOR 복호화 성공");
+                    s
+                } else {
+                    // 복호화 결과가 이상하면 평문 암호로 간주
+                    log::info!("[RemoteUser] 복호화: XOR 결과 비정상 -> 평문으로 사용");
+                    encrypted.to_string()
+                }
+            }
+            Err(_) => {
+                // UTF-8 변환 실패 = 평문 암호로 간주
+                log::info!("[RemoteUser] 복호화: UTF-8 변환 실패 -> 평문으로 사용");
+                encrypted.to_string()
+            }
+        }
+    }
+
 
     fn is_recent_session(&mut self, tfa: bool) -> bool {
         SESSIONS
@@ -2544,6 +2842,24 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 Some(message::Union::Cliprdr(clip)) => {
+                    // Windows 클립보드 파일 전송 감지: FormatList에 파일 형식이 있으면 audit 기록
+                    #[cfg(target_os = "windows")]
+                    if let Some(cliprdr::Union::FormatList(format_list)) = &clip.union {
+                        let has_file_format = format_list.formats.iter().any(|f| {
+                            f.format.contains("FileGroupDescriptor") || 
+                            f.format.contains("FileContents")
+                        });
+                        if has_file_format {
+                            log::info!("Clipboard file transfer detected from client");
+                            self.post_file_audit(
+                                FileAuditType::RemoteReceive,
+                                "clipboard",
+                                vec![("clipboard file transfer".to_string(), 0i64)],
+                                json!({}),
+                            );
+                        }
+                    }
+                    
                     if let Some(cliprdr::Union::Files(files)) = &clip.union {
                         self.post_file_audit(
                             FileAuditType::RemoteReceive,
@@ -4872,6 +5188,11 @@ mod raii {
                     .unwrap()
                     .on_connection_open(conn_id);
             }
+            // Show remote overlay indicator on Windows
+            #[cfg(target_os = "windows")]
+            if conn_type == AuthConnType::Remote {
+                crate::platform::windows::remote_overlay::show_remote_indicator();
+            }
             Self(conn_id, conn_type)
         }
 
@@ -4978,6 +5299,11 @@ mod raii {
 
     impl Drop for AuthedConnID {
         fn drop(&mut self) {
+            // Hide remote overlay indicator on Windows
+            #[cfg(target_os = "windows")]
+            if self.1 == AuthConnType::Remote {
+                crate::platform::windows::remote_overlay::hide_remote_indicator();
+            }
             if self.1 == AuthConnType::Remote || self.1 == AuthConnType::ViewCamera {
                 scrap::codec::Encoder::update(scrap::codec::EncodingUpdate::Remove(self.0));
                 video_service::VIDEO_QOS

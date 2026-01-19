@@ -535,6 +535,11 @@ abstract class BasePeerCard extends StatelessWidget {
           .expand((i) => i)
           .toList();
 
+  /// Public method to build menu items for external use (e.g., TreeView)
+  Future<List<mod_menu.PopupMenuEntry<String>>> buildMenuItems(
+          BuildContext context) async =>
+      _buildPopupMenuEntry(context);
+
   @protected
   Future<List<MenuEntryBase<String>>> _buildMenuItems(BuildContext context);
 

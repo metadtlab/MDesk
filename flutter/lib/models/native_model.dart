@@ -134,8 +134,14 @@ class PlatformFFI {
     try {
       _session_get_rgba = dylib.lookupFunction<F3Dart, F3>("session_get_rgba");
       try {
-        // SYSTEM user failed
-        _dir = (await getApplicationDocumentsDirectory()).path;
+        // Windows에서는 빈 문자열로 설정하여 Rust에서 올바른 AppData 경로를 결정하도록 함
+        // 이렇게 하면 포터블/일반 모드에서 동일한 config 경로 사용
+        if (isWindows) {
+          _dir = ''; // Rust에서 AppData\Roaming\{APP_NAME} 경로 사용
+        } else {
+          // SYSTEM user failed
+          _dir = (await getApplicationDocumentsDirectory()).path;
+        }
       } catch (e) {
         debugPrint('Failed to get documents directory: $e');
       }

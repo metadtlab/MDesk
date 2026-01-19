@@ -60,6 +60,7 @@ if %CLEAN_BUILD%==1 (
     if exist "flutter\build\windows" rd /s /q "flutter\build\windows" 2>nul
     cd flutter
     call flutter clean
+    call flutter pub get
     cd ..
     echo [OK] Flutter cache cleaned
 ) else (
