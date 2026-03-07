@@ -22,6 +22,7 @@ import '../../utils/image.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/kb_layout_type_chooser.dart';
 import '../widgets/tabbar_widget.dart';
+import '../widgets/whiteboard_overlay.dart';
 
 import 'package:flutter_hbb/native/custom_cursor.dart'
     if (dart.library.html) 'package:flutter_hbb/web/custom_cursor.dart';
@@ -89,6 +90,9 @@ class _RemotePageState extends State<RemotePage>
   var _blockableOverlayState = BlockableOverlayState();
 
   final FocusNode _rawKeyFocusNode = FocusNode(debugLabel: "rawkeyFocusNode");
+  
+  // 화이트보드 컨트롤러
+  final WhiteboardController _whiteboardController = WhiteboardController();
 
   // We need `_instanceIdOnEnterOrLeaveImage4Toolbar` together with `_onEnterOrLeaveImage4Toolbar`
   // to identify the toolbar instance and its callback function.
@@ -115,12 +119,18 @@ class _RemotePageState extends State<RemotePage>
     super.initState();
     _ffi = FFI(widget.sessionId);
     Get.put<FFI>(_ffi, tag: widget.id);
+    // 화이트보드 컨트롤러 등록 및 세션 ID 설정
+    Get.put<WhiteboardController>(_whiteboardController, tag: widget.id);
+    _whiteboardController.setSessionId(_ffi.sessionId);
     _ffi.imageModel.addCallbackOnFirstImage((String peerId) {
       _ffi.canvasModel.activateLocalCursor();
       showKBLayoutTypeChooserIfNeeded(
           _ffi.ffiModel.pi.platform, _ffi.dialogManager);
       _ffi.recordingModel
           .updateStatus(bind.sessionGetIsRecording(sessionId: _ffi.sessionId));
+      
+      // 화이트보드 컨트롤러에 원격 화면 해상도 설정
+      _updateWhiteboardRemoteDisplaySize();
     });
     _ffi.canvasModel.initializeEdgeScrollFallback(this);
     _ffi.start(
@@ -243,6 +253,22 @@ class _RemotePageState extends State<RemotePage>
       stateGlobal.setFullscreen(false);
     }
   }
+  
+  /// 화이트보드 컨트롤러에 원격 화면 해상도 설정
+  void _updateWhiteboardRemoteDisplaySize() {
+    try {
+      final displays = _ffi.ffiModel.pi.getCurDisplays();
+      if (displays.isNotEmpty) {
+        final display = displays[0];
+        _whiteboardController.setRemoteDisplaySize(
+          display.width.toDouble(),
+          display.height.toDouble(),
+        );
+      }
+    } catch (e) {
+      debugPrint('Whiteboard: Failed to update remote display size: $e');
+    }
+  }
 
   @override
   Future<void> dispose() async {
@@ -272,6 +298,7 @@ class _RemotePageState extends State<RemotePage>
       await WakelockPlus.disable();
     }
     await Get.delete<FFI>(tag: widget.id);
+    Get.delete<WhiteboardController>(tag: widget.id);
     removeSharedStates(widget.id);
   }
 
@@ -542,6 +569,15 @@ class _RemotePageState extends State<RemotePage>
             QualityMonitor(_ffi.qualityMonitorModel), null, null),
       ),
     );
+    
+    // 화이트보드 오버레이 추가
+    paints.add(
+      WhiteboardOverlay(
+        controller: _whiteboardController,
+        ffi: _ffi,
+      ),
+    );
+    
     return Stack(
       children: paints,
     );

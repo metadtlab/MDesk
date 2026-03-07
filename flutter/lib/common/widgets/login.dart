@@ -442,6 +442,18 @@ Future<bool?> loginDialog() async {
 
     handleLoginResponse(LoginResponse resp, bool storeIfAccessToken,
         void Function([dynamic])? close) async {
+      // MDesk 2차 인증(2FA) 필요 시 - API서버 tfa_required 응답
+      // 모든 플랫폼에서 로그인 다이얼로그를 먼저 닫음 (FocusScope 충돌 방지)
+      if (resp.tfaRequired && resp.tfaKey != null && resp.tfaKey!.isNotEmpty) {
+        curOP.value = '';
+        if (close != null) close(null);
+        final res = await mdesk2faVerifyDialog(
+            resp.tfaKey!, resp.tfaMethods ?? [], resp.tfaMessage);
+        if (res == true) {
+          return;
+        }
+        return;
+      }
       switch (resp.type) {
         case HttpType.kAuthResTypeToken:
           if (resp.access_token != null) {
@@ -631,6 +643,89 @@ Future<bool?> loginDialog() async {
     await UserModel.updateOtherModels();
   }
 
+  return res;
+}
+
+/// MDesk 2차 인증(2FA) 인증코드 입력 다이얼로그
+/// API서버에서 tfa_required 응답 후 6자리 인증코드 검증
+Future<bool?> mdesk2faVerifyDialog(String tfaKey,
+    List<Map<String, dynamic>> tfaMethods, String? tfaMessage) async {
+  var isInProgress = false;
+  String? errorText;
+  final code = TextEditingController();
+
+  final res = await gFFI.dialogManager.show<bool>((setState, close, context) {
+    void onVerify() async {
+      setState(() => isInProgress = true);
+      setState(() => errorText = null);
+      try {
+        final resp = await gFFI.userModel.login2faVerify(tfaKey, code.text);
+        if (resp.access_token != null && resp.user != null) {
+          await bind.mainSetLocalOption(
+              key: 'access_token', value: resp.access_token!);
+          await bind.mainSetLocalOption(
+              key: 'user_info', value: jsonEncode(resp.user!));
+          close(true);
+          return;
+        }
+        setState(() => errorText = translate('Unknown error'));
+      } on RequestException catch (err) {
+        setState(() => errorText = translate(err.cause));
+      } catch (err) {
+        setState(() => errorText = "Unknown Error: $err");
+      }
+      setState(() => isInProgress = false);
+    }
+
+    final codeField = Dialog2FaField(
+      controller: code,
+      errorText: errorText,
+      readyCallback: onVerify,
+      onChanged: () => errorText = null,
+    );
+
+    return CustomAlertDialog(
+      title: Text(translate('Login') + ' - 2차 인증'),
+      contentBoxConstraints: BoxConstraints(maxWidth: 320),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (tfaMessage != null && tfaMessage.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12.0),
+              child: Text(
+                tfaMessage,
+                style: TextStyle(fontSize: 14),
+              ),
+            ),
+          if (tfaMethods.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8.0),
+              child: Text(
+                tfaMethods
+                    .map((m) =>
+                        '${m['type'] == 'email' ? "이메일" : "휴대전화"}: ${m['target']?.toString() ?? ''}')
+                    .join(' / '),
+                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+              ),
+            ),
+          codeField,
+          if (isInProgress) const LinearProgressIndicator(),
+        ],
+      ),
+      onCancel: close,
+      onSubmit: codeField.isReady ? onVerify : null,
+      actions: [
+        dialogButton("Cancel", onPressed: close, isOutline: true),
+        dialogButton("Verify", onPressed: codeField.isReady ? onVerify : null),
+      ],
+    );
+  });
+
+  if (res == true) {
+    await UserModel.updateOtherModels();
+  }
   return res;
 }
 

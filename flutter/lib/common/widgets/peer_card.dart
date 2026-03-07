@@ -5,6 +5,10 @@ import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
+import 'package:flutter_hbb/utils/device_register_service.dart';
+import 'package:flutter_hbb/utils/favorite_service.dart';
+import 'package:flutter_hbb/common/widgets/login.dart';
+import 'package:flutter_hbb/common/widgets/peer_tree_view.dart' show refreshMyDevicesCallback;
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 
@@ -813,10 +817,21 @@ abstract class BasePeerCard extends StatelessWidget {
               bind.mainLoadRecentPeers();
               break;
             case PeerTabIndex.fav:
-              final favs = (await bind.mainGetFav()).toList();
-              if (favs.remove(id)) {
-                await bind.mainStoreFav(favs: favs);
-                bind.mainLoadFavPeers();
+              if (gFFI.userModel.isLogin) {
+                final apiServer = await bind.mainGetApiServer();
+                final accessToken = bind.mainGetLocalOption(key: 'access_token');
+                if (apiServer.isNotEmpty && accessToken.isNotEmpty) {
+                  final resp = await favoriteService.removeFavorite(
+                    apiServer: apiServer,
+                    accessToken: accessToken,
+                    peerId: id,
+                  );
+                  if (resp.isUnauthorized) {
+                    await gFFI.userModel.reset(resetOther: true);
+                  } else if (resp.success) {
+                    loadFavPeers();
+                  }
+                }
               }
               break;
             case PeerTabIndex.lan:
@@ -869,7 +884,7 @@ abstract class BasePeerCard extends StatelessWidget {
   }
 
   @protected
-  MenuEntryBase<String> _addFavAction(String id) {
+  MenuEntryBase<String> _addFavAction(String id, {String? displayName}) {
     return MenuEntryButton<String>(
       childBuilder: (TextStyle? style) => Row(
         children: [
@@ -889,12 +904,30 @@ abstract class BasePeerCard extends StatelessWidget {
       ),
       proc: () {
         () async {
-          final favs = (await bind.mainGetFav()).toList();
-          if (!favs.contains(id)) {
-            favs.add(id);
-            await bind.mainStoreFav(favs: favs);
+          if (!gFFI.userModel.isLogin) {
+            await loginDialog();
+            return;
           }
-          showToast(translate('Successful'));
+          final apiServer = await bind.mainGetApiServer();
+          final accessToken = bind.mainGetLocalOption(key: 'access_token');
+          if (apiServer.isEmpty || accessToken.isEmpty) {
+            showToast(translate('Failed'));
+            return;
+          }
+          final resp = await favoriteService.addFavorite(
+            apiServer: apiServer,
+            accessToken: accessToken,
+            peerId: id,
+            displayName: displayName,
+          );
+          if (resp.isUnauthorized) {
+            await gFFI.userModel.reset(resetOther: true);
+          } else if (resp.success) {
+            loadFavPeers();
+            showToast(translate('Successful'));
+          } else {
+            showToast(translate('Failed'));
+          }
         }();
       },
       padding: menuPadding,
@@ -924,12 +957,21 @@ abstract class BasePeerCard extends StatelessWidget {
       ),
       proc: () {
         () async {
-          final favs = (await bind.mainGetFav()).toList();
-          if (favs.remove(id)) {
-            await bind.mainStoreFav(favs: favs);
+          if (!gFFI.userModel.isLogin) return;
+          final apiServer = await bind.mainGetApiServer();
+          final accessToken = bind.mainGetLocalOption(key: 'access_token');
+          if (apiServer.isEmpty || accessToken.isEmpty) return;
+          final resp = await favoriteService.removeFavorite(
+            apiServer: apiServer,
+            accessToken: accessToken,
+            peerId: id,
+          );
+          if (resp.isUnauthorized) {
+            await gFFI.userModel.reset(resetOther: true);
+          } else if (resp.success) {
             await reloadFunc();
+            showToast(translate('Successful'));
           }
-          showToast(translate('Successful'));
         }();
       },
       padding: menuPadding,
@@ -984,8 +1026,6 @@ class RecentPeerCard extends BasePeerCard {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
-    final List favs = (await bind.mainGetFav()).toList();
-
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
       menuItems.add(_tcpTunnelingAction(context));
     }
@@ -1007,10 +1047,13 @@ class RecentPeerCard extends BasePeerCard {
       menuItems.add(_unrememberPasswordAction(peer.id));
     }
 
-    if (!favs.contains(peer.id)) {
-      menuItems.add(_addFavAction(peer.id));
-    } else {
-      menuItems.add(_rmFavAction(peer.id, () async {}));
+    if (gFFI.userModel.isLogin) {
+      final isInFav = gFFI.favoritePeersModel.peers.any((p) => p.id == peer.id);
+      if (!isInFav) {
+        menuItems.add(_addFavAction(peer.id, displayName: peer.alias.isEmpty ? peer.hostname : peer.alias));
+      } else {
+        menuItems.add(_rmFavAction(peer.id, () async {}));
+      }
     }
 
     if (gFFI.userModel.userName.isNotEmpty) {
@@ -1069,9 +1112,11 @@ class FavoritePeerCard extends BasePeerCard {
     if (await bind.mainPeerHasPassword(id: peer.id)) {
       menuItems.add(_unrememberPasswordAction(peer.id));
     }
-    menuItems.add(_rmFavAction(peer.id, () async {
-      await bind.mainLoadFavPeers();
-    }));
+    if (gFFI.userModel.isLogin) {
+      menuItems.add(_rmFavAction(peer.id, () async {
+        await loadFavPeers();
+      }));
+    }
 
     if (gFFI.userModel.userName.isNotEmpty) {
       menuItems.add(_addToAb(peer));
@@ -1084,7 +1129,7 @@ class FavoritePeerCard extends BasePeerCard {
 
   @protected
   @override
-  void _update() => bind.mainLoadFavPeers();
+  void _update() => loadFavPeers();
 }
 
 class DiscoveredPeerCard extends BasePeerCard {
@@ -1109,8 +1154,6 @@ class DiscoveredPeerCard extends BasePeerCard {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
-    final List favs = (await bind.mainGetFav()).toList();
-
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
       menuItems.add(_tcpTunnelingAction(context));
     }
@@ -1126,10 +1169,13 @@ class DiscoveredPeerCard extends BasePeerCard {
       menuItems.add(_createShortCutAction(peer.id));
     }
 
-    if (!favs.contains(peer.id)) {
-      menuItems.add(_addFavAction(peer.id));
-    } else {
-      menuItems.add(_rmFavAction(peer.id, () async {}));
+    if (gFFI.userModel.isLogin) {
+      final isInFav = gFFI.favoritePeersModel.peers.any((p) => p.id == peer.id);
+      if (!isInFav) {
+        menuItems.add(_addFavAction(peer.id, displayName: peer.alias.isEmpty ? peer.hostname : peer.alias));
+      } else {
+        menuItems.add(_rmFavAction(peer.id, () async {}));
+      }
     }
 
     if (gFFI.userModel.userName.isNotEmpty) {
@@ -1346,7 +1392,106 @@ class MyGroupPeerCard extends BasePeerCard {
     if (gFFI.userModel.userName.isNotEmpty) {
       menuItems.add(_addToAb(peer));
     }
+    
+    // 나의 관리장치에서 삭제 메뉴 추가
+    menuItems.add(MenuEntryDivider());
+    menuItems.add(_deleteFromMyDevicesAction(context));
+    
     return menuItems;
+  }
+
+  /// 나의 관리장치에서 삭제
+  MenuEntryButton<String> _deleteFromMyDevicesAction(BuildContext context) {
+    return MenuEntryButton<String>(
+      childBuilder: (TextStyle? style) => Text(
+        translate('Delete from my devices'),
+        style: style?.copyWith(color: Colors.red),
+      ),
+      proc: () {
+        _showDeleteConfirmDialog(context);
+      },
+      padding: menuPadding,
+      dismissOnClicked: true,
+    );
+  }
+
+  /// 삭제 확인 다이얼로그
+  void _showDeleteConfirmDialog(BuildContext context) {
+    gFFI.dialogManager.show(
+      (setState, close, context) => CustomAlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.orange),
+            SizedBox(width: 8),
+            Text(translate('Delete device')),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('${translate('Are you sure to delete this device?')}'),
+            SizedBox(height: 8),
+            Text(
+              '${peer.alias.isNotEmpty ? peer.alias : peer.hostname} (${peer.id})',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        actions: [
+          dialogButton(
+            'Cancel',
+            onPressed: close,
+            isOutline: true,
+          ),
+          dialogButton(
+            'Delete',
+            onPressed: () async {
+              close();
+              await _deleteDevice();
+            },
+            buttonStyle: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+            ),
+          ),
+        ],
+      ),
+      tag: 'delete-my-device-${peer.id}',
+    );
+  }
+
+  /// 기기 삭제 API 호출
+  Future<void> _deleteDevice() async {
+    try {
+      final apiServer = await bind.mainGetApiServer();
+      final userId = gFFI.userModel.userName.value;
+      
+      if (apiServer.isEmpty) {
+        showToast('API 서버가 설정되지 않았습니다.');
+        return;
+      }
+      
+      if (userId.isEmpty) {
+        showToast('로그인이 필요합니다.');
+        return;
+      }
+      
+      final response = await deviceRegisterService.unregisterDeviceSimple(
+        apiServer: apiServer,
+        userId: userId,
+        remoteId: peer.id,
+      );
+      
+      if (response.success) {
+        showToast('${peer.alias.isNotEmpty ? peer.alias : peer.id} 삭제 완료');
+        // 나의 관리장치 트리뷰 즉시 새로고침
+        refreshMyDevicesCallback?.call();
+      } else {
+        showToast('삭제 실패: ${response.message}');
+      }
+    } catch (e) {
+      showToast('삭제 오류: $e');
+    }
   }
 
   @protected

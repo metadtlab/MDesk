@@ -1409,46 +1409,17 @@ pub fn main_load_recent_peers_for_ab(filter: String) -> String {
     "".to_string()
 }
 
+/// 즐겨찾기는 서버 API 전용. Flutter의 loadFavPeers()가 API에서 로드함.
+/// 레거시/웹 호환을 위해 빈 목록을 푸시.
 pub fn main_load_fav_peers() {
-    let push_to_flutter = |peers| {
-        let data = HashMap::from([("name", "load_fav_peers".to_owned()), ("peers", peers)]);
-        let _res = flutter::push_global_event(
-            flutter::APP_TYPE_MAIN,
-            serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
-        );
-    };
-    if !config::APP_DIR.read().unwrap().is_empty() {
-        let favs = get_fav();
-        let mut recent = PeerConfig::peers(Some(favs.clone()));
-        let mut lan = config::LanPeers::load()
-            .peers
-            .iter()
-            .filter(|d| favs.contains(&d.id) && recent.iter().all(|r| r.0 != d.id))
-            .map(|d| {
-                (
-                    d.id.clone(),
-                    SystemTime::UNIX_EPOCH,
-                    PeerConfig {
-                        info: PeerInfoSerde {
-                            username: d.username.clone(),
-                            hostname: d.hostname.clone(),
-                            platform: d.platform.clone(),
-                        },
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
-        recent.append(&mut lan);
-        let peers: Vec<HashMap<&str, String>> = recent
-            .into_iter()
-            .map(|(id, _, p)| peer_to_map(id, p))
-            .collect();
-
-        push_to_flutter(serde_json::ser::to_string(&peers).unwrap_or("".to_owned()));
-    } else {
-        push_to_flutter("".to_owned());
-    }
+    let data = HashMap::from([
+        ("name", "load_fav_peers".to_owned()),
+        ("peers", "[]".to_owned()),
+    ]);
+    let _res = flutter::push_global_event(
+        flutter::APP_TYPE_MAIN,
+        serde_json::ser::to_string(&data).unwrap_or("[]".to_owned()),
+    );
 }
 
 pub fn main_load_lan_peers() {
@@ -2005,6 +1976,45 @@ pub fn main_create_shortcut(_id: String) {
 pub fn cm_send_chat(conn_id: i32, msg: String) {
     #[cfg(not(any(target_os = "ios")))]
     crate::ui_cm_interface::send_chat(conn_id, msg);
+}
+
+/// 화이트보드 드로잉 스트로크 전송 (피제어자 측에 표시)
+/// points: 정규화된 좌표 리스트 (0.0 ~ 1.0)
+/// argb: ARGB 색상값
+/// stroke_width: 선 두께
+/// tool: 0=pen, 1=highlighter, 2=eraser
+pub fn whiteboard_send_draw(conn_id: i32, points: String, argb: u32, stroke_width: f32, tool: u8) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // JSON 문자열에서 좌표 파싱
+        if let Ok(parsed_points) = serde_json::from_str::<Vec<(f32, f32)>>(&points) {
+            crate::whiteboard::send_draw_stroke(conn_id, parsed_points, argb, stroke_width, tool);
+        }
+    }
+}
+
+/// 화이트보드 드로잉 클리어
+pub fn whiteboard_clear_draw(conn_id: i32) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::whiteboard::clear_draw(conn_id);
+}
+
+/// 화이트보드 드로잉 실행취소
+pub fn whiteboard_undo_draw(conn_id: i32) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::whiteboard::undo_draw(conn_id);
+}
+
+/// 화이트보드 등록 (피제어자 측에서 호출)
+pub fn whiteboard_register(conn_id: i32) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::whiteboard::register_whiteboard(crate::whiteboard::get_key_draw(conn_id));
+}
+
+/// 화이트보드 해제 (피제어자 측에서 호출)
+pub fn whiteboard_unregister(conn_id: i32) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::whiteboard::unregister_whiteboard(crate::whiteboard::get_key_draw(conn_id));
 }
 
 pub fn cm_login_res(conn_id: i32, res: bool) {
@@ -2690,6 +2700,20 @@ pub fn main_get_common(key: String) -> String {
             {
                 "error:unsupported".to_owned()
             }
+        } else if key.starts_with("encrypt-conn-pwd:") {
+            // 연결 암호를 XSalsa20-Poly1305로 암호화 (machine UUID 기반 키)
+            let password = key.replacen("encrypt-conn-pwd:", "", 1);
+            hbb_common::password_security::encrypt_str_or_original(
+                &password,
+                "00",
+                128,
+            )
+        } else if key.starts_with("decrypt-conn-pwd:") {
+            // 암호화된 연결 암호를 복호화
+            let encrypted = key.replacen("decrypt-conn-pwd:", "", 1);
+            let (decrypted, _success, _) =
+                hbb_common::password_security::decrypt_str_or_original(&encrypted, "00");
+            decrypted
         } else {
             "".to_owned()
         }

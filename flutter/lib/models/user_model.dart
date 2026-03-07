@@ -27,6 +27,16 @@ class UserModel {
   WeakReference<FFI> parent;
 
   Timer? _refreshTimer;
+  
+  // 로그인 직후 리셋 방지 가드 (디버그 모드 타이밍 이슈 해결)
+  DateTime? _lastLoginTime;
+  static const _loginProtectionDuration = Duration(seconds: 5);
+  
+  /// 로그인 보호 기간 내인지 확인 (로그인 직후 일정 시간 동안 401 응답 무시)
+  bool isWithinLoginProtection() {
+    return _lastLoginTime != null && 
+        DateTime.now().difference(_lastLoginTime!) < _loginProtectionDuration;
+  }
 
   UserModel(this.parent) {
     userName.listen((p0) {
@@ -80,6 +90,12 @@ class UserModel {
       debugPrint('UserModel: Refresh response status: $status');
       debugPrint('UserModel: Refresh response body: ${response.body}');
       if (status == 401 || status == 400) {
+        // 로그인 직후 일정 시간 내에는 리셋 방지 (디버그 모드 타이밍 이슈)
+        if (_lastLoginTime != null && 
+            DateTime.now().difference(_lastLoginTime!) < _loginProtectionDuration) {
+          debugPrint('UserModel: Auth error ignored (within login protection period)');
+          return;
+        }
         debugPrint('UserModel: Auth error, resetting');
         reset(resetOther: status == 401);
         return;
@@ -137,6 +153,9 @@ class UserModel {
   }
 
   Future<void> reset({bool resetOther = false}) async {
+    debugPrint('UserModel.reset called with resetOther=$resetOther');
+    debugPrint('UserModel.reset called from:');
+    debugPrint(StackTrace.current.toString().split('\n').take(10).join('\n'));
     await bind.mainSetLocalOption(key: 'access_token', value: '');
     await bind.mainSetLocalOption(key: 'user_info', value: '');
     if (resetOther) {
@@ -161,6 +180,8 @@ class UserModel {
       // ugly here, tmp solution
       bind.mainSetLocalOption(key: 'verifier', value: user.verifier ?? '');
     }
+    // 로그인 성공 시간 기록 (디버그 모드 타이밍 이슈 방지)
+    _lastLoginTime = DateTime.now();
   }
 
   /// 현재 기기를 API 서버에 등록
@@ -285,6 +306,47 @@ class UserModel {
       body = jsonDecode(resp.body);
     } catch (e) {
       debugPrint("login: jsonDecode resp body failed: ${e.toString()}");
+      if (resp.statusCode != 200) {
+        BotToast.showText(
+            contentColor: Colors.red, text: 'HTTP ${resp.statusCode}');
+      }
+      rethrow;
+    }
+    if (resp.statusCode != 200) {
+      throw RequestException(resp.statusCode, body['error'] ?? '');
+    }
+    if (body['error'] != null) {
+      throw RequestException(0, body['error']);
+    }
+
+    return getLoginResponseFromAuthBody(body);
+  }
+
+  /// MDesk 2차 인증(2FA) 검증 - POST /api/login/2fa
+  /// tfa_key, tfa_code로 인증코드 검증 후 성공 시 access_token 반환
+  Future<LoginResponse> login2faVerify(String tfaKey, String tfaCode) async {
+    var url = await bind.mainGetApiServer();
+    if (url.startsWith('http://')) {
+      url = url.replaceFirst('http://', 'https://');
+    }
+    final verifyUrl = '$url/api/login/2fa';
+    final requestBody = jsonEncode({'tfa_key': tfaKey, 'tfa_code': tfaCode});
+    debugPrint('UserModel: 2FA verify request to $verifyUrl');
+
+    final resp = await flutter_http.post(
+      Uri.parse(verifyUrl),
+      headers: {'Content-Type': 'application/json'},
+      body: requestBody,
+    );
+
+    debugPrint('UserModel: 2FA Response status: ${resp.statusCode}');
+    debugPrint('UserModel: 2FA Response body: ${resp.body}');
+
+    final Map<String, dynamic> body;
+    try {
+      body = jsonDecode(resp.body);
+    } catch (e) {
+      debugPrint("login2faVerify: jsonDecode failed: ${e.toString()}");
       if (resp.statusCode != 200) {
         BotToast.showText(
             contentColor: Colors.red, text: 'HTTP ${resp.statusCode}');

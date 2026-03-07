@@ -19,6 +19,7 @@ import '../consts.dart';
 import '../common.dart';
 import '../common/widgets/overlay.dart';
 import '../main.dart';
+import '../desktop/widgets/whiteboard_overlay.dart';
 import 'model.dart';
 
 class MessageKey {
@@ -351,6 +352,13 @@ class ChatModel with ChangeNotifier {
       return;
     }
     if (text.isEmpty) return;
+    
+    // 화이트보드 메시지 처리 (채팅으로 표시하지 않음)
+    if (text.startsWith(kWhiteboardPrefix)) {
+      _handleWhiteboardMessage(id, text);
+      return;
+    }
+    
     if (desktopType == DesktopType.cm) {
       await showCmWindow();
     }
@@ -439,6 +447,21 @@ class ChatModel with ChangeNotifier {
     }
     latestReceivedKey = messagekey;
     notifyListeners();
+  }
+  
+  /// 화이트보드 메시지 처리
+  void _handleWhiteboardMessage(int id, String text) {
+    try {
+      // 피제어자(서버) 측에서 화이트보드 수신 처리
+      // id가 clientModeID가 아니면 서버 모드 (피제어자)
+      if (id != clientModeID) {
+        // 서버 모드: 피제어자가 제어자로부터 화이트보드 데이터 수신
+        final receiverController = Get.find<WhiteboardReceiverController>();
+        receiverController.handleMessage(text);
+      }
+    } catch (e) {
+      debugPrint('ChatModel: Failed to handle whiteboard message: $e');
+    }
   }
 
   send(ChatMessage message) {

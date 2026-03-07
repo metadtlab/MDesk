@@ -1,4 +1,4 @@
-use super::{Cursor, CustomEvent};
+use super::{Cursor, CustomEvent, DrawStroke, DrawPoint};
 use crate::{
     ipc::{self, Data},
     CHILD_PROCESS,
@@ -37,6 +37,42 @@ struct LastCursorEvent {
 #[inline]
 pub fn get_key_cursor(conn_id: i32) -> String {
     format!("{}-cursor", conn_id)
+}
+
+#[inline]
+pub fn get_key_draw(conn_id: i32) -> String {
+    format!("{}-draw", conn_id)
+}
+
+/// 드로잉 스트로크 전송
+pub fn send_draw_stroke(conn_id: i32, points: Vec<(f32, f32)>, argb: u32, stroke_width: f32, tool: u8) {
+    let k = get_key_draw(conn_id);
+    let draw_points: Vec<DrawPoint> = points.iter().map(|(x, y)| DrawPoint { x: *x, y: *y }).collect();
+    let stroke = DrawStroke {
+        points: draw_points,
+        argb,
+        stroke_width,
+        tool,
+    };
+    TX_WHITEBOARD.read().unwrap().as_ref().map(|tx| {
+        allow_err!(tx.send((k, CustomEvent::Draw(stroke))));
+    });
+}
+
+/// 드로잉 클리어
+pub fn clear_draw(conn_id: i32) {
+    let k = get_key_draw(conn_id);
+    TX_WHITEBOARD.read().unwrap().as_ref().map(|tx| {
+        allow_err!(tx.send((k, CustomEvent::ClearDraw)));
+    });
+}
+
+/// 드로잉 실행취소
+pub fn undo_draw(conn_id: i32) {
+    let k = get_key_draw(conn_id);
+    TX_WHITEBOARD.read().unwrap().as_ref().map(|tx| {
+        allow_err!(tx.send((k, CustomEvent::UndoDraw)));
+    });
 }
 
 pub fn register_whiteboard(k: String) {

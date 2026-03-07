@@ -1,6 +1,7 @@
 allprojects {
     repositories {
         google()
+        mavenCentral()
         jcenter()
         maven { url 'https://jitpack.io' }
     }
@@ -12,6 +13,53 @@ subprojects {
 }
 subprojects {
     project.evaluationDependsOn(':app')
+}
+def configureMissingNamespace = { subproject ->
+    def android = subproject.extensions.findByName("android")
+    if (android == null || !android.hasProperty("namespace")) {
+        return
+    }
+    if (android.namespace != null && android.namespace.toString().trim()) {
+        return
+    }
+
+    def manifestFile = android.sourceSets?.main?.manifest?.srcFile
+    if (manifestFile?.exists()) {
+        def manifest = new groovy.xml.XmlSlurper(false, false).parse(manifestFile)
+        def packageName = manifest.@package?.text()
+        if (packageName) {
+            android.namespace = packageName
+        }
+    }
+}
+def configureAndroidJvm = { subproject ->
+    def android = subproject.extensions.findByName("android")
+    if (android == null || !android.hasProperty("compileOptions")) {
+        return
+    }
+    android.compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+subprojects { subproject ->
+    subproject.plugins.withId("com.android.application") {
+        configureMissingNamespace(subproject)
+        configureAndroidJvm(subproject)
+    }
+    subproject.plugins.withId("com.android.library") {
+        configureMissingNamespace(subproject)
+        configureAndroidJvm(subproject)
+    }
+    subproject.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+        kotlinOptions {
+            jvmTarget = "11"
+        }
+    }
+    subproject.tasks.withType(JavaCompile).configureEach {
+        sourceCompatibility = JavaVersion.VERSION_11.toString()
+        targetCompatibility = JavaVersion.VERSION_11.toString()
+    }
 }
 
 tasks.register("clean", Delete) {

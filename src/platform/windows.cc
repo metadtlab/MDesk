@@ -580,6 +580,39 @@ extern "C"
         return rdp_or_console;
     }
 
+    BOOL is_session_locked()
+    {
+        auto session_id = get_current_session(TRUE);
+        LPWSTR buffer = NULL;
+        DWORD bytes = 0;
+        BOOL locked = FALSE;
+
+        if (WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE,
+                session_id,
+                WTSSessionInfoEx,
+                &buffer,
+                &bytes))
+        {
+            if (buffer != NULL && bytes >= sizeof(WTSINFOEXW))
+            {
+                auto info = reinterpret_cast<WTSINFOEXW *>(buffer);
+                if (info->Level == 1)
+                {
+                    locked = info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK
+                                 ? TRUE
+                                 : FALSE;
+                }
+            }
+            if (buffer != NULL)
+            {
+                WTSFreeMemory(buffer);
+            }
+        }
+
+        return locked;
+    }
+
     uint32_t get_active_user(PWSTR bufin, uint32_t nin, BOOL rdp)
     {
         uint32_t nout = 0;

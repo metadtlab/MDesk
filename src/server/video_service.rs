@@ -699,10 +699,13 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
         #[cfg(windows)]
         {
+            // RDP:Owner 등 세션 전환 시 데스크톱이 바뀌면 먼저 전환 시도. 실패할 때만 bail하여 연결 끊김 방지.
             if crate::platform::windows::desktop_changed()
                 && !crate::portable_service::client::running()
             {
-                bail!("Desktop changed");
+                if !crate::platform::windows::try_change_desktop() {
+                    bail!("Desktop changed");
+                }
             }
         }
         let now = time::Instant::now();

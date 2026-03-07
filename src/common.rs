@@ -175,7 +175,7 @@ pub fn is_running_portable() -> bool {
 
 #[cfg(not(windows))]
 pub fn is_running_portable() -> bool {
-    !crate::platform::is_installed()
+    !crate::ui_interface::is_installed()
 }
 
 pub fn global_clean() {
@@ -1056,7 +1056,8 @@ pub fn get_full_name() -> String {
 }
 
 pub fn is_setup(name: &str) -> bool {
-    name.to_lowercase().ends_with("install.exe")
+    let name = name.to_lowercase();
+    name.ends_with(".exe") && name.contains("-install")
 }
 
 pub fn get_custom_rendezvous_server(custom: String) -> String {

@@ -669,7 +669,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               "다운로드",
               () async {
                 // 다운로드 페이지로 이동
-                final Uri url = Uri.parse('https://admin.787.kr/executables/MDesk_portable.exe');
+                final Uri url = Uri.parse('https://admin.787.kr/executables/MDesk-install.exe');
                 await launchUrl(url);
               },
               closeButton: true);

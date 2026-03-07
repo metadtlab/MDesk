@@ -25,6 +25,7 @@ import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
 import './popup_menu.dart';
 import './kb_layout_type_chooser.dart';
+import './whiteboard_overlay.dart';
 import 'package:flutter_hbb/utils/scale.dart';
 import 'package:flutter_hbb/common/widgets/custom_scale_base.dart';
 
@@ -404,6 +405,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       toolbarItems.add(_VoiceCallMenu(id: widget.id, ffi: widget.ffi));
     }
     if (!isWeb) toolbarItems.add(_RecordMenu());
+    toolbarItems.add(_WhiteboardButton(id: widget.id));
     toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));
     final toolbarBorderRadius = BorderRadius.all(Radius.circular(4.0));
     return Column(
@@ -2198,6 +2200,29 @@ class _RecordMenu extends StatelessWidget {
           ? _ToolbarTheme.hoverRedColor
           : _ToolbarTheme.hoverBlueColor,
     );
+  }
+}
+
+class _WhiteboardButton extends StatelessWidget {
+  final String id;
+  const _WhiteboardButton({Key? key, required this.id}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final controller = Get.find<WhiteboardController>(tag: id);
+      return _IconMenuButton(
+        icon: const Icon(Icons.draw, size: 20),
+        tooltip: controller.isEnabled.value ? '화이트보드 끄기' : '화이트보드',
+        onPressed: () => controller.toggle(),
+        color: controller.isEnabled.value
+            ? _ToolbarTheme.redColor
+            : _ToolbarTheme.blueColor,
+        hoverColor: controller.isEnabled.value
+            ? _ToolbarTheme.hoverRedColor
+            : _ToolbarTheme.hoverBlueColor,
+      );
+    });
   }
 }
 

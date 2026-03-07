@@ -186,8 +186,14 @@ fn main() {
         }
         i += 1;
     }
-    let click_setup = args.is_empty() && arg_exe.to_lowercase().ends_with("install.exe");
-    let quick_support = args.is_empty() && arg_exe.to_lowercase().ends_with("qs.exe");
+    let current_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(arg_exe.clone());
+    let current_exe_lower = current_exe.to_lowercase();
+    let no_real_args = !args.iter().any(|a| a.starts_with("--"));
+    let click_setup =
+        no_real_args && current_exe_lower.ends_with(".exe") && current_exe_lower.contains("-install");
+    let quick_support = no_real_args && current_exe_lower.ends_with("qs.exe");
 
     let mut ui = false;
     let reader = BinaryReader::default();

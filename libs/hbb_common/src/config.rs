@@ -1990,8 +1990,6 @@ pub struct LocalConfig {
     kb_layout_type: String,
     #[serde(default, deserialize_with = "deserialize_size")]
     size: Size,
-    #[serde(default, deserialize_with = "deserialize_vec_string")]
-    pub fav: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     options: HashMap<String, String>,
     // Various data for flutter ui
@@ -2043,19 +2041,6 @@ impl LocalConfig {
 
     pub fn get_remote_id() -> String {
         LOCAL_CONFIG.read().unwrap().remote_id.clone()
-    }
-
-    pub fn set_fav(fav: Vec<String>) {
-        let mut lock = LOCAL_CONFIG.write().unwrap();
-        if lock.fav == fav {
-            return;
-        }
-        lock.fav = fav;
-        lock.store();
-    }
-
-    pub fn get_fav() -> Vec<String> {
-        LOCAL_CONFIG.read().unwrap().fav.clone()
     }
 
     pub fn get_option(k: &str) -> String {

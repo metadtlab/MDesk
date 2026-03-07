@@ -95,6 +95,9 @@ class AbModel {
 
   reset() async {
     print("reset ab model");
+    // 디버깅: 호출 스택 출력
+    print("reset ab model called from:");
+    print(StackTrace.current.toString().split('\n').take(10).join('\n'));
     addressbooks.clear();
     _currentName.value = '';
     await bind.mainClearAb();
@@ -202,6 +205,7 @@ class AbModel {
       final api = "${await bind.mainGetApiServer()}/api/ab/settings";
       var headers = getHttpHeaders();
       headers['Content-Type'] = "application/json";
+      _setEmptyBody(headers);
       final resp = await http.post(Uri.parse(api), headers: headers);
       if (resp.statusCode == 404) {
         debugPrint("HTTP 404, api server doesn't support shared address book");
@@ -228,6 +232,7 @@ class AbModel {
       final api = "${await bind.mainGetApiServer()}/api/ab/personal";
       var headers = getHttpHeaders();
       headers['Content-Type'] = "application/json";
+      _setEmptyBody(headers);
       final resp = await http.post(Uri.parse(api), headers: headers);
       if (resp.statusCode == 404) {
         debugPrint("HTTP 404, current api server is legacy mode");
@@ -269,6 +274,7 @@ class AbModel {
             });
         var headers = getHttpHeaders();
         headers['Content-Type'] = "application/json";
+        _setEmptyBody(headers);
         final resp = await http.post(uri, headers: headers);
         Map<String, dynamic> json =
             _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
@@ -992,7 +998,12 @@ class LegacyAb extends BaseAb {
     } finally {
       if (pullError.isNotEmpty) {
         if (statusCode == 401) {
-          gFFI.userModel.reset(resetOther: true);
+          // 로그인 직후에는 401 응답으로 인한 리셋 방지 (서버 호환성 문제일 수 있음)
+          if (gFFI.userModel.isWithinLoginProtection()) {
+            debugPrint('LegacyAb: 401 ignored (within login protection period)');
+          } else {
+            gFFI.userModel.reset(resetOther: true);
+          }
         }
       }
     }
@@ -1406,6 +1417,7 @@ class Ab extends BaseAb {
             });
         var headers = getHttpHeaders();
         headers['Content-Type'] = "application/json";
+        _setEmptyBody(headers);
         final resp = await http.post(uri, headers: headers);
         statusCode = resp.statusCode;
         Map<String, dynamic> json =
@@ -1443,7 +1455,12 @@ class Ab extends BaseAb {
     } finally {
       if (pullError.isNotEmpty) {
         if (statusCode == 401) {
-          gFFI.userModel.reset(resetOther: true);
+          // 로그인 직후에는 401 응답으로 인한 리셋 방지
+          if (gFFI.userModel.isWithinLoginProtection()) {
+            debugPrint('Ab.pullAbImpl: 401 ignored (within login protection period)');
+          } else {
+            gFFI.userModel.reset(resetOther: true);
+          }
         }
       }
     }
@@ -1463,6 +1480,7 @@ class Ab extends BaseAb {
       );
       var headers = getHttpHeaders();
       headers['Content-Type'] = "application/json";
+      _setEmptyBody(headers);
       final resp = await http.post(uri, headers: headers);
       statusCode = resp.statusCode;
       List<dynamic> json =
@@ -1489,7 +1507,12 @@ class Ab extends BaseAb {
     } finally {
       if (pullError.isNotEmpty) {
         if (statusCode == 401) {
-          gFFI.userModel.reset(resetOther: true);
+          // 로그인 직후에는 401 응답으로 인한 리셋 방지
+          if (gFFI.userModel.isWithinLoginProtection()) {
+            debugPrint('Ab._fetchTags: 401 ignored (within login protection period)');
+          } else {
+            gFFI.userModel.reset(resetOther: true);
+          }
         }
       }
     }
@@ -1976,4 +1999,9 @@ String _jsonDecodeActionResp(http.Response resp) {
     }
   }
   return errMsg;
+}
+
+// reqwest can reject empty POST bodies without an explicit length header.
+void _setEmptyBody(Map<String, String> headers) {
+  headers['Content-Length'] = '0';
 }

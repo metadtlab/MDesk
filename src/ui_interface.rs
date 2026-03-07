@@ -120,10 +120,12 @@ pub fn run_without_install() {
 
 #[inline]
 pub fn show_run_without_install() -> bool {
-    let mut it = std::env::args();
-    if let Some(tmp) = it.next() {
-        if crate::is_setup(&tmp) {
-            return it.next() == None;
+    if let Ok(exe_path) = std::env::current_exe() {
+        let exe_name = exe_path.to_string_lossy().to_string();
+        if crate::is_setup(&exe_name) {
+            // No real command-line arguments (those starting with --)
+            let has_real_args = std::env::args().skip(1).any(|a| a.starts_with("--"));
+            return !has_real_args;
         }
     }
     false
@@ -612,15 +614,15 @@ pub fn get_peer(id: String) -> PeerConfig {
     PeerConfig::load(&id)
 }
 
+/// 즐겨찾기는 서버 API 전용. 레거시 UI 호환을 위해 빈 목록 반환.
 #[inline]
 pub fn get_fav() -> Vec<String> {
-    LocalConfig::get_fav()
+    vec![]
 }
 
+/// 즐겨찾기는 서버 API 전용. 무시됨.
 #[inline]
-pub fn store_fav(fav: Vec<String>) {
-    LocalConfig::set_fav(fav);
-}
+pub fn store_fav(_fav: Vec<String>) {}
 
 #[inline]
 pub fn is_process_trusted(_prompt: bool) -> bool {
@@ -1169,6 +1171,8 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
     #[cfg(not(feature = "flutter"))]
     let mut id = "".to_owned();
     #[cfg(target_os = "windows")]
+    let mut access_mode = "".to_owned();
+    #[cfg(target_os = "windows")]
     let mut enable_file_transfer = "".to_owned();
     let is_cm = crate::common::is_cm();
 
@@ -1197,10 +1201,29 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
 
                                 #[cfg(target_os = "windows")]
                                 {
-                                    let b = OPTIONS.lock().unwrap().get(OPTION_ENABLE_FILE_TRANSFER).map(|x| x.to_string()).unwrap_or_default();
-                                    if b != enable_file_transfer {
-                                        clipboard::ContextSend::enable(config::option2bool(OPTION_ENABLE_FILE_TRANSFER, &b));
-                                        enable_file_transfer = b;
+                                    let (ft, am) = {
+                                        let lock = OPTIONS.lock().unwrap();
+                                        (
+                                            lock.get(OPTION_ENABLE_FILE_TRANSFER)
+                                                .map(|x| x.to_string())
+                                                .unwrap_or_default(),
+                                            lock.get(OPTION_ACCESS_MODE)
+                                                .map(|x| x.to_string())
+                                                .unwrap_or_default(),
+                                        )
+                                    };
+                                    if ft != enable_file_transfer || am != access_mode {
+                                        let access_mode_enabled = match am.as_str() {
+                                            "full" => Some(true),
+                                            "view" => Some(false),
+                                            _ => None,
+                                        };
+                                        let enabled = access_mode_enabled.unwrap_or(
+                                            config::option2bool(OPTION_ENABLE_FILE_TRANSFER, &ft),
+                                        );
+                                        clipboard::ContextSend::enable(enabled);
+                                        enable_file_transfer = ft;
+                                        access_mode = am;
                                     }
                                 }
                             }

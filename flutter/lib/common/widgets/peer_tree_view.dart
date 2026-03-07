@@ -16,6 +16,9 @@ import 'package:flutter_hbb/utils/device_register_service.dart';
 /// 트리뷰에서 사용하는 피어 카드 타입
 enum TreeViewPeerType { recent, favorite, mydevices, addressbook, recentApi }
 
+/// 나의 관리장치 새로고침 콜백 (외부에서 호출 가능)
+VoidCallback? refreshMyDevicesCallback;
+
 /// 팀뷰어 스타일의 트리뷰 피어 목록 위젯
 class PeerTreeView extends StatefulWidget {
   final EdgeInsets? menuPadding;
@@ -62,6 +65,10 @@ class _PeerTreeViewState extends State<PeerTreeView> {
   @override
   void initState() {
     super.initState();
+    // 나의 관리장치 새로고침 콜백 등록
+    refreshMyDevicesCallback = () {
+      _loadMyDevices(force: true);
+    };
     // 데이터 로드
     _loadAllPeers();
     // 나의 관리장치 로드
@@ -76,6 +83,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
   
   @override
   void dispose() {
+    refreshMyDevicesCallback = null;
     platformFFI.unregisterEventHandler('callback_query_onlines', 'peer_tree_view');
     super.dispose();
   }
@@ -121,7 +129,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
   void _loadAllPeers() {
     bind.mainLoadRecentPeers();
-    bind.mainLoadFavPeers();
+    loadFavPeers();
     gFFI.abModel.pullAb(force: ForcePullAb.listAndCurrent, quiet: true);
   }
   
@@ -405,6 +413,10 @@ class _PeerTreeViewState extends State<PeerTreeView> {
             if (!_recentSessionsLoading && !_recentSessionsLoaded) {
               _loadRecentSessions();
             }
+            // 즐겨찾기 로드 (서버 API, 로그인/사용자 변경 시)
+            if (_lastUserPkid != currentUserPkid) {
+              loadFavPeers();
+            }
           });
         } else if (!_onlineQueried) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -682,6 +694,10 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       onDoubleTap: () {
         // 더블클릭으로 연결 (현재 기기가 아닐 때만)
         if (!isCurrentDevice) {
+          // api_mdeskdeviceregistration alias를 peer 옵션에 저장 → 탭에 컴퓨터 이름 우선 표기
+          if (peer.alias.isNotEmpty) {
+            bind.mainSetPeerOptionSync(id: peer.id, key: 'alias', value: peer.alias);
+          }
           connect(context, peer.id);
         }
       },
@@ -1066,6 +1082,10 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       },
       onDoubleTap: () {
         // 더블클릭으로 연결
+        // api_mdeskdeviceregistration alias를 peer 옵션에 저장 → 탭에 컴퓨터 이름 우선 표기
+        if (session.alias.isNotEmpty) {
+          bind.mainSetPeerOptionSync(id: session.peerId, key: 'alias', value: session.alias);
+        }
         connect(context, session.peerId);
       },
       onSecondaryTapDown: (details) {

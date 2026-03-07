@@ -131,8 +131,16 @@ pub fn core_main() -> Option<Vec<String>> {
     if _is_flutter_invoke_new_connection {
         return core_main_invoke_new_connection(std::env::args());
     }
-    let click_setup = cfg!(windows) && args.is_empty() && crate::common::is_setup(&arg_exe);
+    let click_setup = cfg!(windows)
+        && !args.iter().any(|a| a.starts_with("--"))
+        && {
+            let exe_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or(arg_exe.clone());
+            crate::common::is_setup(&exe_path)
+        };
     if click_setup && !config::is_disable_installation() {
+        args.clear();
         args.push("--install".to_owned());
         flutter_args.push("--install".to_string());
     }

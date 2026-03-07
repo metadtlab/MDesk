@@ -882,36 +882,18 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     _loadRegisteredUsers();
   }
 
-  // 간단한 암호화 키 (앱 고유)
-  static const String _encryptionKey = 'MDesk2024SecureKey!@#';
-
-  // 암호화 함수
+  // 암호화 함수 - Rust의 XSalsa20-Poly1305 (machine UUID 기반 키) 사용
+  // 해독이 사실상 불가능한 보안 암호화
   String _encryptPassword(String password) {
     if (password.isEmpty) return '';
-    final bytes = utf8.encode(password);
-    final keyBytes = utf8.encode(_encryptionKey);
-    final encrypted = List<int>.generate(
-      bytes.length,
-      (i) => bytes[i] ^ keyBytes[i % keyBytes.length],
-    );
-    return base64Encode(encrypted);
+    return bind.mainGetCommonSync(key: 'encrypt-conn-pwd:$password');
   }
 
-  // 복호화 함수
+  // 복호화 함수 - Rust의 password_security 모듈 사용
+  // 레거시 XOR+Base64 암호도 하위호환 지원
   String _decryptPassword(String encrypted) {
     if (encrypted.isEmpty) return '';
-    try {
-      final bytes = base64Decode(encrypted);
-      final keyBytes = utf8.encode(_encryptionKey);
-      final decrypted = List<int>.generate(
-        bytes.length,
-        (i) => bytes[i] ^ keyBytes[i % keyBytes.length],
-      );
-      return utf8.decode(decrypted);
-    } catch (e) {
-      // 이전에 암호화되지 않은 데이터인 경우 그대로 반환
-      return encrypted;
-    }
+    return bind.mainGetCommonSync(key: 'decrypt-conn-pwd:$encrypted');
   }
 
   Future<void> _loadRegisteredUsers() async {
@@ -920,15 +902,27 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       final saved = bind.mainGetLocalOption(key: 'registered_remote_users');
       if (saved.isNotEmpty) {
         final List<dynamic> decoded = jsonDecode(saved);
+        bool needsMigration = false;
         registeredUsers = decoded.map((e) {
           final user = Map<String, String>.from(e);
           // 암호 복호화
-          if (user['connectionPassword'] != null) {
-            user['connectionPassword'] = _decryptPassword(user['connectionPassword']!);
+          if (user['connectionPassword'] != null && user['connectionPassword']!.isNotEmpty) {
+            final encrypted = user['connectionPassword']!;
+            // "00"으로 시작하지 않으면 레거시 암호 → 마이그레이션 필요
+            if (!encrypted.startsWith('00')) {
+              needsMigration = true;
+            }
+            user['connectionPassword'] = _decryptPassword(encrypted);
           }
           return user;
         }).toList();
         setState(() {});
+        
+        // 레거시 암호가 있으면 새 방식으로 재암호화하여 저장
+        if (needsMigration) {
+          debugPrint('[Security] 레거시 암호를 XSalsa20-Poly1305로 마이그레이션 합니다');
+          await _saveRegisteredUsers();
+        }
       }
     } catch (e) {
       debugPrint('Failed to load registered users: $e');
@@ -974,8 +968,28 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     await _saveRegisteredUsers();
   }
 
-  Future<void> _removeRemoteUser(String id) async {
-    registeredUsers.removeWhere((u) => u['id'] == id);
+  Future<void> _removeRemoteUser(String userId) async {
+    try {
+      // 서버에서 기기 등록 해제 API 호출
+      final remoteId = await bind.mainGetMyId();
+      if (remoteId.isNotEmpty && userId.isNotEmpty) {
+        final response = await deviceRegisterService.unregisterDeviceSimple(
+          apiServer: _remoteUserApiBase,
+          userId: userId,
+          remoteId: remoteId,
+        );
+        if (response.success) {
+          debugPrint('_removeRemoteUser: Device unregistered from server - userId=$userId, remoteId=$remoteId');
+        } else {
+          debugPrint('_removeRemoteUser: Server unregister failed - ${response.message}');
+        }
+      }
+    } catch (e) {
+      debugPrint('_removeRemoteUser: Error calling unregister API - $e');
+    }
+    
+    // 로컬에서도 삭제
+    registeredUsers.removeWhere((u) => u['id'] == userId);
     await _saveRegisteredUsers();
   }
 
@@ -1026,7 +1040,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                   Icon(Icons.person, size: 16, color: Colors.blue),
                   SizedBox(width: 4),
                   Text(
-                    user['name'] ?? user['id'] ?? '',
+                    user['id'] ?? user['name'] ?? '',
                     style: TextStyle(color: Colors.blue),
                   ),
                   SizedBox(width: 4),
@@ -1216,7 +1230,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     try {
       // API 호출하여 원격자 자격 증명 검증 (토큰 갱신 없음)
       final response = await http.post(
-        Uri.parse('https://787.kr/api/verify_remote_user'),
+        Uri.parse('$_remoteUserApiBase/api/verify_remote_user'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'username': id,
@@ -1253,16 +1267,23 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     }
   }
 
-  /// 기기 등록 API 호출
+  /// verify_remote_user와 동일한 서버로 register 요청을 보내기 위한 기본 URL
+  static const String _remoteUserApiBase = 'https://787.kr';
+
+  /// 기기 등록 API 호출 (피원격지 기기 등록 - 로그인 불필요)
   Future<void> _registerDeviceToServer(String userId, String alias) async {
     try {
-      final apiServer = await bind.mainGetApiServer();
-      final accessToken = bind.mainGetLocalOption(key: 'access_token');
-      final userPkid = gFFI.userModel.userPkid.value;
+      var apiServer = await bind.mainGetApiServer();
+      // verify_remote_user와 같은 서버로 register 보내기 (빈 값이면 동일 호스트 사용)
+      if (apiServer.isEmpty) {
+        apiServer = _remoteUserApiBase;
+      }
       final remoteId = await bind.mainGetMyId();
       
-      if (apiServer.isEmpty || accessToken.isEmpty || userPkid.isEmpty || remoteId.isEmpty) {
-        debugPrint('_registerDeviceToServer: Missing required info - apiServer=$apiServer, accessToken=${accessToken.isNotEmpty}, userPkid=$userPkid, remoteId=$remoteId');
+      // remoteId(기기 ID)만 필수 - 피원격지 등록이므로 로그인 토큰 불필요
+      if (remoteId.isEmpty) {
+        debugPrint('_registerDeviceToServer: Missing remoteId');
+        showToast('기기 ID를 가져올 수 없습니다.');
         return;
       }
       
@@ -1277,13 +1298,11 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         platform = 'Linux';
       }
       
-      debugPrint('_registerDeviceToServer: Registering device - remoteId=$remoteId, alias=$alias, userId=$userId');
+      debugPrint('_registerDeviceToServer: Registering device - apiServer=$apiServer, remoteId=$remoteId, alias=$alias, userId=$userId');
       
-      final response = await deviceRegisterService.registerDevice(
+      final response = await deviceRegisterService.registerDeviceSimple(
         apiServer: apiServer,
-        accessToken: accessToken,
         userId: userId,
-        userPkid: userPkid,
         remoteId: remoteId,
         alias: alias,
         hostname: hostname,

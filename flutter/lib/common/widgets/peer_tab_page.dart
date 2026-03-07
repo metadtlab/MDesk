@@ -17,6 +17,7 @@ import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
+import 'package:flutter_hbb/utils/favorite_service.dart';
 
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -487,12 +488,20 @@ class _PeerTabPageState extends State<PeerTabPage>
                 bind.mainLoadRecentPeers();
                 break;
               case 1:
-                final favs = (await bind.mainGetFav()).toList();
-                peers.map((p) {
-                  favs.remove(p.id);
-                }).toList();
-                await bind.mainStoreFav(favs: favs);
-                bind.mainLoadFavPeers();
+                if (gFFI.userModel.isLogin) {
+                  final apiServer = await bind.mainGetApiServer();
+                  final accessToken = bind.mainGetLocalOption(key: 'access_token');
+                  if (apiServer.isNotEmpty && accessToken.isNotEmpty) {
+                    for (final p in peers) {
+                      await favoriteService.removeFavorite(
+                        apiServer: apiServer,
+                        accessToken: accessToken,
+                        peerId: p.id,
+                      );
+                    }
+                    loadFavPeers();
+                  }
+                }
                 break;
               case 2:
                 for (var p in peers) {
@@ -518,20 +527,32 @@ class _PeerTabPageState extends State<PeerTabPage>
   Widget addSelectionToFav() {
     final model = Provider.of<PeerTabModel>(context);
     return Offstage(
-      offstage:
-          model.currentTab != PeerTabIndex.recent.index, // show based on recent
+      offstage: !gFFI.userModel.isLogin ||
+          model.currentTab != PeerTabIndex.recent.index,
       child: _hoverAction(
         context: context,
         toolTip: translate('Add to Favorites'),
         onTap: () async {
+          if (!gFFI.userModel.isLogin) return;
+          final apiServer = await bind.mainGetApiServer();
+          final accessToken = bind.mainGetLocalOption(key: 'access_token');
+          if (apiServer.isEmpty || accessToken.isEmpty) {
+            showToast(translate('Failed'));
+            return;
+          }
           final peers = model.selectedPeers;
-          final favs = (await bind.mainGetFav()).toList();
-          for (var p in peers) {
-            if (!favs.contains(p.id)) {
-              favs.add(p.id);
+          final favIds = gFFI.favoritePeersModel.peers.map((p) => p.id).toSet();
+          for (final p in peers) {
+            if (!favIds.contains(p.id)) {
+              await favoriteService.addFavorite(
+                apiServer: apiServer,
+                accessToken: accessToken,
+                peerId: p.id,
+                displayName: p.alias.isEmpty ? p.hostname : p.alias,
+              );
             }
           }
-          await bind.mainStoreFav(favs: favs);
+          loadFavPeers();
           model.setMultiSelectionMode(false);
           showToast(translate('Successful'));
         },

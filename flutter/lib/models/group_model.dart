@@ -55,7 +55,12 @@ class GroupModel {
     initialized = true;
     platformFFI.tryHandle({'name': LoadEvent.group});
     if (_statusCode == 401) {
-      gFFI.userModel.reset(resetOther: true);
+      // 로그인 직후에는 401 응답으로 인한 리셋 방지
+      if (gFFI.userModel.isWithinLoginProtection()) {
+        debugPrint('GroupModel: 401 ignored (within login protection period)');
+      } else {
+        gFFI.userModel.reset(resetOther: true);
+      }
     } else {
       _saveCache();
     }

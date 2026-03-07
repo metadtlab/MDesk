@@ -488,6 +488,7 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 extern "C" {
     fn get_current_session(rdp: BOOL) -> DWORD;
+    fn is_session_locked() -> BOOL;
     fn LaunchProcessWin(
         cmd: *const u16,
         session_id: DWORD,
@@ -1088,6 +1089,11 @@ pub fn is_prelogin() -> bool {
         return false;
     };
     username.is_empty() || username == "SYSTEM"
+}
+
+#[inline]
+pub fn is_locked() -> bool {
+    unsafe { is_session_locked() == TRUE }
 }
 
 // `is_logon_ui()` is regardless of multiple sessions now.

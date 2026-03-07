@@ -1,6 +1,6 @@
 @echo off
-REM MDesk Windows Build Script
 setlocal enabledelayedexpansion
+REM MDesk Windows Build Script
 
 echo ========================================
 echo MDesk Windows Build Script
@@ -12,7 +12,7 @@ if not exist "libs\hbb_common\Cargo.toml" (
     echo [WARN] Submodules not initialized. Initializing...
     git submodule update --init --recursive
     if errorlevel 1 (
-        echo [ERROR] Submodule init failed!
+        echo [ERROR] Submodule init failed.
         pause
         exit /b 1
     )
@@ -116,6 +116,17 @@ if exist "target\release\deps\dylib_virtual_display.dll" (
     copy /y "target\release\deps\dylib_virtual_display.dll" "%BUILD_DIR%\" >nul
 )
 echo [OK] DLLs copied
+
+echo.
+echo ========================================
+echo   Please code sign MDesk.exe
+echo ========================================
+echo   %BUILD_DIR%\MDesk.exe
+echo.
+echo   Copy to USB, sign on another PC, then overwrite
+echo   the file above. Press any key to continue build.
+echo ========================================
+pause
 
 echo.
 echo [5/5] Creating portable package...

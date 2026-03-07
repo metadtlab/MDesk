@@ -26,6 +26,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'common.dart';
 import 'consts.dart';
+import 'desktop/widgets/whiteboard_overlay.dart';
 import 'mobile/pages/home_page.dart';
 import 'mobile/pages/server_page.dart';
 import 'models/platform_model.dart';
@@ -181,6 +182,9 @@ void runMainApp(bool startService) async {
   }
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
+  
+  // 피제어자용 화이트보드 수신 컨트롤러 전역 등록
+  Get.put<WhiteboardReceiverController>(WhiteboardReceiverController(), permanent: true);
 
   // Rust에서 설정한 'is-portable' 옵션을 동기(Sync) 방식으로 읽어옴
   // 또는 agentid가 파일명에 있으면 심플 모드로 설정
@@ -581,9 +585,9 @@ class _AppState extends State<App> with WidgetsBindingObserver, WindowListener {
           darkTheme: MyTheme.darkTheme,
           themeMode: MyTheme.currentThemeMode(),
           home: isDesktop
-              ? (!hasAgentIdInFilename()
-                  ? const DesktopTabPage()  // agentid 있으면 전체 UI (CustomRemote 포함)
-                  : SimpleHomePage())       // agentid 없으면 간단 UI
+              ? (!(hasAgentIdInFilename() || bind.mainGetOptionSync(key: 'is-portable') == 'Y')
+                  ? const DesktopTabPage()  // 포터블 아닌 경우 전체 UI
+                  : SimpleHomePage())       // 포터블 모드 간단 UI
               : isWeb
                   ? WebHomePage()
                   : HomePage(),

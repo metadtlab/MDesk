@@ -56,5 +56,24 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+# generic build outputs
+flutter/build/
+**/ephemeral/
+debug/
+release/
+dist/
+out/
+# packaging artifacts
+*.apk
+*.aab
+*.ipa
+*.msix
+*.appx
+*.appxbundle
+*.zip
+*.7z
+# debug symbols and linker outputs
+*.ilk
+*.exp
 # GitHub workflows (workflow 스코프 필요)
-.github/
+.github/src.7z

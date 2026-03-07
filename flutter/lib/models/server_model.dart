@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
@@ -59,6 +60,47 @@ class ServerModel with ChangeNotifier {
   CustomConfig? customConfig;
   bool isFetchingConfig = false;
 
+  // SSL 인증서 검증 우회 HttpClient 생성
+  HttpClient _createSecureHttpClient() {
+    return HttpClient()
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
+        debugPrint('ServerModel SSL BadCertificate callback - host=$host, port=$port');
+        return true; // 모든 인증서 허용
+      };
+  }
+
+  // SSL 우회 POST 요청
+  Future<http.Response> _securePost(String url, {Map<String, String>? headers, Object? body, Duration? timeout}) async {
+    final httpClient = _createSecureHttpClient();
+    try {
+      final request = await httpClient.postUrl(Uri.parse(url));
+      if (headers != null) {
+        headers.forEach((key, value) => request.headers.set(key, value));
+      }
+      if (body != null) {
+        request.write(body);
+      }
+      final response = await request.close().timeout(timeout ?? const Duration(seconds: 10));
+      final responseBody = await response.transform(utf8.decoder).join();
+      return http.Response(responseBody, response.statusCode);
+    } finally {
+      httpClient.close();
+    }
+  }
+
+  // SSL 우회 GET 요청
+  Future<http.Response> _secureGet(String url, {Duration? timeout}) async {
+    final httpClient = _createSecureHttpClient();
+    try {
+      final request = await httpClient.getUrl(Uri.parse(url));
+      final response = await request.close().timeout(timeout ?? const Duration(seconds: 10));
+      final responseBody = await response.transform(utf8.decoder).join();
+      return http.Response(responseBody, response.statusCode);
+    } finally {
+      httpClient.close();
+    }
+  }
+
   Future<void> fetchCustomConfig(String id) async {
     debugPrint('ServerModel: fetchCustomConfig called with ID: $id');
     if (isFetchingConfig) return;
@@ -70,11 +112,12 @@ class ServerModel with ChangeNotifier {
       final body = jsonEncode({'username': id});
       debugPrint('ServerModel: Sending POST to $url with body: $body');
       
-      final response = await http.post(
-        Uri.parse(url),
+      final response = await _securePost(
+        url,
         headers: {'Content-Type': 'application/json'},
         body: body,
-      ).timeout(const Duration(seconds: 10));
+        timeout: const Duration(seconds: 10),
+      );
 
       debugPrint('ServerModel: Response status: ${response.statusCode}');
       debugPrint('ServerModel: Response body: ${response.body}');
@@ -86,10 +129,28 @@ class ServerModel with ChangeNotifier {
           debugPrint('ServerModel: Custom config applied for ${customConfig?.appName}');
           
           // API에서 받은 password가 있으면 실제 영구 비밀번호로 설정
+          debugPrint('=== ServerModel Password Setup ===');
+          debugPrint('ServerModel: API password from config = "${customConfig?.password}"');
+          debugPrint('ServerModel: API encryptedPassword = "${customConfig?.encryptedPassword}"');
+          debugPrint('ServerModel: password isEmpty = ${customConfig?.password.isEmpty}');
+          
           if (customConfig != null && customConfig!.password.isNotEmpty) {
+            debugPrint('ServerModel: Setting permanent password: "${customConfig!.password}"');
             await bind.mainSetPermanentPassword(password: customConfig!.password);
             debugPrint('ServerModel: Permanent password set from API');
+            
+            // 설정 후 확인
+            final savedPw = await bind.mainGetPermanentPassword();
+            debugPrint('ServerModel: Saved permanent password (verify) = "$savedPw"');
+            debugPrint('ServerModel: Password match = ${savedPw == customConfig!.password}');
+          } else {
+            debugPrint('ServerModel: No password in config, skipping password setup');
           }
+          
+          // 현재 인증 방식 확인
+          final currentVerificationMethod = bind.mainGetOptionSync(key: 'verification-method');
+          debugPrint('ServerModel: Current verification method = "$currentVerificationMethod"');
+          debugPrint('=== ServerModel Password Setup END ===');
           
           notifyListeners();
         }
@@ -616,7 +677,7 @@ class ServerModel with ChangeNotifier {
       
       debugPrint('ServerModel: Client connected in portable mode! Calling agentclose API: $url');
       
-      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 5));
+      final response = await _secureGet(url, timeout: const Duration(seconds: 5));
       debugPrint('ServerModel: agentclose response: ${response.statusCode} - ${response.body}');
     } catch (e) {
       debugPrint('ServerModel: agentclose API error: $e');

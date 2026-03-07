@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:http/http.dart' as http;
@@ -44,32 +45,68 @@ class HttpService {
     return _parseHttpResponse(resJson);
   }
 
+  // SSL 인증서 검증 우회 HttpClient 생성
+  HttpClient _createSecureHttpClient() {
+    return HttpClient()
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
+        debugPrint('HttpService SSL BadCertificate callback - host=$host, port=$port');
+        return true; // 모든 인증서 허용
+      };
+  }
+
   Future<http.Response> _pollFlutterHttp(
     Uri url,
     HttpMethod method, {
     Map<String, String>? headers,
     dynamic body,
   }) async {
-    var response = http.Response('', 400);
-
-    switch (method) {
-      case HttpMethod.get:
-        response = await http.get(url, headers: headers);
-        break;
-      case HttpMethod.post:
-        response = await http.post(url, headers: headers, body: body);
-        break;
-      case HttpMethod.put:
-        response = await http.put(url, headers: headers, body: body);
-        break;
-      case HttpMethod.delete:
-        response = await http.delete(url, headers: headers, body: body);
-        break;
-      default:
-        throw Exception('Unsupported HTTP method');
+    // SSL 우회 HttpClient 사용
+    final httpClient = _createSecureHttpClient();
+    
+    try {
+      HttpClientRequest request;
+      
+      switch (method) {
+        case HttpMethod.get:
+          request = await httpClient.getUrl(url);
+          break;
+        case HttpMethod.post:
+          request = await httpClient.postUrl(url);
+          break;
+        case HttpMethod.put:
+          request = await httpClient.putUrl(url);
+          break;
+        case HttpMethod.delete:
+          request = await httpClient.deleteUrl(url);
+          break;
+        default:
+          throw Exception('Unsupported HTTP method');
+      }
+      
+      // 헤더 설정
+      if (headers != null) {
+        headers.forEach((key, value) => request.headers.set(key, value));
+      }
+      
+      // body 설정 (POST, PUT, DELETE)
+      if (body != null && method != HttpMethod.get) {
+        if (body is String) {
+          request.write(body);
+        } else if (body is Map) {
+          request.write(jsonEncode(body));
+        } else {
+          request.write(body.toString());
+        }
+      }
+      
+      final response = await request.close();
+      final responseBody = await response.transform(utf8.decoder).join();
+      
+      // http.Response로 변환하여 반환
+      return http.Response(responseBody, response.statusCode);
+    } finally {
+      httpClient.close();
     }
-
-    return response;
   }
 
   Future<String> _pollForResponse(String url) async {

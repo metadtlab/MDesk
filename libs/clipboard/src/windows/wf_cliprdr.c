@@ -272,6 +272,9 @@ static UINT cliprdr_send_request_filecontents(wfClipboard *clipboard, UINT32 con
 static BOOL is_file_descriptor_from_remote();
 static BOOL is_set_by_instance(wfClipboard *clipboard);
 
+/* Forward declaration of global clipboard instance, defined at end of file */
+extern wfClipboard clipboard;
+
 static void CliprdrDataObject_Delete(CliprdrDataObject *instance);
 
 static CliprdrEnumFORMATETC *CliprdrEnumFORMATETC_New(ULONG nFormats, FORMATETC *pFormatEtc);
@@ -1437,9 +1440,13 @@ static UINT cliprdr_send_format_list(wfClipboard *clipboard, UINT32 connID)
 	if (!clipboard)
 		return ERROR_INTERNAL_ERROR;
 
-	if (!IsClipboardFormatAvailable(CF_HDROP))
+	/* Check for both CF_HDROP (local files) and CFSTR_FILEDESCRIPTORW (RDP/virtual files) */
 	{
-		return ERROR_SUCCESS;
+		UINT fsid_check = RegisterClipboardFormat(CFSTR_FILEDESCRIPTORW);
+		if (!IsClipboardFormatAvailable(CF_HDROP) && !IsClipboardFormatAvailable(fsid_check))
+		{
+			return ERROR_SUCCESS;
+		}
 	}
 
 	ZeroMemory(&formatList, sizeof(CLIPRDR_FORMAT_LIST));
@@ -2612,8 +2619,75 @@ wf_cliprdr_server_format_data_request(CliprdrClientContext *context,
 
 		if (FAILED(result))
 		{
-			rc = ERROR_INTERNAL_ERROR;
-			goto exit;
+			/* CF_HDROP not available - try CFSTR_FILEDESCRIPTORW directly (RDP/virtual files) */
+			FORMATETC fgd_etc;
+			STGMEDIUM fgd_stg;
+			FILEGROUPDESCRIPTORW *fgd;
+			ZeroMemory(&fgd_etc, sizeof(FORMATETC));
+			ZeroMemory(&fgd_stg, sizeof(STGMEDIUM));
+			fgd_etc.cfFormat = RegisterClipboardFormat(CFSTR_FILEDESCRIPTORW);
+			fgd_etc.tymed = TYMED_HGLOBAL;
+			fgd_etc.dwAspect = DVASPECT_CONTENT;
+			fgd_etc.lindex = -1;
+			result = IDataObject_GetData(dataObj, &fgd_etc, &fgd_stg);
+
+			if (FAILED(result))
+			{
+				IDataObject_Release(dataObj);
+				rc = ERROR_INTERNAL_ERROR;
+				goto exit;
+			}
+
+			fgd = (FILEGROUPDESCRIPTORW *)GlobalLock(fgd_stg.hGlobal);
+			if (!fgd)
+			{
+				GlobalUnlock(fgd_stg.hGlobal);
+				ReleaseStgMedium(&fgd_stg);
+				clipboard->nFiles = 0;
+				goto resp;
+			}
+
+			clear_file_array(clipboard);
+
+			/* Populate clipboard arrays directly from the file group descriptor */
+			for (i = 0; i < fgd->cItems; i++)
+			{
+				if (!wf_cliprdr_array_ensure_capacity(clipboard))
+					break;
+
+				/* Store file descriptor directly from the source */
+				clipboard->fileDescriptor[clipboard->nFiles] =
+					(FILEDESCRIPTORW *)calloc(1, sizeof(FILEDESCRIPTORW));
+				if (!clipboard->fileDescriptor[clipboard->nFiles])
+					break;
+				*clipboard->fileDescriptor[clipboard->nFiles] = fgd->fgd[i];
+
+				/* Store file name (just the name, not a full local path) */
+				clipboard->file_names[clipboard->nFiles] = (LPWSTR)malloc(MAX_PATH * sizeof(WCHAR));
+				if (clipboard->file_names[clipboard->nFiles])
+				{
+					wcsncpy_s(clipboard->file_names[clipboard->nFiles], MAX_PATH,
+							   fgd->fgd[i].cFileName, wcslen(fgd->fgd[i].cFileName) + 1);
+				}
+				else
+				{
+					free(clipboard->fileDescriptor[clipboard->nFiles]);
+					clipboard->fileDescriptor[clipboard->nFiles] = NULL;
+					break;
+				}
+
+				if ((clipboard->fileDescriptor[clipboard->nFiles]->dwFileAttributes &
+					 FILE_ATTRIBUTE_DIRECTORY) == 0)
+				{
+					clipboard->first_file_index = clipboard->nFiles;
+				}
+
+				clipboard->nFiles++;
+			}
+
+			GlobalUnlock(fgd_stg.hGlobal);
+			ReleaseStgMedium(&fgd_stg);
+			goto resp;
 		}
 
 		dropFiles = (DROPFILES *)GlobalLock(stg_medium.hGlobal);
@@ -3157,7 +3231,10 @@ BOOL is_file_descriptor_from_remote()
 	}
 	fsid = RegisterClipboardFormat(CFSTR_FILEDESCRIPTORW);
 	if (IsClipboardFormatAvailable(fsid)) {
-		return TRUE;
+		/* Only consider it "from remote" if OUR instance (RustDesk) set the clipboard.
+		 * This avoids blocking file descriptors from other sources like RDP,
+		 * which also use CFSTR_FILEDESCRIPTORW without CF_HDROP. */
+		return is_set_by_instance(&clipboard);
 	}
 	return FALSE;
 }

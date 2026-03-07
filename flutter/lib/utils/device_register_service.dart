@@ -241,6 +241,76 @@ class DeviceRegisterService {
     }
   }
 
+  /// 피원격지 기기 등록 (로그인 불필요)
+  /// 
+  /// verify_remote_user 성공 후 바로 호출 가능.
+  /// 인증 토큰 없이 기기를 원격 사용자에게 등록합니다.
+  /// 
+  /// [apiServer] - API 서버 URL
+  /// [userId] - 원격 사용자 ID (verify_remote_user로 검증된 사용자)
+  /// [remoteId] - 원격 ID (peer ID, 이 기기의 ID)
+  /// [alias] - 사용자 지정 별칭
+  /// [hostname] - 호스트명 (선택)
+  /// [platform] - 플랫폼 (선택)
+  Future<DeviceRegisterResponse> registerDeviceSimple({
+    required String apiServer,
+    required String userId,
+    required String remoteId,
+    required String alias,
+    String? hostname,
+    String? platform,
+  }) async {
+    try {
+      debugPrint('DeviceRegisterService: Registering device (simple) - remoteId=$remoteId, alias=$alias, userId=$userId');
+      
+      // HTTP → HTTPS 강제 변환 (리다이렉트 시 POST→GET 변환 방지)
+      var server = apiServer;
+      if (server.startsWith('http://')) {
+        server = server.replaceFirst('http://', 'https://');
+      }
+      final url = Uri.parse('$server/api/device/register');
+      
+      final body = jsonEncode({
+        'user_id': userId,
+        'remote_id': remoteId,
+        'alias': alias,
+        'hostname': hostname ?? '',
+        'platform': platform ?? '',
+      });
+
+      debugPrint('DeviceRegisterService: Request URL=$url, body=$body');
+
+      final response = await http.post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: body,
+      );
+
+      debugPrint('DeviceRegisterService: Register response - ${response.statusCode}, body=${response.body}');
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final Map<String, dynamic> result = jsonDecode(response.body);
+        return DeviceRegisterResponse.fromJson(result);
+      } else {
+        return DeviceRegisterResponse(
+          success: false,
+          message: 'HTTP Error: ${response.statusCode}',
+          error: 'HTTP_ERROR',
+          statusCode: response.statusCode,
+        );
+      }
+    } catch (e) {
+      debugPrint('DeviceRegisterService: Error registering device (simple) - $e');
+      return DeviceRegisterResponse(
+        success: false,
+        message: 'Failed to register device: $e',
+        error: 'HTTP_ERROR',
+      );
+    }
+  }
+
   /// 기기 등록 해제
   /// 
   /// HTTP를 통해 기기 등록 해제 요청을 보냅니다.
@@ -294,6 +364,64 @@ class DeviceRegisterService {
       }
     } catch (e) {
       debugPrint('DeviceRegisterService: Error unregistering device - $e');
+      return DeviceRegisterResponse(
+        success: false,
+        message: 'Failed to unregister device: $e',
+        error: 'HTTP_ERROR',
+      );
+    }
+  }
+
+  /// 기기 등록 해제 (간단 버전 - 로그인 불필요)
+  /// 
+  /// 나의 관리장치에서 기기 삭제 시 사용
+  /// user_id와 remote_id만으로 삭제 요청
+  Future<DeviceRegisterResponse> unregisterDeviceSimple({
+    required String apiServer,
+    required String userId,
+    required String remoteId,
+  }) async {
+    try {
+      debugPrint('DeviceRegisterService: Unregistering device (simple) - userId=$userId, remoteId=$remoteId');
+      
+      // HTTP → HTTPS 강제 변환
+      var server = apiServer;
+      if (server.startsWith('http://')) {
+        server = server.replaceFirst('http://', 'https://');
+      }
+      
+      final url = Uri.parse('$server/api/device/unregister');
+      
+      final body = jsonEncode({
+        'user_id': userId,
+        'remote_id': remoteId,
+      });
+
+      debugPrint('DeviceRegisterService: Unregister URL=$url, body=$body');
+
+      final response = await http.post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: body,
+      );
+
+      debugPrint('DeviceRegisterService: Unregister response - ${response.statusCode}, body=${response.body}');
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final Map<String, dynamic> result = jsonDecode(response.body);
+        return DeviceRegisterResponse.fromJson(result);
+      } else {
+        return DeviceRegisterResponse(
+          success: false,
+          message: 'HTTP Error: ${response.statusCode}',
+          error: 'HTTP_ERROR',
+          statusCode: response.statusCode,
+        );
+      }
+    } catch (e) {
+      debugPrint('DeviceRegisterService: Error unregistering device (simple) - $e');
       return DeviceRegisterResponse(
         success: false,
         message: 'Failed to unregister device: $e',

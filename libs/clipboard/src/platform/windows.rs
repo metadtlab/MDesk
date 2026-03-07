@@ -1060,12 +1060,14 @@ extern "C" fn handle_clipboard_files(
                                 files.push((n.to_owned(), meta.len()));
                             }
                         }
-                        Err(e) => {
-                            log::warn!(
-                                "handle_clipboard_files: Failed to get metadata for file '{}': {}",
+                        Err(_e) => {
+                            // File may be a virtual/RDP clipboard file (not a local path).
+                            // Include it with size 0 so the UI can still show the file name.
+                            log::debug!(
+                                "handle_clipboard_files: '{}' is not a local file (possibly RDP virtual file), including with size 0",
                                 n,
-                                e
                             );
+                            files.push((n.to_owned(), 0));
                         }
                     },
                     None => {

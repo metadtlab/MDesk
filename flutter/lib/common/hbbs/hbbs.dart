@@ -179,8 +179,15 @@ class LoginResponse {
   String? secret;
   UserPayload? user;
 
+  /// MDesk 2차 인증(2FA) 필드 - API서버에서 tfa_required: true 응답 시 사용
+  bool tfaRequired = false;
+  String? tfaKey;
+  List<Map<String, dynamic>>? tfaMethods;
+  String? tfaMessage;
+
   LoginResponse(
-      {this.access_token, this.type, this.tfa_type, this.secret, this.user});
+      {this.access_token, this.type, this.tfa_type, this.secret, this.user,
+      this.tfaKey, this.tfaMethods, this.tfaMessage});
 
   LoginResponse.fromJson(Map<String, dynamic> json) {
     access_token = json['access_token'];
@@ -188,6 +195,13 @@ class LoginResponse {
     tfa_type = json['tfa_type'];
     secret = json['secret'];
     user = json['user'] != null ? UserPayload.fromJson(json['user']) : null;
+    tfaRequired = json['tfa_required'] == true;
+    tfaKey = json['tfa_key'];
+    tfaMethods = json['tfa_methods'] != null
+        ? List<Map<String, dynamic>>.from(
+            (json['tfa_methods'] as List).map((e) => Map<String, dynamic>.from(e as Map)))
+        : null;
+    tfaMessage = json['tfa_message'];
   }
 }
 

@@ -804,10 +804,41 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
 
 const double buttonBottomMargin = 8;
 
-class _CmControlPanel extends StatelessWidget {
+class _CmControlPanel extends StatefulWidget {
   final Client client;
 
   const _CmControlPanel({Key? key, required this.client}) : super(key: key);
+
+  @override
+  State<_CmControlPanel> createState() => _CmControlPanelState();
+}
+
+class _CmControlPanelState extends State<_CmControlPanel>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _neonController;
+  late Animation<double> _neonAnimation;
+  
+  Client get client => widget.client;
+
+  @override
+  void initState() {
+    super.initState();
+    // 네온사인 깜빡임 애니메이션 (0.8초 주기)
+    _neonController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    )..repeat(reverse: true);
+    
+    _neonAnimation = Tween<double>(begin: 0.4, end: 1.0).animate(
+      CurvedAnimation(parent: _neonController, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _neonController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1008,49 +1039,58 @@ class _CmControlPanel extends StatelessWidget {
   }
 
   buildUnAuthorized(BuildContext context) {
-    final bool canElevate = bind.cmCanElevate();
     final model = Provider.of<ServerModel>(context);
-    final showElevation = canElevate &&
-        model.showElevation &&
-        client.type_() == ClientType.remote;
     final showAccept = model.approveMode != 'password';
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
-        Offstage(
-          offstage: !showElevation || !showAccept,
-          child: buildButton(context, color: Colors.green[700], onClick: () {
-            handleAccept(context);
-            handleElevate(context);
-            windowManager.minimize();
-          },
-              text: 'Accept and Elevate',
-              icon: Icon(
-                Icons.security_rounded,
-                color: Colors.white,
-                size: 14,
-              ),
-              textColor: Colors.white,
-              tooltip: 'accept_and_elevate_btn_tooltip'),
-        ),
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
+            // 수락 버튼 (네온사인 깜빡임 효과)
             if (showAccept)
               Expanded(
-                child: Column(
-                  children: [
-                    buildButton(
-                      context,
-                      color: MyTheme.accent,
-                      onClick: () {
-                        handleAccept(context);
-                        windowManager.minimize();
-                      },
-                      text: 'Accept',
-                      textColor: Colors.white,
-                    ),
-                  ],
+                child: AnimatedBuilder(
+                  animation: _neonAnimation,
+                  builder: (context, child) {
+                    return Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10.0),
+                        boxShadow: [
+                          BoxShadow(
+                            color: MyTheme.accent.withOpacity(_neonAnimation.value * 0.8),
+                            blurRadius: 12 * _neonAnimation.value,
+                            spreadRadius: 2 * _neonAnimation.value,
+                          ),
+                          BoxShadow(
+                            color: Colors.white.withOpacity(_neonAnimation.value * 0.3),
+                            blurRadius: 6 * _neonAnimation.value,
+                            spreadRadius: 1,
+                          ),
+                        ],
+                      ),
+                      child: buildButton(context, 
+                        color: Color.lerp(
+                          MyTheme.accent.withOpacity(0.7),
+                          MyTheme.accent,
+                          _neonAnimation.value,
+                        ),
+                        onClick: () {
+                          handleAccept(context);
+                          handleElevate(context);
+                          windowManager.minimize();
+                        },
+                        text: 'Accept',
+                        icon: Icon(
+                          Icons.security_rounded,
+                          color: Colors.white,
+                          size: 14,
+                        ),
+                        textColor: Colors.white,
+                        tooltip: 'accept_and_elevate_btn_tooltip',
+                      ),
+                    );
+                  },
                 ),
               ),
             Expanded(

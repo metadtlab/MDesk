@@ -370,6 +370,76 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     }
   }
 
+  // 인증번호 취소 API 호출
+  Future<void> _cancelCertNo() async {
+    if (_certCode.isEmpty) return;
+    
+    final certCodeToCancel = _certCode;
+    
+    // 먼저 UI에서 즉시 제거
+    setState(() {
+      _certCode = '';
+      _certExpireTime = '';
+    });
+    
+    try {
+      final username = gFFI.userModel.userName.value;
+      final userPkid = gFFI.userModel.userPkid.value;
+      final mdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
+      final url = 'https://admin.787.kr/api/certno/cancel';
+      
+      final body = jsonEncode({
+        'customer_id': username,
+        'user_pk_id': userPkid,
+        'mdesk_id': mdeskId,
+        'cert_code': certCodeToCancel,
+      });
+      
+      debugPrint('CertNo Cancel Request URL: $url');
+      debugPrint('CertNo Cancel Request Body: $body');
+
+      final response = await http.post(
+        Uri.parse(url),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: body,
+      ).timeout(const Duration(seconds: 10));
+
+      debugPrint('CertNo Cancel Response: ${response.statusCode} - ${response.body}');
+
+      final data = jsonDecode(response.body);
+      
+      switch (response.statusCode) {
+        case 200:
+          if (data['success'] == true) {
+            showToast('인증번호가 취소되었습니다');
+          }
+          break;
+        case 400:
+          // MISSING_CUSTOMER_ID, MISSING_MDESK_ID, MISSING_CERT_CODE, CERT_MISMATCH
+          final error = data['error'] ?? '';
+          if (error == 'CERT_MISMATCH') {
+            showToast('인증번호가 일치하지 않습니다');
+          } else {
+            debugPrint('CertNo Cancel: Missing parameter - $error');
+          }
+          break;
+        case 404:
+          // CERT_NOT_FOUND - 이미 취소됨/만료됨
+          debugPrint('CertNo Cancel: 취소할 인증번호 없음 (이미 취소되었거나 만료됨)');
+          break;
+        case 405:
+          debugPrint('CertNo Cancel: Method not allowed');
+          break;
+        default:
+          debugPrint('CertNo Cancel: Unexpected status ${response.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('CertNo Cancel Error: $e');
+    }
+  }
+
   // 인증번호 조회 API 호출
   Future<void> _searchCertNo() async {
     try {
@@ -913,16 +983,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                     ),
                     const SizedBox(width: 12),
                     IconButton(
-                      onPressed: () {
-                        setState(() {
-                          _certCode = '';
-                          _certExpireTime = '';
-                        });
-                      },
+                      onPressed: _cancelCertNo,
                       icon: const Icon(Icons.close, color: Colors.white, size: 18),
                       padding: EdgeInsets.zero,
                       constraints: const BoxConstraints(),
-                      tooltip: '인증번호 숨기기',
+                      tooltip: '인증번호 취소',
                     ),
                   ],
                 ),

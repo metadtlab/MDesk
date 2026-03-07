@@ -2128,57 +2128,52 @@ impl Connection {
         false
     }
 
-    /// 연결 암호 복호화 (Flutter와 동일한 XOR + Base64)
-    /// 평문 암호도 지원: 복호화 결과가 유효하지 않으면 원본 사용
+    /// 연결 암호 복호화
+    /// 1차: XSalsa20-Poly1305 (password_security) 복호화 시도 (신규 방식)
+    /// 2차: 레거시 XOR + Base64 복호화 시도 (하위호환)
+    /// 3차: 평문으로 간주
     fn decrypt_connection_password(&self, encrypted: &str) -> String {
-        use hbb_common::base64::{Engine as _, engine::general_purpose::STANDARD};
-        
-        const ENCRYPTION_KEY: &[u8] = b"MDesk2024SecureKey!@#";
+        use hbb_common::password_security::decrypt_str_or_original;
         
         if encrypted.is_empty() {
             log::info!("[RemoteUser] 복호화: 빈 암호");
             return String::new();
         }
 
-        // Base64 디코딩 시도
-        let bytes = match STANDARD.decode(encrypted) {
-            Ok(b) => {
-                log::info!("[RemoteUser] 복호화: Base64 디코딩 성공, {} 바이트", b.len());
-                b
+        // 1차: XSalsa20-Poly1305 복호화 시도 (신규 방식, "00" 버전 프리픽스)
+        if encrypted.len() > 2 && encrypted.starts_with("00") {
+            let (decrypted, success, _) = decrypt_str_or_original(encrypted, "00");
+            if success {
+                log::info!("[RemoteUser] 복호화: XSalsa20-Poly1305 복호화 성공 (보안 암호화)");
+                return decrypted;
             }
-            Err(e) => {
-                // Base64 디코딩 실패 = 평문 암호
-                log::info!("[RemoteUser] 복호화: Base64 디코딩 실패 ({}) -> 평문으로 사용", e);
-                return encrypted.to_string();
-            }
-        };
+            log::info!("[RemoteUser] 복호화: XSalsa20-Poly1305 복호화 실패, 레거시 시도");
+        }
 
-        // XOR 복호화
-        let decrypted: Vec<u8> = bytes
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| b ^ ENCRYPTION_KEY[i % ENCRYPTION_KEY.len()])
-            .collect();
-
-        // UTF-8 변환 시도
-        match String::from_utf8(decrypted.clone()) {
-            Ok(s) => {
-                // 복호화된 문자열이 출력 가능한 ASCII인지 확인
-                if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
-                    log::info!("[RemoteUser] 복호화: XOR 복호화 성공");
-                    s
-                } else {
-                    // 복호화 결과가 이상하면 평문 암호로 간주
-                    log::info!("[RemoteUser] 복호화: XOR 결과 비정상 -> 평문으로 사용");
-                    encrypted.to_string()
+        // 2차: 레거시 XOR + Base64 복호화 시도 (하위호환)
+        {
+            use hbb_common::base64::{Engine as _, engine::general_purpose::STANDARD};
+            const LEGACY_KEY: &[u8] = b"MDesk2024SecureKey!@#";
+            
+            if let Ok(bytes) = STANDARD.decode(encrypted) {
+                let decrypted: Vec<u8> = bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| b ^ LEGACY_KEY[i % LEGACY_KEY.len()])
+                    .collect();
+                
+                if let Ok(s) = String::from_utf8(decrypted) {
+                    if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                        log::info!("[RemoteUser] 복호화: 레거시 XOR 복호화 성공 (마이그레이션 필요)");
+                        return s;
+                    }
                 }
             }
-            Err(_) => {
-                // UTF-8 변환 실패 = 평문 암호로 간주
-                log::info!("[RemoteUser] 복호화: UTF-8 변환 실패 -> 평문으로 사용");
-                encrypted.to_string()
-            }
         }
+
+        // 3차: 평문 암호로 간주
+        log::info!("[RemoteUser] 복호화: 평문 암호로 사용");
+        encrypted.to_string()
     }
 
 
@@ -2442,11 +2437,13 @@ impl Connection {
 
             // https://github.com/rustdesk/rustdesk-server-pro/discussions/646
             // `is_logon` is used to check login with `OPTION_ALLOW_LOGON_SCREEN_PASSWORD` == "Y".
-            // `is_logon_ui()` is used on Windows, because there's no good way to detect `is_locked()`.
-            // Detecting `is_logon_ui()` (if `LogonUI.exe` running) is a workaround.
+            // On Windows, `is_locked()` covers the normal locked-session case.
+            // `is_logon_ui()` remains as a fallback for the logon UI process.
             #[cfg(target_os = "windows")]
             let is_logon = || {
-                crate::platform::is_prelogin() || {
+                crate::platform::is_prelogin()
+                    || crate::platform::is_locked()
+                    || {
                     match crate::platform::is_logon_ui() {
                         Ok(result) => result,
                         Err(e) => {
@@ -3207,8 +3204,13 @@ impl Connection {
                         self.toggle_privacy_mode(t).await;
                     }
                     Some(misc::Union::ChatMessage(c)) => {
-                        self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
-                        self.chat_unanswered = true;
+                        // 화이트보드 메시지 처리
+                        if c.text.starts_with("##WB##") {
+                            self.handle_whiteboard_message(&c.text);
+                        } else {
+                            self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
+                            self.chat_unanswered = true;
+                        }
                         self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::Option(o)) => {
@@ -3818,6 +3820,76 @@ impl Connection {
                 .await;
             }
         }
+    }
+
+    /// 화이트보드 메시지 처리
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn handle_whiteboard_message(&mut self, text: &str) {
+        use crate::whiteboard;
+        
+        const WB_PREFIX: &str = "##WB##";
+        let json_str = &text[WB_PREFIX.len()..];
+        
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            
+            match msg_type {
+                "state" => {
+                    let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if enabled {
+                        // 화이트보드 활성화
+                        whiteboard::register_whiteboard(whiteboard::get_key_draw(self.inner.id));
+                        log::info!("Whiteboard enabled for conn_id: {}", self.inner.id);
+                    } else {
+                        // 화이트보드 비활성화
+                        whiteboard::unregister_whiteboard(whiteboard::get_key_draw(self.inner.id));
+                        log::info!("Whiteboard disabled for conn_id: {}", self.inner.id);
+                    }
+                }
+                "stroke" => {
+                    // 드로잉 스트로크 처리
+                    if let (Some(points), Some(color), Some(stroke_width), Some(tool)) = (
+                        data.get("points").and_then(|v| v.as_array()),
+                        data.get("color").and_then(|v| v.as_u64()),
+                        data.get("strokeWidth").and_then(|v| v.as_f64()),
+                        data.get("tool").and_then(|v| v.as_u64()),
+                    ) {
+                        let draw_points: Vec<(f32, f32)> = points
+                            .iter()
+                            .filter_map(|p| {
+                                let x = p.get("x").and_then(|v| v.as_f64())?;
+                                let y = p.get("y").and_then(|v| v.as_f64())?;
+                                Some((x as f32, y as f32))
+                            })
+                            .collect();
+                        
+                        whiteboard::send_draw_stroke(
+                            self.inner.id,
+                            draw_points,
+                            color as u32,
+                            stroke_width as f32,
+                            tool as u8,
+                        );
+                    }
+                }
+                "clear" => {
+                    whiteboard::clear_draw(self.inner.id);
+                }
+                "undo" => {
+                    whiteboard::undo_draw(self.inner.id);
+                }
+                _ => {
+                    log::warn!("Unknown whiteboard message type: {}", msg_type);
+                }
+            }
+        } else {
+            log::error!("Failed to parse whiteboard message: {}", json_str);
+        }
+    }
+    
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn handle_whiteboard_message(&mut self, _text: &str) {
+        // 모바일에서는 화이트보드 미지원
     }
 
     async fn toggle_privacy_mode(&mut self, t: TogglePrivacyMode) {

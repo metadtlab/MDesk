@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi' hide Size;
 import 'dart:io';
+import 'package:ffi/ffi.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
@@ -13,6 +16,21 @@ import 'package:http/http.dart' as http;
 import '../../common.dart';
 import '../../models/model.dart';
 
+// Windows API를 위한 구조체 정의
+final class LASTINPUTINFO extends Struct {
+  @Uint32()
+  external int cbSize;
+  
+  @Uint32()
+  external int dwTime;
+}
+
+// Windows API 함수 타입 정의
+typedef GetLastInputInfoNative = Int32 Function(Pointer<LASTINPUTINFO> plii);
+typedef GetLastInputInfoDart = int Function(Pointer<LASTINPUTINFO> plii);
+typedef GetTickCountNative = Uint32 Function();
+typedef GetTickCountDart = int Function();
+
 class SimpleHomePage extends StatefulWidget {
   @override
   _SimpleHomePageState createState() => _SimpleHomePageState();
@@ -20,6 +38,7 @@ class SimpleHomePage extends StatefulWidget {
 
 class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
   Timer? _updateTimer;
+  Timer? _inactivityTimer;  // 비활동 체크 타이머
   bool _agentUpdateCalled = false;
   String _userId = 'admin';
   String _agentId = '';
@@ -27,6 +46,36 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
   bool _certNoEnabled = false;  // 인증번호 입력창 활성화 여부
   final TextEditingController _certNoController = TextEditingController();  // 인증번호 입력 컨트롤러
   bool _isCertNoVerified = false;  // 인증번호 확인 상태
+  bool _certNumAutoFilled = false;  // certnum 파일명 파라미터로 자동 입력 완료 여부
+  DateTime? _certNumAutoFilledAt;  // certnum 자동 입력 시각 (자동 인증 확인 타이밍용)
+  bool _clipboardChecked = false;  // 클립보드 certno 확인 완료 여부
+  bool _certNumAutoVerifyDone = false;  // 자동 인증번호 확인 실행 완료 여부
+  
+  // 비활동 자동 종료 설정 (1시간 = 3600초)
+  static const int _inactivityTimeoutSeconds = 60 * 60;  // 1시간 동안 사용하지 않으면 자동종료
+  static const int _inactivityCheckIntervalSeconds = 60;  // 1분마다 체크
+  
+  // Windows API 참조
+  DynamicLibrary? _user32;
+  DynamicLibrary? _kernel32;
+  GetLastInputInfoDart? _getLastInputInfo;
+  GetTickCountDart? _getTickCount;
+  
+  // 더블클릭 방지 드래그 영역 빌더
+  Widget _buildDragArea({required Widget child}) {
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onDoubleTap: () {
+        // 더블클릭 시 아무 동작 안 함 (창 최대화/이동 방지)
+        debugPrint('MDesk: Double click ignored');
+      },
+      onPanStart: (_) {
+        // 드래그 시작
+        windowManager.startDragging();
+      },
+      child: child,
+    );
+  }
 
   // 파일명에서 ID, AgentID, CertNo 파싱하는 함수
   Map<String, String> _parseFilename() {
@@ -53,34 +102,187 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
       String id = '';
       String agentid = '';
       String certno = '';
+      String certnum = '';
+      String ipdirect = '';
       
       for (var part in parts) {
-        if (part.startsWith('agentid=')) {
-          // "agentid=18 (1)" 형태에서 숫자 부분만 추출
-          String val = part.substring(8).trim();
+        final p = part.trim();
+        if (p.startsWith('agentid=')) {
+          String val = p.substring(8).trim();
           agentid = val.split(RegExp(r'[^0-9]')).first;
-        } else if (part.startsWith('id=')) {
-          // "id=admin (1)" 형태에서 공백 전까지만 추출
-          String val = part.substring(3).trim();
+        } else if (p.startsWith('id=')) {
+          String val = p.substring(3).trim();
           id = val.split(' ').first;
-        } else if (part.startsWith('certno=')) {
-          // "certno=true" 형태 파싱
-          String val = part.substring(7).trim();
+        } else if (p.startsWith('certno=')) {
+          String val = p.substring(7).trim();
           certno = val.split(' ').first;
+        } else if (p.startsWith('certnum=')) {
+          String val = p.substring(8).trim();
+          certnum = val.split(' ').first;
+        } else if (p.startsWith('ipdirect=')) {
+          String val = p.substring(9).trim();
+          ipdirect = val.split(' ').first;
         }
       }
       
-      return {'id': id, 'agentid': agentid, 'certno': certno};
+      debugPrint('MDesk Parser: id=$id, agentid=$agentid, certno=$certno, certnum=$certnum, ipdirect=$ipdirect');
+      return {'id': id, 'agentid': agentid, 'certno': certno, 'certnum': certnum, 'ipdirect': ipdirect};
     } catch (e) {
       debugPrint('MDesk Parser Error: $e');
-      return {'id': '', 'agentid': '', 'certno': ''};
+      return {'id': '', 'agentid': '', 'certno': '', 'certnum': '', 'ipdirect': ''};
     }
   }
 
+  /// 클립보드에서 "certno: 40005" 형식의 값을 읽어 인증번호를 추출
+  Future<String?> _readClipboardCertNo() async {
+    try {
+      final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
+      if (clipboardData == null || clipboardData.text == null) return null;
+
+      final text = clipboardData.text!.trim();
+      debugPrint('MDesk Clipboard: raw text = "$text"');
+
+      final match = RegExp(r'^certno\s*:\s*(\d+)$', caseSensitive: false).firstMatch(text);
+      if (match != null) {
+        final certNum = match.group(1)!;
+        debugPrint('MDesk Clipboard: Found certno number = $certNum');
+        return certNum;
+      }
+
+      return null;
+    } catch (e) {
+      debugPrint('MDesk Clipboard Error: $e');
+      return null;
+    }
+  }
+
+  // 포터블 모드 창 크기 설정
+  static const double _fixedWidth = 400;
+  static const double _fixedHeightNormal = 600;      // 일반 모드 (인증번호 없음)
+  static const double _fixedHeightWithCertNo = 680;  // 인증번호 모드 (비밀번호까지 표시)
+  
+  Future<void> _setupFixedWindowSize() async {
+    try {
+      // 창 크기 조절 불가능하게 설정
+      await windowManager.setResizable(false);
+      
+      // 최대화 불가능하게 설정
+      await windowManager.setMaximizable(false);
+      
+      // 초기 크기 설정 (일반 모드)
+      await _updateWindowSize(_certNoEnabled);
+      
+      debugPrint('MDesk: Window size initialized');
+    } catch (e) {
+      debugPrint('MDesk: Failed to setup fixed window size: $e');
+    }
+  }
+  
+  // 인증번호 모드에 따라 창 크기 업데이트
+  Future<void> _updateWindowSize(bool certNoEnabled) async {
+    try {
+      final height = certNoEnabled ? _fixedHeightWithCertNo : _fixedHeightNormal;
+      
+      await windowManager.setMinimumSize(Size(_fixedWidth, height));
+      await windowManager.setMaximumSize(Size(_fixedWidth, height));
+      await windowManager.setSize(Size(_fixedWidth, height));
+      
+      debugPrint('MDesk: Window size updated to ${_fixedWidth}x$height (certNo=$certNoEnabled)');
+    } catch (e) {
+      debugPrint('MDesk: Failed to update window size: $e');
+    }
+  }
+  
+  // Windows API 초기화 (비활동 감지용)
+  void _initWindowsApi() {
+    if (!Platform.isWindows) return;
+    
+    try {
+      _user32 = DynamicLibrary.open('user32.dll');
+      _kernel32 = DynamicLibrary.open('kernel32.dll');
+      
+      _getLastInputInfo = _user32!.lookupFunction<GetLastInputInfoNative, GetLastInputInfoDart>('GetLastInputInfo');
+      _getTickCount = _kernel32!.lookupFunction<GetTickCountNative, GetTickCountDart>('GetTickCount');
+      
+      debugPrint('MDesk: Windows API initialized for inactivity detection');
+    } catch (e) {
+      debugPrint('MDesk: Failed to initialize Windows API: $e');
+    }
+  }
+  
+  // 시스템 비활동 시간(초) 가져오기
+  int _getIdleTimeSeconds() {
+    if (_getLastInputInfo == null || _getTickCount == null) return 0;
+    
+    try {
+      final lastInputInfo = calloc<LASTINPUTINFO>();
+      lastInputInfo.ref.cbSize = sizeOf<LASTINPUTINFO>();
+      
+      if (_getLastInputInfo!(lastInputInfo) != 0) {
+        final currentTick = _getTickCount!();
+        final lastInputTick = lastInputInfo.ref.dwTime;
+        final idleMs = currentTick - lastInputTick;
+        calloc.free(lastInputInfo);
+        return idleMs ~/ 1000;  // 밀리초를 초로 변환
+      }
+      
+      calloc.free(lastInputInfo);
+    } catch (e) {
+      debugPrint('MDesk: Error getting idle time: $e');
+    }
+    
+    return 0;
+  }
+  
+  // 비활동 타이머 시작
+  void _startInactivityTimer() {
+    if (!Platform.isWindows) return;
+    
+    _inactivityTimer?.cancel();
+    _inactivityTimer = Timer.periodic(
+      Duration(seconds: _inactivityCheckIntervalSeconds),
+      (timer) {
+        // 원격 연결 중이어도 마우스/키보드 활동이 없으면 종료 체크
+        final idleSeconds = _getIdleTimeSeconds();
+        final remainingSeconds = _inactivityTimeoutSeconds - idleSeconds;
+        
+        if (_isClientConnected) {
+          debugPrint('MDesk Inactivity: Client connected, idle=${idleSeconds}s, remaining=${remainingSeconds}s');
+        } else {
+          debugPrint('MDesk Inactivity: Idle time = ${idleSeconds}s, Timeout = ${_inactivityTimeoutSeconds}s, Remaining = ${remainingSeconds}s');
+        }
+        
+        if (idleSeconds >= _inactivityTimeoutSeconds) {
+          debugPrint('MDesk Inactivity: 1 hour of inactivity detected, closing application (connected=$_isClientConnected)');
+          _inactivityTimer?.cancel();
+          
+          // 종료 메시지 표시 후 앱 종료
+          if (mounted) {
+            showToast('1시간 동안 활동이 없어 프로그램을 종료합니다');
+          }
+          
+          // 1초 후 종료 (토스트 메시지 표시 시간)
+          Future.delayed(const Duration(seconds: 1), () {
+            _handleExit();
+          });
+        }
+      },
+    );
+    
+    debugPrint('MDesk Inactivity: Timer started (timeout: ${_inactivityTimeoutSeconds}s, check interval: ${_inactivityCheckIntervalSeconds}s)');
+  }
+  
   @override
   void initState() {
     super.initState();
     windowManager.addListener(this);
+    
+    // Windows API 초기화 및 비활동 타이머 시작
+    _initWindowsApi();
+    _startInactivityTimer();
+    
+    // 포터블 모드 창 크기 고정 설정
+    _setupFixedWindowSize();
     
     // 앱 시작 시 유저 정보 및 멤버십 정보 리프레쉬
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -98,6 +300,53 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
         final mdeskId = gFFI.serverModel.serverId.text;
         debugPrint('MDesk Timer: mdeskId="$mdeskId", isEmpty=${mdeskId.isEmpty}, contains...=${mdeskId.contains('...')}');
         
+        // 파일명 파싱은 isValidId 체크 전에 먼저 수행 (certno 설정을 위해)
+        final params = _parseFilename();
+        final parsedId = params['id'] ?? '';
+        final parsedAgentId = params['agentid'] ?? '';
+        var parsedCertNo = params['certno'] ?? '';
+        var parsedCertNum = params['certnum'] ?? '';
+        final parsedIpDirect = params['ipdirect'] ?? '';
+
+        // ipdirect=true 이면 Direct IP Access 활성화 (한 번만)
+        if (parsedIpDirect.toLowerCase() == 'true') {
+          final currentVal = bind.mainGetOptionSync(key: 'direct-server');
+          if (currentVal != 'Y') {
+            await bind.mainSetOption(key: 'direct-server', value: 'Y');
+            debugPrint('MDesk: ipdirect=true -> direct-server enabled');
+          }
+        }
+
+        // 클립보드에서 "certno: 40005" 형식 확인 (한 번만, 파일명보다 우선)
+        if (!_clipboardChecked) {
+          _clipboardChecked = true;
+          final clipboardCertNum = await _readClipboardCertNo();
+          if (clipboardCertNum != null) {
+            parsedCertNo = 'true';
+            parsedCertNum = clipboardCertNum;
+            debugPrint('MDesk: Clipboard certno overrides filename -> certnum=$clipboardCertNum');
+          }
+        }
+        
+        // certno=true 이면 인증번호 입력창 활성화 (isValidId와 관계없이)
+        final newCertNoEnabled = parsedCertNo.toLowerCase() == 'true';
+        if (newCertNoEnabled != _certNoEnabled) {
+          _certNoEnabled = newCertNoEnabled;
+          debugPrint('MDesk: certno enabled = $_certNoEnabled');
+          // 인증번호 모드에 따라 창 크기 업데이트
+          await _updateWindowSize(_certNoEnabled);
+          if (mounted) setState(() {});
+        }
+        
+        // certnum= 값이 있으면 인증번호 입력창에 자동 입력 (한 번만)
+        if (_certNoEnabled && parsedCertNum.isNotEmpty && !_certNumAutoFilled) {
+          _certNumAutoFilled = true;
+          _certNumAutoFilledAt = DateTime.now();
+          _certNoController.text = parsedCertNum;
+          debugPrint('MDesk: certnum auto-filled = $parsedCertNum');
+          if (mounted) setState(() {});
+        }
+        
         // ID가 숫자로만 구성되어 있는지 추가 검증
         final cleanId = mdeskId.replaceAll(' ', '');
         final isValidId = cleanId.isNotEmpty && 
@@ -107,18 +356,23 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
         
         debugPrint('MDesk Timer: cleanId="$cleanId", isValidId=$isValidId');
         
+        // certnum 자동 입력 시: 5초 후 또는 윈도우(ID) 로딩 완료 시 자동으로 인증번호 확인
+        if (_certNumAutoFilled && 
+            !_certNumAutoVerifyDone && 
+            !_isCertNoVerified && 
+            _certNoController.text.trim().isNotEmpty &&
+            _certNumAutoFilledAt != null) {
+          final elapsed = DateTime.now().difference(_certNumAutoFilledAt!);
+          final shouldAutoVerify = elapsed >= const Duration(seconds: 5) || isValidId;
+          if (shouldAutoVerify) {
+            _certNumAutoVerifyDone = true;
+            debugPrint('MDesk: Auto-verify certno (elapsed=${elapsed.inSeconds}s, isValidId=$isValidId)');
+            _verifyCertNo();
+          }
+        }
+        
         if (isValidId) {
           _agentUpdateCalled = true;
-          
-          // 파일명 직접 파싱
-          final params = _parseFilename();
-          final parsedId = params['id'] ?? '';
-          final parsedAgentId = params['agentid'] ?? '';
-          final parsedCertNo = params['certno'] ?? '';
-          
-          // certno=true 이면 인증번호 입력창 활성화 및 id 무시
-          _certNoEnabled = parsedCertNo.toLowerCase() == 'true';
-          debugPrint('MDesk: certno enabled = $_certNoEnabled');
           
           // 최종적으로 사용할 값 결정
           // certno=true 이면 id 값을 무시하고 'cert'로 설정 (인증번호로 누구나 접속 가능)
@@ -561,6 +815,7 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
   void dispose() {
     windowManager.removeListener(this);
     _updateTimer?.cancel();
+    _inactivityTimer?.cancel();
     _certNoController.dispose();
     super.dispose();
   }
@@ -587,7 +842,7 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
                   child: Row(
                     children: [
                       Expanded(
-                        child: DragToMoveArea(
+                        child: _buildDragArea(
                           child: Container(
                             alignment: Alignment.centerLeft,
                             padding: const EdgeInsets.only(left: 15),
@@ -620,7 +875,7 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
                   ),
                 ),
                 Expanded(
-                  child: DragToMoveArea(
+                  child: _buildDragArea(
                     child: Center(
                       child: Container(
                         width: 350,
@@ -913,8 +1168,8 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
                                     ),
                                   ),
                                 ],
-                              ),
                             ),
+                          ),
                           ],
                         ),
                       ),

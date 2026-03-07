@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:back_button_interceptor/back_button_interceptor.dart';
+import 'package:app_links/app_links.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
@@ -21,7 +22,6 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
 import 'package:get/get_rx/src/rx_workers/utils/debouncer.dart';
 import 'package:provider/provider.dart';
-import 'package:uni_links/uni_links.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
@@ -45,7 +45,9 @@ import 'package:flutter_hbb/native/win32.dart'
 import 'package:flutter_hbb/native/common.dart'
     if (dart.library.html) 'package:flutter_hbb/web/common.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
+import 'package:flutter_hbb/utils/favorite_service.dart';
 
+final AppLinks _appLinks = AppLinks();
 final globalKey = GlobalKey<NavigatorState>();
 final navigationBarKey = GlobalKey();
 
@@ -2174,16 +2176,16 @@ Future<bool> initUniLinks() async {
   }
   // check cold boot
   try {
-    final initialLink = await getInitialLink();
-    print("initialLink: $initialLink");
-    if (initialLink == null || initialLink.isEmpty) {
+    final initialUri = await _appLinks.getInitialLink();
+    print("initialLink: $initialUri");
+    if (initialUri == null) {
       return false;
     }
     if (isWeb) {
-      webInitialLink = initialLink;
+      webInitialLink = initialUri.toString();
       return false;
     } else {
-      return handleUriLink(uriString: initialLink);
+      return handleUriLink(uri: initialUri);
     }
   } catch (err) {
     debugPrintStack(label: "$err");
@@ -2201,16 +2203,12 @@ StreamSubscription? listenUniLinks({handleByFlutter = true}) {
     return null;
   }
 
-  final sub = uriLinkStream.listen((Uri? uri) {
+  final sub = _appLinks.uriLinkStream.listen((Uri uri) {
     debugPrint("A uri was received: $uri. handleByFlutter $handleByFlutter");
-    if (uri != null) {
-      if (handleByFlutter) {
-        handleUriLink(uri: uri);
-      } else {
-        bind.sendUrlScheme(url: uri.toString());
-      }
+    if (handleByFlutter) {
+      handleUriLink(uri: uri);
     } else {
-      print("uni listen error: uri is empty.");
+      bind.sendUrlScheme(url: uri.toString());
     }
   }, onError: (err) {
     print("uni links error: $err");
@@ -3198,22 +3196,28 @@ Widget buildErrorBanner(BuildContext context,
       ));
 }
 
+/// 원격 탭 라벨: api_mdeskdeviceregistration alias(컴퓨터 이름) 우선 표기.
+/// 형식: "컴퓨터이름 (번호)" 또는 이름이 없을 때만 "번호@hostname".
 String getDesktopTabLabel(String peerId, String alias) {
-  String label = alias.isEmpty ? peerId : alias;
+  String hostname = '';
   try {
     String peer = bind.mainGetPeerSync(id: peerId);
     Map<String, dynamic> config = jsonDecode(peer);
     if (config['info']['hostname'] is String) {
-      String hostname = config['info']['hostname'];
-      if (hostname.isNotEmpty &&
-          !label.toLowerCase().contains(hostname.toLowerCase())) {
-        label += "@$hostname";
-      }
+      hostname = config['info']['hostname'] ?? '';
     }
   } catch (e) {
     debugPrint("Failed to get hostname:$e");
   }
-  return label;
+  // alias(컴퓨터 이름) 우선, 없으면 hostname, 그다음 peerId
+  final displayName = alias.isNotEmpty
+      ? alias
+      : (hostname.isNotEmpty ? hostname : peerId);
+  if (displayName == peerId) {
+    if (hostname.isNotEmpty) return '$peerId@$hostname';
+    return peerId;
+  }
+  return '$displayName ($peerId)';
 }
 
 sessionRefreshVideo(SessionID sessionId, PeerInfo pi) async {
@@ -3900,6 +3904,34 @@ void earlyAssert() {
   assert('\1' == '1');
 }
 
+/// 즐겨찾기 목록 로드 (서버 API 연동, 로그인 사용자 전용)
+Future<void> loadFavPeers() async {
+  const loadFavEvent = 'load_fav_peers';
+  if (!gFFI.userModel.isLogin) {
+    platformFFI.tryHandle({'name': loadFavEvent, 'peers': jsonEncode([])});
+    return;
+  }
+  final apiServer = await bind.mainGetApiServer();
+  final accessToken = bind.mainGetLocalOption(key: 'access_token');
+  if (apiServer.isEmpty || accessToken.isEmpty) {
+    platformFFI.tryHandle({'name': loadFavEvent, 'peers': jsonEncode([])});
+    return;
+  }
+  final response = await favoriteService.getFavorites(
+    apiServer: apiServer,
+    accessToken: accessToken,
+  );
+  if (response.isUnauthorized) {
+    await gFFI.userModel.reset(resetOther: true);
+  }
+  final peers = favoriteService.favoritesToPeers(response.data);
+  final peerMaps = peers.map((p) => p.toJson()).toList();
+  platformFFI.tryHandle({
+    'name': loadFavEvent,
+    'peers': jsonEncode(peerMaps),
+  });
+}
+
 void checkUpdate() {
   if (!isWeb) {
     // MDesk 자체 버전 체크 API 사용
@@ -3930,8 +3962,8 @@ Future<void> checkMDeskUpdate() async {
         debugPrint('MDesk Update Check: Latest version = $latestVersion');
         
         if (latestVersion.isNotEmpty && _isNewerVersion(latestVersion, currentVersion)) {
-          // 새 버전이 있으면 업데이트 URL 설정
-          final downloadUrl = 'https://admin.787.kr/executables/$fileName';
+          // 새 버전이 있으면 업데이트 URL 설정 (항상 고정 URL 사용)
+          final downloadUrl = 'https://admin.787.kr/executables/MDesk-install.exe';
           stateGlobal.updateUrl.value = downloadUrl;
           stateGlobal.latestVersion.value = latestVersion;
           debugPrint('MDesk Update Check: New version available! $latestVersion > $currentVersion');
