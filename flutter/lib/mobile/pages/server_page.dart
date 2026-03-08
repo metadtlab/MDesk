@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
+import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:get/get.dart';
@@ -193,26 +194,43 @@ class _ServerPageState extends State<ServerPage> {
   @override
   Widget build(BuildContext context) {
     checkService();
-    return ChangeNotifierProvider.value(
-        value: gFFI.serverModel,
-        child: Consumer<ServerModel>(
-            builder: (context, serverModel, child) => SingleChildScrollView(
-                  controller: gFFI.serverModel.controller,
-                  child: Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.start,
-                      children: [
-                        buildPresetPasswordWarningMobile(),
-                        gFFI.serverModel.isStart
-                            ? ServerInfo()
-                            : ServiceNotRunningNotification(),
-                        const ConnectionManager(),
-                        const PermissionChecker(),
-                        SizedBox.fromSize(size: const Size(0, 15.0)),
-                      ],
+    return Obx(() {
+      final isLoggedIn = gFFI.userModel.isLogin;
+      return ChangeNotifierProvider.value(
+          value: gFFI.serverModel,
+          child: Consumer<ServerModel>(
+              builder: (context, serverModel, child) => SingleChildScrollView(
+                    controller: gFFI.serverModel.controller,
+                    child: Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.start,
+                        children: [
+                          if (!isLoggedIn) LoginRequiredNotification(),
+                          IgnorePointer(
+                            ignoring: !isLoggedIn,
+                            child: Opacity(
+                              opacity: isLoggedIn ? 1.0 : 0.45,
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.start,
+                                children: [
+                                  buildPresetPasswordWarningMobile(),
+                                  gFFI.serverModel.isStart
+                                      ? ServerInfo()
+                                      : ServiceNotRunningNotification(
+                                          enabled: isLoggedIn),
+                                  const ConnectionManager(),
+                                  PermissionChecker(enabled: isLoggedIn),
+                                  SizedBox.fromSize(
+                                      size: const Size(0, 15.0)),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                )));
+                  )));
+    });
   }
 }
 
@@ -226,8 +244,38 @@ void checkService() async {
   }
 }
 
+class LoginRequiredNotification extends StatelessWidget {
+  const LoginRequiredNotification({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return PaddingCard(
+        title: '로그인이 필요합니다',
+        titleIcon: const Icon(Icons.lock_outline, color: Colors.orangeAccent),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '로그인한 사용자만 화면 공유와 권한 설정을 사용할 수 있습니다.',
+              style: TextStyle(fontSize: 12, color: MyTheme.darkGray),
+            ).marginOnly(bottom: 8),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.login),
+              onPressed: () {
+                loginDialog();
+              },
+              label: const Text('로그인'),
+            ),
+          ],
+        ));
+  }
+}
+
 class ServiceNotRunningNotification extends StatelessWidget {
-  ServiceNotRunningNotification({Key? key}) : super(key: key);
+  const ServiceNotRunningNotification({Key? key, this.enabled = true})
+      : super(key: key);
+
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -246,7 +294,8 @@ class ServiceNotRunningNotification extends StatelessWidget {
                 .marginOnly(bottom: 8),
             ElevatedButton.icon(
                 icon: const Icon(Icons.play_arrow),
-                onPressed: () {
+                onPressed: enabled
+                    ? () {
                   if (gFFI.userModel.userName.value.isEmpty &&
                       bind.mainGetLocalOption(key: "show-scam-warning") !=
                           "N") {
@@ -254,7 +303,8 @@ class ServiceNotRunningNotification extends StatelessWidget {
                   } else {
                     serverModel.toggleService();
                   }
-                },
+                }
+                    : null,
                 label: Text(translate("Start service")))
           ],
         ));
@@ -565,7 +615,9 @@ class ServerInfo extends StatelessWidget {
 }
 
 class PermissionChecker extends StatefulWidget {
-  const PermissionChecker({Key? key}) : super(key: key);
+  const PermissionChecker({Key? key, this.enabled = true}) : super(key: key);
+
+  final bool enabled;
 
   @override
   State<PermissionChecker> createState() => _PermissionCheckerState();
@@ -585,24 +637,29 @@ class _PermissionCheckerState extends State<PermissionChecker> {
                           backgroundColor:
                               MaterialStateProperty.all(Colors.red)),
                       icon: const Icon(Icons.stop),
-                      onPressed: serverModel.toggleService,
+                      onPressed:
+                          widget.enabled ? serverModel.toggleService : null,
                       label: Text(translate("Stop service")))
                   .marginOnly(bottom: 8)
               : SizedBox.shrink(),
           PermissionRow(
               translate("Screen Capture"),
               serverModel.mediaOk,
+              enabled: widget.enabled,
               !serverModel.mediaOk &&
                       gFFI.userModel.userName.value.isEmpty &&
                       bind.mainGetLocalOption(key: "show-scam-warning") != "N"
                   ? () => showScamWarning(context, serverModel)
                   : serverModel.toggleService),
           PermissionRow(translate("Input Control"), serverModel.inputOk,
+              enabled: widget.enabled,
               serverModel.toggleInput),
           PermissionRow(translate("Transfer file"), serverModel.fileOk,
+              enabled: widget.enabled,
               serverModel.toggleFile),
           hasAudioPermission
               ? PermissionRow(translate("Audio Capture"), serverModel.audioOk,
+                  enabled: widget.enabled,
                   serverModel.toggleAudio)
               : Row(children: [
                   Icon(Icons.info_outline).marginOnly(right: 15),
@@ -613,18 +670,21 @@ class _PermissionCheckerState extends State<PermissionChecker> {
                   ))
                 ]),
           PermissionRow(translate("Enable clipboard"), serverModel.clipboardOk,
+              enabled: widget.enabled,
               serverModel.toggleClipboard),
         ]));
   }
 }
 
 class PermissionRow extends StatelessWidget {
-  const PermissionRow(this.name, this.isOk, this.onPressed, {Key? key})
+  const PermissionRow(this.name, this.isOk, this.onPressed,
+      {Key? key, this.enabled = true})
       : super(key: key);
 
   final String name;
   final bool isOk;
   final VoidCallback onPressed;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -633,9 +693,11 @@ class PermissionRow extends StatelessWidget {
         contentPadding: EdgeInsets.all(0),
         title: Text(name),
         value: isOk,
-        onChanged: (bool value) {
-          onPressed();
-        });
+        onChanged: enabled
+            ? (bool value) {
+                onPressed();
+              }
+            : null);
   }
 }
 

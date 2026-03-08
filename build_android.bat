@@ -122,6 +122,12 @@ if not defined ANDROID_NDK_HOME (
     goto :error
 )
 
+set "NDK_PREBUILT=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64"
+set "LIBCXX_ARM64=%NDK_PREBUILT%\sysroot\usr\lib\aarch64-linux-android\libc++_shared.so"
+set "LIBCXX_ARM=%NDK_PREBUILT%\sysroot\usr\lib\arm-linux-androideabi\libc++_shared.so"
+set "LIBCXX_X64=%NDK_PREBUILT%\sysroot\usr\lib\x86_64-linux-android\libc++_shared.so"
+set "LIBCXX_X86=%NDK_PREBUILT%\sysroot\usr\lib\i686-linux-android\libc++_shared.so"
+
 echo   ANDROID_NDK_HOME: %ANDROID_NDK_HOME%
 echo   BUILD_MODE: %BUILD_MODE%
 if defined PERL_PROVIDER (
@@ -223,6 +229,7 @@ if "%BUILD_ARM64%"=="1" (
         echo   [ARM64] Build failed
         goto :error
     )
+    if exist "%LIBCXX_ARM64%" copy /Y "%LIBCXX_ARM64%" "%JNILIBS_DIR%\arm64-v8a\libc++_shared.so" >nul
     echo   [ARM64] Done
     echo.
 )
@@ -235,6 +242,7 @@ if "%BUILD_ARM%"=="1" (
         echo   [ARM32] Build failed
         goto :error
     )
+    if exist "%LIBCXX_ARM%" copy /Y "%LIBCXX_ARM%" "%JNILIBS_DIR%\armeabi-v7a\libc++_shared.so" >nul
     echo   [ARM32] Done
     echo.
 )
@@ -251,6 +259,7 @@ if "%BUILD_X64%"=="1" (
         echo   [x86_64] Build failed
         goto :error
     )
+    if exist "%LIBCXX_X64%" copy /Y "%LIBCXX_X64%" "%JNILIBS_DIR%\x86_64\libc++_shared.so" >nul
     echo   [x86_64] Done
     echo.
 )
@@ -267,6 +276,7 @@ if "%BUILD_X86%"=="1" (
         echo   [x86] Build failed
         goto :error
     )
+    if exist "%LIBCXX_X86%" copy /Y "%LIBCXX_X86%" "%JNILIBS_DIR%\x86\libc++_shared.so" >nul
     echo   [x86] Done
     echo.
 )

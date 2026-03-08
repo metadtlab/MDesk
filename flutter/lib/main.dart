@@ -39,6 +39,13 @@ int? kWindowId;
 WindowType? kWindowType;
 late List<String> kBootArgs;
 
+const Locale _forcedAndroidLocale = Locale('ko');
+
+Locale? get _appLocale => isAndroid ? _forcedAndroidLocale : null;
+
+List<Locale> get _appSupportedLocales =>
+    isAndroid ? const [_forcedAndroidLocale] : supportedLocales;
+
 /// 파일명에서 포터블 모드 인자가 있는지 확인
 /// agentid=, id=, certno= 파라미터가 있어야 포터블 모드로 인식
 /// (단순히 'portable' 키워드만 있으면 포터블 모드 아님)
@@ -159,6 +166,9 @@ Future<void> main(List<String> args) async {
 Future<void> initEnv(String appType) async {
   // global shared preference
   await platformFFI.init(appType);
+  if (isAndroid) {
+    await bind.mainSetLocalOption(key: kCommConfKeyLang, value: 'ko');
+  }
   // global FFI, use this **ONLY** for global configuration
   // for convenience, use global FFI on mobile platform
   // focus on multi-ffi on desktop first
@@ -420,6 +430,7 @@ void _runApp(
       navigatorKey: globalKey,
       debugShowCheckedModeBanner: false,
       title: title,
+      locale: _appLocale,
       theme: MyTheme.lightTheme,
       darkTheme: MyTheme.darkTheme,
       themeMode: themeMode,
@@ -429,7 +440,7 @@ void _runApp(
         GlobalWidgetsLocalizations.delegate,
         GlobalCupertinoLocalizations.delegate,
       ],
-      supportedLocales: supportedLocales,
+      supportedLocales: _appSupportedLocales,
       navigatorObservers: [
         // FirebaseAnalyticsObserver(analytics: analytics),
         BotToastNavigatorObserver(),
@@ -581,6 +592,7 @@ class _AppState extends State<App> with WidgetsBindingObserver, WindowListener {
           title: isWeb
               ? '${bind.mainGetAppNameSync()} Web Client V2 (Preview)'
               : bind.mainGetAppNameSync(),
+          locale: _appLocale,
           theme: MyTheme.lightTheme,
           darkTheme: MyTheme.darkTheme,
           themeMode: MyTheme.currentThemeMode(),
@@ -596,7 +608,7 @@ class _AppState extends State<App> with WidgetsBindingObserver, WindowListener {
             GlobalWidgetsLocalizations.delegate,
             GlobalCupertinoLocalizations.delegate,
           ],
-          supportedLocales: supportedLocales,
+          supportedLocales: _appSupportedLocales,
           navigatorObservers: [
             // FirebaseAnalyticsObserver(analytics: analytics),
             BotToastNavigatorObserver(),

@@ -45,6 +45,9 @@ class UserModel {
       //  For _updateLocalUserInfo, network error will be set later
       //  For login success, should clear network error
       networkError.value = '';
+      if (p0.isEmpty && isAndroid && gFFI.serverModel.isStart) {
+        gFFI.serverModel.stopService();
+      }
     });
     // 10분마다 자동 리프레쉬 타이머 설정 (600초)
     _refreshTimer = Timer.periodic(const Duration(minutes: 10), (timer) {

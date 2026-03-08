@@ -32,7 +32,7 @@ echo.
 
 echo [4/4] 웹 빌드 중... (시간이 걸릴 수 있습니다)
 echo.
-flutter build web --release
+flutter build web --release -t lib/main_web.dart
 if errorlevel 1 (
     echo [오류] 웹 빌드 실패
     goto :error

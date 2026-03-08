@@ -35,7 +35,7 @@ class SettingsPage extends StatefulWidget implements PageShape {
   State<SettingsPage> createState() => _SettingsState();
 }
 
-const url = 'https://rustdesk.com/';
+const url = 'https://mdesk.co.kr/';
 
 enum KeepScreenOn {
   never,
@@ -267,9 +267,11 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     Provider.of<FfiModel>(context);
-    final outgoingOnly = bind.isOutgoingOnly();
-    final incomingOnly = bind.isIncomingOnly();
-    final customClientSection = CustomSettingsSection(
+    return Obx(() {
+      final isLoggedIn = gFFI.userModel.isLogin;
+      final outgoingOnly = bind.isOutgoingOnly();
+      final incomingOnly = bind.isIncomingOnly();
+      final customClientSection = CustomSettingsSection(
         child: Column(
       children: [
         if (bind.isCustomClient())
@@ -527,7 +529,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     Text('* ${translate('Ignore Battery Optimizations')}',
                         style: Theme.of(context).textTheme.bodySmall),
                   ]),
-              onToggle: (v) async {
+              onToggle: isLoggedIn
+                  ? (v) async {
                 if (v) {
                   await AndroidPermissionManager.request(
                       kRequestIgnoreBatteryOptimizations);
@@ -551,41 +554,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                         kActionApplicationDetailsSettings);
                   }
                 }
-              }));
+              }
+                  : null));
     }
-    enhancementsTiles.add(SettingsTile.switchTile(
-        initialValue: _enableStartOnBoot,
-        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(translate('Start on boot')),
-          Text(
-              '* ${translate('Start the screen sharing service on boot, requires special permissions')}',
-              style: Theme.of(context).textTheme.bodySmall),
-        ]),
-        onToggle: (toValue) async {
-          if (toValue) {
-            // 1. request kIgnoreBatteryOptimizations
-            if (!await AndroidPermissionManager.check(
-                kRequestIgnoreBatteryOptimizations)) {
-              if (!await AndroidPermissionManager.request(
-                  kRequestIgnoreBatteryOptimizations)) {
-                return;
-              }
-            }
-
-            // 2. request kSystemAlertWindow
-            if (!await AndroidPermissionManager.check(kSystemAlertWindow)) {
-              if (!await AndroidPermissionManager.request(kSystemAlertWindow)) {
-                return;
-              }
-            }
-
-            // (Optional) 3. request input permission
-          }
-          setState(() => _enableStartOnBoot = toValue);
-
-          gFFI.invokeMethod(AndroidChannel.kSetStartOnBootOpt, toValue);
-        }));
-
     if (!bind.isCustomClient()) {
       enhancementsTiles.add(
         SettingsTile.switchTile(
@@ -625,7 +596,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           Text('* ${translate('floating_window_tip')}',
               style: Theme.of(context).textTheme.bodySmall),
         ]),
-        onToggle: bind.mainIsOptionFixed(key: kOptionDisableFloatingWindow)
+        onToggle: !isLoggedIn
+            ? null
+            : bind.mainIsOptionFixed(key: kOptionDisableFloatingWindow)
             ? null
             : onFloatingWindowChanged));
 
@@ -642,7 +615,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           ? KeepScreenOn.never
           : optionToKeepScreenOn(
               bind.mainGetLocalOption(key: kOptionKeepScreenOn))),
-      asyncSetter: isOptionFixed(kOptionKeepScreenOn) || _floatingWindowDisabled
+      asyncSetter: !isLoggedIn ||
+              isOptionFixed(kOptionKeepScreenOn) ||
+              _floatingWindowDisabled
           ? null
           : (value) async {
               await bind.mainSetLocalOption(
@@ -768,12 +743,22 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 });
               },
             ),
-          SettingsTile(
+          if (isAndroid)
+            SettingsTile(
               title: Text(translate('Language')),
               leading: Icon(Icons.translate),
-              onPressed: (context) {
-                showLanguageSettings(gFFI.dialogManager);
-              }),
+              value: const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text('한국어'),
+              ),
+            )
+          else
+            SettingsTile(
+                title: Text(translate('Language')),
+                leading: Icon(Icons.translate),
+                onPressed: (context) {
+                  showLanguageSettings(gFFI.dialogManager);
+                }),
           SettingsTile(
             title: Text(translate(
                 Theme.of(context).brightness == Brightness.light
@@ -879,15 +864,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             !outgoingOnly &&
             !hideSecuritySettings)
           SettingsSection(title: Text('2FA'), tiles: tfaTiles),
-        if (isAndroid &&
-            !disabledSettings &&
-            !outgoingOnly &&
-            !hideSecuritySettings)
-          SettingsSection(
-            title: Text(translate("Share screen")),
-            tiles: shareScreenTiles,
-          ),
-        if (!bind.isIncomingOnly()) defaultDisplaySection(),
+        if (!bind.isIncomingOnly()) defaultDisplaySection(isLoggedIn),
         if (isAndroid &&
             !disabledSettings &&
             !outgoingOnly &&
@@ -906,28 +883,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 title: Text(translate("Version: ") + version),
                 value: Padding(
                   padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Text('rustdesk.com',
+                  child: Text('mdesk.co.kr',
                       style: TextStyle(
                         decoration: TextDecoration.underline,
                       )),
                 ),
                 leading: Icon(Icons.info)),
-            SettingsTile(
-                title: Text(translate("Build Date")),
-                value: Padding(
-                  padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Text(_buildDate),
-                ),
-                leading: Icon(Icons.query_builder)),
-            if (isAndroid)
-              SettingsTile(
-                  onPressed: (context) => onCopyFingerprint(_fingerprint),
-                  title: Text(translate("Fingerprint")),
-                  value: Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text(_fingerprint),
-                  ),
-                  leading: Icon(Icons.fingerprint)),
             SettingsTile(
               title: Text(translate("Privacy Statement")),
               onPressed: (context) =>
@@ -938,7 +899,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         ),
       ],
     );
-    return settings;
+      return settings;
+    });
   }
 
   Future<bool> canStartOnBoot() async {
@@ -952,7 +914,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     return true;
   }
 
-  defaultDisplaySection() {
+  defaultDisplaySection(bool isLoggedIn) {
     return SettingsSection(
       title: Text(translate("Display Settings")),
       tiles: [
@@ -960,7 +922,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             title: Text(translate('Display Settings')),
             leading: Icon(Icons.desktop_windows_outlined),
             trailing: Icon(Icons.arrow_forward_ios),
-            onPressed: (context) {
+            onPressed: !isLoggedIn
+                ? null
+                : (context) {
               Navigator.push(context, MaterialPageRoute(builder: (context) {
                 return _DisplayPage();
               }));
@@ -971,6 +935,10 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
 }
 
 void showLanguageSettings(OverlayDialogManager dialogManager) async {
+  if (isAndroid) {
+    await bind.mainSetLocalOption(key: kCommConfKeyLang, value: 'ko');
+    return;
+  }
   try {
     final langs = json.decode(await bind.mainGetLangs()) as List<dynamic>;
     var lang = bind.mainGetLocalOption(key: kCommConfKeyLang);
@@ -1044,12 +1012,12 @@ void showAbout(OverlayDialogManager dialogManager) {
         Text('Version: $version'),
         InkWell(
             onTap: () async {
-              const url = 'https://rustdesk.com/';
+              const url = 'https://mdesk.co.kr/';
               await launchUrl(Uri.parse(url));
             },
             child: Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('rustdesk.com',
+              child: Text('mdesk.co.kr',
                   style: TextStyle(
                     decoration: TextDecoration.underline,
                   )),

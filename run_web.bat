@@ -11,7 +11,7 @@ echo.
 
 cd /d "%~dp0flutter"
 
-flutter run -d chrome
+flutter run -d chrome -t lib/main_web.dart
 
 cd /d "%~dp0"
 pause
