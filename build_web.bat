@@ -11,7 +11,7 @@ REM Flutter 디렉토리로 이동
 cd /d "%~dp0flutter"
 
 echo [1/4] Flutter 환경 확인 중...
-flutter --version
+call flutter --version
 if errorlevel 1 (
     echo [오류] Flutter가 설치되어 있지 않습니다.
     goto :error
@@ -19,11 +19,11 @@ if errorlevel 1 (
 echo.
 
 echo [2/4] 웹 지원 활성화 확인...
-flutter config --enable-web
+call flutter config --enable-web
 echo.
 
 echo [3/4] 의존성 설치 중...
-flutter pub get
+call flutter pub get
 if errorlevel 1 (
     echo [오류] 의존성 설치 실패
     goto :error
@@ -32,7 +32,7 @@ echo.
 
 echo [4/4] 웹 빌드 중... (시간이 걸릴 수 있습니다)
 echo.
-flutter build web --release -t lib/main_web.dart
+call flutter build web --release -t lib/main_web.dart
 if errorlevel 1 (
     echo [오류] 웹 빌드 실패
     goto :error

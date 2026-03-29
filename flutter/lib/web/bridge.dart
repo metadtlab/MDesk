@@ -1356,11 +1356,11 @@ class RustdeskImpl {
   }
 
   Future<void> mainCheckMouseTime({dynamic hint}) {
-    throw UnimplementedError("mainCheckMouseTime");
+    return Future.value();
   }
 
   Future<double> mainGetMouseTime({dynamic hint}) {
-    throw UnimplementedError("mainGetMouseTime");
+    return Future.value(0);
   }
 
   Future<void> mainWol({required String id, dynamic hint}) {

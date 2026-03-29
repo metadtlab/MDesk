@@ -1814,6 +1814,39 @@ impl Connection {
                 }
             }
         }
+        #[cfg(windows)]
+        self.auto_refresh_login_screen_if_needed();
+    }
+
+    #[cfg(windows)]
+    fn auto_refresh_login_screen_if_needed(&self) {
+        let is_remote_session =
+            self.file_transfer.is_none() && !self.view_camera && self.port_forward_socket.is_none() && !self.terminal;
+        let is_login_screen = crate::platform::is_prelogin() || crate::platform::is_locked();
+        if !is_remote_session || !is_login_screen {
+            return;
+        }
+
+        log::info!(
+            "[Display] Windows 로그인/잠금 화면 접속 감지 - 초기 검정 화면 방지를 위해 비디오 새로 고침을 자동 실행합니다"
+        );
+        self.refresh_video_display(None);
+
+        let server = self.server.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(1200)).await;
+            log::info!(
+                "[Display] Windows 로그인/잠금 화면 자동 2차 새로 고침 실행"
+            );
+            video_service::refresh();
+            server.upgrade().map(|s| {
+                s.read().unwrap().set_video_service_opt(
+                    None,
+                    video_service::OPTION_REFRESH,
+                    super::service::SERVICE_OPTION_VALUE_TRUE,
+                );
+            });
+        });
     }
 
     fn peer_keyboard_enabled(&self) -> bool {
@@ -2080,10 +2113,25 @@ impl Connection {
         };
 
         log::info!("[RemoteUser] 등록된 원격자 수: {}", users.len());
+        let requester_account_id = self.lr.my_name.trim().to_lowercase();
+        let registered_ids = users
+            .iter()
+            .map(|user| user.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect::<Vec<_>>();
+        log::info!(
+            "[RemoteUser] 등록된 원격자 ID 목록: {:?}, 접속 시도 기기 ID: {}, 접속 시도 이름: {}, 비교용 계정 ID: {}, source_ip: {}",
+            registered_ids,
+            self.lr.my_id,
+            self.lr.my_name,
+            requester_account_id,
+            self.ip
+        );
         
-        // 등록된 모든 원격자의 연결 암호로 인증 시도
+        // 접속 시도 이름(my_name)을 정규화한 계정 ID와 일치하는 등록 원격자의 연결 암호만 인증 시도
+        let mut matched_user_id = false;
         for (idx, user) in users.iter().enumerate() {
             let user_id = user.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let normalized_user_id = user_id.trim().to_lowercase();
             let user_name = user.get("name").and_then(|v| v.as_str()).unwrap_or("");
             
             // 암호화된 연결 암호 가져오기
@@ -2094,6 +2142,29 @@ impl Connection {
             
             log::info!("[RemoteUser] [{}/{}] 인증 시도 - 사용자: {} ({}), 저장된 암호 길이: {}", 
                 idx + 1, users.len(), user_name, user_id, encrypted_password.len());
+
+            if normalized_user_id != requester_account_id {
+                log::info!(
+                    "[RemoteUser] [{}/{}] 계정 ID 불일치로 건너뜀 - 비교용 계정 ID: {}, 등록 ID: {}, 접속 기기 ID: {}",
+                    idx + 1,
+                    users.len(),
+                    requester_account_id,
+                    user_id,
+                    self.lr.my_id
+                );
+                continue;
+            }
+
+            matched_user_id = true;
+            log::info!(
+                "[RemoteUser] [{}/{}] 계정 ID 일치 확인 - 비교용 계정 ID: {}, 등록 이름: {}, 요청자 이름: {}, 접속 기기 ID: {}",
+                idx + 1,
+                users.len(),
+                requester_account_id,
+                user_name,
+                self.lr.my_name,
+                self.lr.my_id
+            );
             
             if encrypted_password.is_empty() {
                 log::info!("[RemoteUser] [{}/{}] 암호가 비어있어 건너뜀", idx + 1, users.len());
@@ -2123,7 +2194,17 @@ impl Connection {
             }
         }
         
-        log::info!("[RemoteUser] 모든 등록된 원격자 암호 검증 실패");
+        if !matched_user_id {
+            log::warn!(
+                "[RemoteUser] 비교용 계정 ID와 일치하는 등록 원격자 없음 - 비교용 계정 ID: {}, 접속 시도 이름: {}, 접속 기기 ID: {}, 등록 ID 목록: {:?}",
+                requester_account_id,
+                self.lr.my_name,
+                self.lr.my_id,
+                registered_ids
+            );
+        }
+        
+        log::info!("[RemoteUser] 일치하는 ID의 등록 원격자 암호 검증 실패");
         log::info!("[RemoteUser] ========== 원격자 인증 종료 ==========");
         false
     }
@@ -2240,6 +2321,17 @@ impl Connection {
 
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
+        log::info!(
+            "[LoginRequest] 원격 요청 수신 - source_ip={}, my_id={}, my_name={}, my_platform={}, username={}, session_id={}, version={}, password_bytes={}",
+            self.ip,
+            lr.my_id,
+            lr.my_name,
+            lr.my_platform,
+            lr.username,
+            lr.session_id,
+            lr.version,
+            lr.password.len()
+        );
         self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
         if let Some(o) = lr.option.as_ref() {
             self.options_in_login = Some(o.clone());

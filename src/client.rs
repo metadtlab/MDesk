@@ -467,7 +467,10 @@ impl Client {
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             ..Default::default()
         });
-        for i in 1..=3 {
+        let mut i = 0;
+        let mut offline_grace_retry = true;
+        while i < 3 {
+            i += 1;
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
                 i,
@@ -491,6 +494,15 @@ impl Client {
                                     bail!("ID does not exist");
                                 }
                                 Ok(punch_hole_response::Failure::OFFLINE) => {
+                                    if offline_grace_retry {
+                                        offline_grace_retry = false;
+                                        log::info!(
+                                            "Peer offline on rendezvous; waiting 3s then retry punch"
+                                        );
+                                        hbb_common::sleep(3.).await;
+                                        i -= 1;
+                                        continue;
+                                    }
                                     bail!("Remote desktop is offline");
                                 }
                                 Ok(punch_hole_response::Failure::LICENSE_MISMATCH) => {

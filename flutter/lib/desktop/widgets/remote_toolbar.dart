@@ -2212,7 +2212,7 @@ class _WhiteboardButton extends StatelessWidget {
     return Obx(() {
       final controller = Get.find<WhiteboardController>(tag: id);
       return _IconMenuButton(
-        icon: const Icon(Icons.draw, size: 20),
+        icon: const Icon(Icons.draw, size: 32),
         tooltip: controller.isEnabled.value ? '화이트보드 끄기' : '화이트보드',
         onPressed: () => controller.toggle(),
         color: controller.isEnabled.value

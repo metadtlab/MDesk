@@ -1,0 +1,124 @@
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # 기본 로그 파일
+    access_log  /var/log/nginx/access.log;
+    error_log   /var/log/nginx/error.log;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    # 업로드 허용 크기
+    client_max_body_size 50M;
+
+    # 업로드/프록시 타임아웃
+    client_body_timeout 300s;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 300s;
+    proxy_send_timeout 300s;
+
+    # Django API 서버 upstream
+    upstream django {
+        server rustdesk-api-server:80;
+    }
+
+    # HTTP -> HTTPS 강제 리다이렉트
+    server {
+        listen 80;
+        server_name 787.kr www.787.kr admin.787.kr;
+        return 301 https://$host$request_uri;
+    }
+
+    # 메인 사이트용 도메인
+    server {
+        listen 443 ssl http2;
+        server_name 787.kr www.787.kr;
+
+        ssl_certificate /etc/nginx/ssl/www.787.kr.crt.pem;
+        ssl_certificate_key /etc/nginx/ssl/www.787.kr.key.pem;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+
+        client_max_body_size 50M;
+
+        location / {
+            proxy_pass http://django;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_read_timeout 300s;
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+        }
+    }
+
+    # admin.787.kr 운영 도메인
+    server {
+        listen 443 ssl http2;
+        server_name admin.787.kr;
+
+        ssl_certificate /etc/nginx/ssl/admin.787.kr.crt.pem;
+        ssl_certificate_key /etc/nginx/ssl/admin.787.kr.key.pem;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+
+        client_max_body_size 50M;
+
+        # 설치 파일 다운로드 경로
+        location = /executables/MDesk-install.exe {
+            alias /var/www/executables/MDesk_portable.exe;
+            add_header Content-Disposition 'attachment; filename="MDesk-install.exe"';
+        }
+
+        location /executables/ {
+            alias /var/www/executables/;
+            add_header Content-Disposition 'attachment';
+        }
+
+        # Flutter Web 정적 파일 경로
+        #
+        # 중요:
+        # - alias 경로 끝에는 반드시 "/"를 유지
+        # - flutter build web 시 --base-href /api/remote/ 로 빌드해야 함
+        # - build/web 폴더 전체를 아래 디렉터리로 복사해야 함
+        # - 이 블록은 location / 보다 먼저 두는 것이 안전함
+        location /api/remote/ {
+            alias /var/www/mdesk-remote/;
+            index index.html;
+
+            # 정적 파일이 있으면 그대로 응답
+            # 없으면 Flutter 앱 진입점인 index.html로 fallback
+            try_files $uri $uri/ /api/remote/index.html;
+
+            # 캐시 정책은 운영 상황에 맞게 조정
+            add_header Cache-Control "no-cache";
+        }
+
+        # 기본 요청은 기존 Django 백엔드로 전달
+        #
+        # /api/login, /api/logout, /api/login-options 등은
+        # 이 블록을 통해 기존 백엔드가 계속 처리함
+        location / {
+            proxy_pass http://django;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_read_timeout 300s;
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+        }
+    }
+}

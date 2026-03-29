@@ -123,10 +123,14 @@ if not defined ANDROID_NDK_HOME (
 )
 
 set "NDK_PREBUILT=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64"
+set "NDK_TOOLCHAIN_BIN=%NDK_PREBUILT%\bin"
 set "LIBCXX_ARM64=%NDK_PREBUILT%\sysroot\usr\lib\aarch64-linux-android\libc++_shared.so"
 set "LIBCXX_ARM=%NDK_PREBUILT%\sysroot\usr\lib\arm-linux-androideabi\libc++_shared.so"
 set "LIBCXX_X64=%NDK_PREBUILT%\sysroot\usr\lib\x86_64-linux-android\libc++_shared.so"
 set "LIBCXX_X86=%NDK_PREBUILT%\sysroot\usr\lib\i686-linux-android\libc++_shared.so"
+set "ANDROID_NDK_HOME_UNIX=%ANDROID_NDK_HOME:\=/%"
+set "ANDROID_NDK_HOME=%ANDROID_NDK_HOME_UNIX%"
+set "ANDROID_NDK=%ANDROID_NDK_HOME_UNIX%"
 
 echo   ANDROID_NDK_HOME: %ANDROID_NDK_HOME%
 echo   BUILD_MODE: %BUILD_MODE%
@@ -171,6 +175,11 @@ if "%BUILD_X86%"=="1" (
         goto :error
     )
     echo   x86 MSYS bash build enabled
+)
+
+:: rustup installs cargo/rustup here; some CMD sessions do not inherit user PATH
+if exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
+    set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 )
 
 :: Check cargo-ndk
@@ -221,10 +230,26 @@ if /i "%PERL_PROVIDER%"=="MSYS2" (
     set "WIN_JNILIBS_DIR=%JNILIBS_DIR%"
 )
 
+:: libsodium-sys: GNU make/configure need cmp/diff; libtool breaks CC paths with Windows backslashes in sh
+if exist "%MSYS2_ROOT%\usr\bin" (
+    set "PATH=%MSYS2_ROOT%\usr\bin;%PATH%"
+    echo   Prepended MSYS2 usr\bin to PATH ^(cmp, diff for libsodium build^)
+) else (
+    echo [WARN] MSYS2 not found at %MSYS2_ROOT%\usr\bin - install MSYS2 or add cmp/diff to PATH.
+    echo   https://www.msys2.org/
+)
+
 :: ARM64 build
 if "%BUILD_ARM64%"=="1" (
     echo   Building arm64-v8a ^(aarch64-linux-android^)
-    cargo ndk -t aarch64-linux-android -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
+    if /i "%PERL_PROVIDER%"=="MSYS2" (
+        "%MSYS2_BASH%" -c "NDK_DIR=$(cygpath -u \"$WIN_ANDROID_NDK_HOME\"); REPO_DIR=$(cygpath -u \"$WIN_REPO_DIR\"); JNILIBS_DIR=$(cygpath -u \"$WIN_JNILIBS_DIR\"); CARGO_BIN=$(cygpath -u \"$WIN_CARGO_BIN\"); TOOLCHAIN_BIN=\"$NDK_DIR/toolchains/llvm/prebuilt/windows-x86_64/bin\"; ARM64_CC=\"$TOOLCHAIN_BIN/clang.exe\"; ARM64_CXX=\"$TOOLCHAIN_BIN/clang++.exe\"; ARM64_LINKER=$(cygpath -w \"$TOOLCHAIN_BIN/aarch64-linux-android21-clang.cmd\"); ARM64_AR=\"$TOOLCHAIN_BIN/llvm-ar.exe\"; ARM64_RANLIB=\"$TOOLCHAIN_BIN/llvm-ranlib.exe\"; ARM64_CLANG_PATH=$(cygpath -w \"$TOOLCHAIN_BIN/clang.exe\"); ARM64_TARGET_FLAG=\"--target=aarch64-linux-android21\"; export ANDROID_NDK_HOME=\"$NDK_DIR\"; export ANDROID_NDK_ROOT=\"$NDK_DIR\"; export CLANG_PATH=\"$ARM64_CLANG_PATH\"; export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=\"$ARM64_LINKER\"; export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=\"$ARM64_AR\"; export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=\"$ARM64_TARGET_FLAG\"; export PATH=\"$CARGO_BIN:$TOOLCHAIN_BIN:$PATH\"; cd \"$REPO_DIR\"; env 'CC_aarch64-linux-android'=\"$ARM64_CC\" 'CXX_aarch64-linux-android'=\"$ARM64_CXX\" 'AR_aarch64-linux-android'=\"$ARM64_AR\" 'RANLIB_aarch64-linux-android'=\"$ARM64_RANLIB\" 'CFLAGS_aarch64-linux-android'=\"$ARM64_TARGET_FLAG\" 'CXXFLAGS_aarch64-linux-android'=\"$ARM64_TARGET_FLAG\" cargo build --target aarch64-linux-android %CARGO_BUILD_FLAG% --features flutter && cp \"target/aarch64-linux-android/%BUILD_MODE%/liblibrustdesk.so\" \"$JNILIBS_DIR/arm64-v8a/librustdesk.so\""
+    ) else (
+        set "PATH=%NDK_TOOLCHAIN_BIN%;%PATH%"
+        set "CLANG_PATH=%NDK_TOOLCHAIN_BIN%\clang.exe"
+        set "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--target=aarch64-linux-android21"
+        cargo ndk -t aarch64-linux-android -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
+    )
     if errorlevel 1 (
         echo   [ARM64] Build failed
         goto :error
@@ -237,6 +262,9 @@ if "%BUILD_ARM64%"=="1" (
 :: ARM32 build
 if "%BUILD_ARM%"=="1" (
     echo   Building armeabi-v7a ^(armv7-linux-androideabi^)
+    set "PATH=%NDK_TOOLCHAIN_BIN%;%PATH%"
+    set "CLANG_PATH=%NDK_TOOLCHAIN_BIN%\clang.exe"
+    set "BINDGEN_EXTRA_CLANG_ARGS_armv7_linux_androideabi=--target=armv7-linux-androideabi21"
     cargo ndk -t armv7-linux-androideabi -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
     if errorlevel 1 (
         echo   [ARM32] Build failed

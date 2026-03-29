@@ -20,6 +20,18 @@ else()
     set(ENV{PATH} "$ENV{PATH}:${PERL_EXE_PATH}")
 endif()
 
+vcpkg_fixup_pkgconfig()
+
+if(NOT DEFINED VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "debug")
+    set(LIBVPX_CONFIG_DEBUG ON)
+else()
+    set(LIBVPX_CONFIG_DEBUG OFF)
+endif()
+
+configure_file("${CMAKE_CURRENT_LIST_DIR}/unofficial-libvpx-config.cmake.in" "${CURRENT_PACKAGES_DIR}/share/unofficial-libvpx/unofficial-libvpx-config.cmake" @ONLY)
+
+vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+
 find_program(BASH NAME bash HINTS /bin /usr/bin REQUIRED NO_CACHE)
 
 vcpkg_find_acquire_program(NASM)
@@ -108,13 +120,19 @@ else()
         set(LIBVPX_TARGET "generic-gnu")
     endif()
 
-    set(MAKE_BINARY "make")
+    if (VCPKG_HOST_IS_BSD)
+        set(MAKE_BINARY "gmake")
+    else()
+        set(MAKE_BINARY "make")
+    endif()
 
-    # 모든 텍스트 파일의 줄바꿈을 강제로 LF로 변환 (바이너리 제외)
+    message(STATUS "Build info. Target: ${LIBVPX_TARGET}; Options: ${OPTIONS}")
+
+    # Normalize generated scripts to LF so MSYS tools do not trip on CRLF.
     if(NOT VCPKG_DETECTED_MSVC)
         message(STATUS "Fixing line endings in all source files...")
         vcpkg_execute_required_process(
-            COMMAND find . -type f -not -path '*/.git/*' -exec grep -Iq . {} \; -exec sed -i "s/\\r$//" {} +
+            COMMAND ${BASH} --noprofile --norc -lc "shopt -s globstar nullglob; for f in **/*; do if [[ -f \"$f\" && \"$f\" != .git/* ]] && grep -Iq . \"$f\"; then sed -i 's/\\r$//' \"$f\"; fi; done"
             WORKING_DIRECTORY "${SOURCE_PATH}"
             LOGNAME "fix-line-endings"
         )
@@ -124,26 +142,80 @@ else()
         message(STATUS "Configuring libvpx for Release")
         file(MAKE_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel")
         vcpkg_execute_required_process(
-            COMMAND ${BASH} --noprofile --norc "${SOURCE_PATH}/configure" --target=${LIBVPX_TARGET} ${OPTIONS} ${OPTIONS_RELEASE} ${AS_NASM}
+            COMMAND
+                ${BASH} --noprofile --norc
+                "${SOURCE_PATH}/configure"
+                --target=${LIBVPX_TARGET}
+                ${OPTIONS}
+                ${OPTIONS_RELEASE}
+                ${MAC_OSX_MIN_VERSION_CFLAGS}
+                ${AS_NASM}
             WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel"
             LOGNAME configure-${TARGET_TRIPLET}-rel
         )
 
-        # 생성된 파일 줄바꿈 고치기
         vcpkg_execute_required_process(
-            COMMAND find . -maxdepth 2 -type f -exec sed -i "s/\\r$//" {} +
+            COMMAND ${BASH} --noprofile --norc -lc "shopt -s globstar nullglob; for f in **/*; do if [[ -f \"$f\" ]]; then sed -i 's/\\r$//' \"$f\"; fi; done"
             WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel"
             LOGNAME "fix-makefile-line-endings-rel"
         )
 
         message(STATUS "Building libvpx for Release")
         vcpkg_execute_required_process(
-            COMMAND ${MAKE_BINARY} -j${VCPKG_CONCURRENCY}
+            COMMAND
+                ${BASH} --noprofile --norc -c "${MAKE_BINARY} -j${VCPKG_CONCURRENCY}"
             WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel"
             LOGNAME build-${TARGET_TRIPLET}-rel
         )
-        
-        # ... (설치 코드 생략)
+
+        message(STATUS "Installing libvpx for Release")
+        vcpkg_execute_required_process(
+            COMMAND
+                ${BASH} --noprofile --norc -c "${MAKE_BINARY} install"
+            WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel"
+            LOGNAME install-${TARGET_TRIPLET}-rel
+        )
     endif()
-    # ... (디버그 코드 동일하게 수정)
+
+    if(NOT DEFINED VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "debug")
+        message(STATUS "Configuring libvpx for Debug")
+        file(MAKE_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-dbg")
+        vcpkg_execute_required_process(
+            COMMAND
+                ${BASH} --noprofile --norc
+                "${SOURCE_PATH}/configure"
+                --target=${LIBVPX_TARGET}
+                ${OPTIONS}
+                ${OPTIONS_DEBUG}
+                ${MAC_OSX_MIN_VERSION_CFLAGS}
+                ${AS_NASM}
+            WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-dbg"
+            LOGNAME configure-${TARGET_TRIPLET}-dbg
+        )
+
+        vcpkg_execute_required_process(
+            COMMAND ${BASH} --noprofile --norc -lc "shopt -s globstar nullglob; for f in **/*; do if [[ -f \"$f\" ]]; then sed -i 's/\\r$//' \"$f\"; fi; done"
+            WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-dbg"
+            LOGNAME "fix-makefile-line-endings-dbg"
+        )
+
+        message(STATUS "Building libvpx for Debug")
+        vcpkg_execute_required_process(
+            COMMAND
+                ${BASH} --noprofile --norc -c "${MAKE_BINARY} -j${VCPKG_CONCURRENCY}"
+            WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-dbg"
+            LOGNAME build-${TARGET_TRIPLET}-dbg
+        )
+
+        message(STATUS "Installing libvpx for Debug")
+        vcpkg_execute_required_process(
+            COMMAND
+                ${BASH} --noprofile --norc -c "${MAKE_BINARY} install"
+            WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-dbg"
+            LOGNAME install-${TARGET_TRIPLET}-dbg
+        )
+
+        file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
+        file(REMOVE "${CURRENT_PACKAGES_DIR}/debug/lib/libvpx_g.a")
+    endif()
 endif()

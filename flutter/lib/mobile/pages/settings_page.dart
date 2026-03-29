@@ -18,7 +18,7 @@ import '../../consts.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../widgets/dialog.dart';
-import 'home_page.dart';
+import 'home_page_shared.dart';
 import 'scan_page.dart';
 
 class SettingsPage extends StatefulWidget implements PageShape {

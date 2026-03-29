@@ -91,6 +91,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         alignment: Alignment.center,
         child: loadLogo(),
       ),
+      _buildVersionLabel(context),
       buildTip(context),
       if (!isOutgoingOnly) buildIDBoard(context),
       if (!isOutgoingOnly) buildPasswordBoard(context),
@@ -389,6 +390,26 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildVersionLabel(BuildContext context) {
+    return FutureBuilder<String>(
+      future: bind.mainGetVersion(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data!.isEmpty) return const SizedBox.shrink();
+        final textColor = Theme.of(context).textTheme.bodySmall?.color?.withOpacity(0.6);
+        return Padding(
+          padding: const EdgeInsets.only(left: 20, right: 16, top: 4, bottom: 0),
+          child: Text(
+            'v${snapshot.data}',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              fontSize: 11,
+              color: textColor,
+            ),
+          ),
+        );
+      },
     );
   }
 

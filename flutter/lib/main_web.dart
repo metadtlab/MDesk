@@ -2,10 +2,14 @@ import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
-import 'package:flutter_hbb/mobile/pages/home_page.dart';
+import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:flutter_hbb/models/state_model.dart';
+import 'package:flutter_hbb/web/home_page.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
+
+const Locale _forcedWebLocale = Locale('ko');
 
 Future<void> _initWebEnv(String appType) async {
   await platformFFI.init(appType);
@@ -26,6 +30,18 @@ Future<void> main(List<String> args) async {
   await initUniLinks();
 }
 
+int? get kWindowId => null;
+
+dynamic get kWindowType => null;
+
+List<String> get kBootArgs => const <String>[];
+
+bool hasAgentIdInFilename() => false;
+
+Future<void> showCmWindow({bool isStartup = false}) async {}
+
+Future<void> hideCmWindow({bool isStartup = false}) async {}
+
 class WebApp extends StatelessWidget {
   const WebApp({super.key});
 
@@ -44,6 +60,7 @@ class WebApp extends StatelessWidget {
         navigatorKey: globalKey,
         debugShowCheckedModeBanner: false,
         title: '${bind.mainGetAppNameSync()} Web Client V2 (Preview)',
+        locale: _forcedWebLocale,
         theme: MyTheme.lightTheme,
         darkTheme: MyTheme.darkTheme,
         themeMode: MyTheme.currentThemeMode(),
@@ -53,7 +70,7 @@ class WebApp extends StatelessWidget {
           GlobalWidgetsLocalizations.delegate,
           GlobalCupertinoLocalizations.delegate,
         ],
-        supportedLocales: supportedLocales,
+        supportedLocales: const [_forcedWebLocale],
         navigatorObservers: [
           BotToastNavigatorObserver(),
         ],

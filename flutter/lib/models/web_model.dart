@@ -43,7 +43,7 @@ class PlatformFFI {
 
   static final PlatformFFI instance = PlatformFFI._();
 
-  static get localeName => window.navigator.language;
+  static get localeName => 'ko';
   RustdeskImpl get ffiBind => _ffiBind;
 
   static Future<String> getVersion() async {

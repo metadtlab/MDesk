@@ -87,7 +87,6 @@ if(VCPKG_HOST_IS_WINDOWS)
     vcpkg_acquire_msys(MSYS_ROOT PACKAGES automake1.16)
     set(SHELL "${MSYS_ROOT}/usr/bin/bash.exe")
     vcpkg_add_to_path("${MSYS_ROOT}/usr/share/automake-1.16")
-    string(APPEND OPTIONS " --pkg-config=${CURRENT_HOST_INSTALLED_DIR}/tools/pkgconf/pkgconf${VCPKG_HOST_EXECUTABLE_SUFFIX}")
 else()
     find_program(SHELL bash)
 endif()
@@ -175,7 +174,7 @@ elseif(VCPKG_TARGET_IS_IOS)
 --extra-ldflags=\"-arch arm64 -mios-version-min=8.0 -fembed-bitcode\" \
 ")
 elseif(VCPKG_CMAKE_SYSTEM_NAME STREQUAL "Android")
-    string(APPEND OPTIONS "\
+    string(APPEND OPTIONS " \
 --target-os=android \
 --disable-asm \
 --disable-iconv \
@@ -408,12 +407,24 @@ if(NOT VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "release")
 
     z_vcpkg_setup_pkgconfig_path(CONFIG RELEASE)
 
+    if(VCPKG_HOST_IS_WINDOWS)
+        set(ENV{MSYSTEM} "MINGW64")
+        set(ENV{CHERE_INVOKING} "1")
+        set(ENV{MSYS2_PATH_TYPE} "inherit")
+    endif()
+
     vcpkg_execute_required_process(
         COMMAND "${SHELL}" ./build.sh
         WORKING_DIRECTORY "${BUILD_DIR}"
         LOGNAME "build-${TARGET_TRIPLET}-rel"
         SAVE_LOG_FILES ffbuild/config.log
     )
+
+    if(VCPKG_HOST_IS_WINDOWS)
+        unset(ENV{MSYSTEM})
+        unset(ENV{CHERE_INVOKING})
+        unset(ENV{MSYS2_PATH_TYPE})
+    endif()
 
     z_vcpkg_restore_pkgconfig_path()
 endif()
@@ -464,12 +475,24 @@ if(NOT VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "debug")
 
     z_vcpkg_setup_pkgconfig_path(CONFIG DEBUG)
 
+    if(VCPKG_HOST_IS_WINDOWS)
+        set(ENV{MSYSTEM} "MINGW64")
+        set(ENV{CHERE_INVOKING} "1")
+        set(ENV{MSYS2_PATH_TYPE} "inherit")
+    endif()
+
     vcpkg_execute_required_process(
         COMMAND "${SHELL}" ./build.sh
         WORKING_DIRECTORY "${BUILD_DIR}"
         LOGNAME "build-${TARGET_TRIPLET}-dbg"
         SAVE_LOG_FILES ffbuild/config.log
     )
+
+    if(VCPKG_HOST_IS_WINDOWS)
+        unset(ENV{MSYSTEM})
+        unset(ENV{CHERE_INVOKING})
+        unset(ENV{MSYS2_PATH_TYPE})
+    endif()
 
     z_vcpkg_restore_pkgconfig_path()
 endif()

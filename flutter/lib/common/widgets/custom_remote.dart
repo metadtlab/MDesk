@@ -1228,38 +1228,54 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
             // 하단: 상담원 추가 버튼 + 인증번호원격 버튼 + 새로고침 + 메시지
             Row(
               children: [
-                ElevatedButton.icon(
-                  onPressed: _isLoading ? null : _addCounselor,
-                  icon: _isLoading
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.person_add),
-                  label: Text(_isLoading ? '추가 중...' : '상담원 추가'),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                Expanded(
+                  flex: 1,
+                  child: ElevatedButton.icon(
+                    onPressed: _isLoading ? null : _addCounselor,
+                    icon: _isLoading
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.person_add, size: 18),
+                    label: Text(
+                      _isLoading ? '추가 중...' : '상담원 추가',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                    ),
                   ),
                 ),
-                const SizedBox(width: 8),
-                ElevatedButton.icon(
-                  onPressed: _isCertLoading ? null : _generateCertNo,
-                  icon: _isCertLoading
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.pin),
-                  label: Text(_isCertLoading ? '생성 중...' : '인증번호원격'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFFF6B35),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                const SizedBox(width: 6),
+                Expanded(
+                  flex: 1,
+                  child: ElevatedButton.icon(
+                    onPressed: _isCertLoading ? null : _generateCertNo,
+                    icon: _isCertLoading
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.pin, size: 18),
+                    label: Text(
+                      _isCertLoading ? '생성 중...' : '인증번호원격',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFFF6B35),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                    ),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 4),
                 IconButton(
                   onPressed: _isFetching ? null : () async {
                     await _fetchCounselors();

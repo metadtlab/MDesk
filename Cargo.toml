@@ -1,6 +1,6 @@
 [package]
 name = "MDesk"
-version = "1.4.21"
+version = "1.4.26"
 authors = ["MDesk <metadtlab@Gmail.com>"]
 edition = "2021"
 build= "build.rs"
@@ -225,9 +225,9 @@ osx_minimum_system_version = "10.14"
 
 #https://github.com/johnthagen/min-sized-rust
 [profile.release]
+opt-level = "z"   # 크기 우선 최적화 (속도보다 용량 감소). 문제 시 "s" 또는 제거
 lto = true
 codegen-units = 1
 panic = 'abort'
 strip = true
-#opt-level = 'z' # only have smaller size after strip
 rpath = true
