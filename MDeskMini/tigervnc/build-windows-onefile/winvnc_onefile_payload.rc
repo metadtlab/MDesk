@@ -1,0 +1,4 @@
+101 RCDATA "D:/IMedix/WebProject/Etc/tigervnc/dist-windows-server-static/winvnc4.exe"
+102 RCDATA "D:/IMedix/WebProject/Etc/tigervnc/dist-windows-server-static/vncconfig.exe"
+103 RCDATA "D:/IMedix/WebProject/Etc/tigervnc/dist-windows-server-static/wm_hooks.dll"
+104 RCDATA "D:/IMedix/WebProject/Etc/tigervnc/dist-windows-server-static/libwinpthread-1.dll"

@@ -2916,6 +2916,7 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 	BOOL bIsStreamFile = TRUE;
 	static LPSTREAM pStreamStc = NULL;
 	static UINT32 uStreamIdStc = 0;
+	static UINT64 uStreamOffsetStc = 0;
 	wfClipboard *clipboard;
 	UINT rc = ERROR_INTERNAL_ERROR;
 	UINT sRc;
@@ -2999,6 +3000,8 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 		{
 			IStream_Release(pStreamStc);
 			pStreamStc = NULL;
+			uStreamIdStc = 0;
+			uStreamOffsetStc = 0;
 		}
 
 		bIsStreamFile = FALSE;
@@ -3020,6 +3023,7 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 						{
 							pStreamStc = vStgMedium.pstm;
 							uStreamIdStc = fileContentsRequest->streamId;
+							uStreamOffsetStc = 0;
 							bIsStreamFile = TRUE;
 						}
 
@@ -3049,6 +3053,8 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 		{
 			LARGE_INTEGER dlibMove;
 			ULARGE_INTEGER dlibNewPosition;
+			UINT64 requestedOffset =
+				((UINT64)fileContentsRequest->nPositionHigh << 32) | fileContentsRequest->nPositionLow;
 
 			if (clipboard->nFiles > 0 &&
 				fileContentsRequest->listIndex == (UINT32)clipboard->first_file_index &&
@@ -3057,12 +3063,21 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 				clipboard->context->HandleClipboardFiles(fileContentsRequest->connID, clipboard->nFiles, clipboard->file_names);
 			}
 
-			dlibMove.HighPart = fileContentsRequest->nPositionHigh;
-			dlibMove.LowPart = fileContentsRequest->nPositionLow;
-			hRet = IStream_Seek(pStreamStc, dlibMove, STREAM_SEEK_SET, &dlibNewPosition);
+			if (requestedOffset != uStreamOffsetStc)
+			{
+				dlibMove.HighPart = fileContentsRequest->nPositionHigh;
+				dlibMove.LowPart = fileContentsRequest->nPositionLow;
+				hRet = IStream_Seek(pStreamStc, dlibMove, STREAM_SEEK_SET, &dlibNewPosition);
+				if (SUCCEEDED(hRet))
+					uStreamOffsetStc = dlibNewPosition.QuadPart;
+			}
 
 			if (SUCCEEDED(hRet))
+			{
 				hRet = IStream_Read(pStreamStc, pData, cbRequested, (PULONG)&uSize);
+				if (SUCCEEDED(hRet))
+					uStreamOffsetStc += uSize;
+			}
 		}
 	}
 	else
@@ -3116,11 +3131,12 @@ exit:
 	if (pDataObj)
 		IDataObject_Release(pDataObj);
 
-	// https://learn.microsoft.com/en-us/windows/win32/api/objidl/nf-objidl-idataobject-getdata#:~:text=value%20of%20its-,pUnkForRelease,-member.%20If%20pUnkForRelease
-	if (pStreamStc && vStgMedium.pUnkForRelease == NULL)
+	if (rc != CHANNEL_RC_OK && pStreamStc)
 	{
 		IStream_Release(pStreamStc);
 		pStreamStc = NULL;
+		uStreamIdStc = 0;
+		uStreamOffsetStc = 0;
 	}
 
 	if (rc != CHANNEL_RC_OK)

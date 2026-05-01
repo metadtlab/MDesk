@@ -199,6 +199,40 @@ class _PeerTabPageState extends State<PeerTabPage>
     });
   }
 
+  static const double _peerTabIconSize = 20;
+
+  Widget _peerTabSwitchIcon(
+      PeerTabModel model, int t, Color? color, bool selected) {
+    Widget png(String asset) => Opacity(
+          opacity: selected ? 1.0 : 0.52,
+          child: Image.asset(
+            asset,
+            width: _peerTabIconSize,
+            height: _peerTabIconSize,
+            fit: BoxFit.contain,
+            filterQuality: FilterQuality.medium,
+          ),
+        );
+    if (t == PeerTabIndex.recent.index) {
+      return png(PeerTabModel.assetTabTreeView);
+    }
+    if (t == PeerTabIndex.ab.index) {
+      return png(PeerTabModel.assetTabDiscovered);
+    }
+    if (t == PeerTabModel.tabIndexCustomRemote) {
+      return png(PeerTabModel.assetTabCustomRemote);
+    }
+    return Text(
+      model.tabEmoji(t),
+      textAlign: TextAlign.center,
+      style: TextStyle(
+        fontSize: 18,
+        height: 1.1,
+        color: color,
+      ),
+    );
+  }
+
   Widget _createSwitchBar(BuildContext context) {
     final model = Provider.of<PeerTabModel>(context);
     var counter = -1;
@@ -234,7 +268,7 @@ class _PeerTabPageState extends State<PeerTabPage>
                         decoration: (hover.value
                             ? (selected ? decoBorder : deco)
                             : (selected ? decoBorder : null)),
-                        child: Icon(model.tabIcon(t), color: color)
+                        child: _peerTabSwitchIcon(model, t, color, selected)
                             .paddingSymmetric(horizontal: 4),
                       ).paddingSymmetric(horizontal: 4),
                       onTap: isOptionFixed(kOptionPeerTabIndex)
@@ -319,10 +353,6 @@ class _PeerTabPageState extends State<PeerTabPage>
                 ))),
       ),
     );
-  }
-
-  Widget _createPeerViewTypeSwitch(BuildContext context) {
-    return PeerViewDropdown();
   }
 
   Widget _createMultiSelection() {
@@ -668,7 +698,6 @@ class _PeerTabPageState extends State<PeerTabPage>
         offstage: model.currentTabCachedPeers.isEmpty,
         child: _createMultiSelection(),
       ),
-      _createPeerViewTypeSwitch(context),
       Offstage(
         offstage: model.currentTab == PeerTabIndex.recent.index,
         child: PeerSortDropdown(),
@@ -870,99 +899,6 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
             ],
           ),
         ));
-  }
-}
-
-class PeerViewDropdown extends StatefulWidget {
-  const PeerViewDropdown({super.key});
-
-  @override
-  State<PeerViewDropdown> createState() => _PeerViewDropdownState();
-}
-
-class _PeerViewDropdownState extends State<PeerViewDropdown> {
-  @override
-  Widget build(BuildContext context) {
-    final List<PeerUiType> types = [
-      PeerUiType.grid,
-      PeerUiType.tile,
-      PeerUiType.list
-    ];
-    final style = TextStyle(
-        color: Theme.of(context).textTheme.titleLarge?.color,
-        fontSize: MenuConfig.fontSize,
-        fontWeight: FontWeight.normal);
-    List<PopupMenuEntry> items = List.empty(growable: true);
-    items.add(PopupMenuItem(
-        height: 36,
-        enabled: false,
-        child: Text(translate("Change view"), style: style)));
-    for (var e in PeerUiType.values) {
-      items.add(PopupMenuItem(
-          height: 36,
-          child: Obx(() => Center(
-                child: SizedBox(
-                  height: 36,
-                  child: getRadio<PeerUiType>(
-                      Tooltip(
-                          message: translate(types.indexOf(e) == 0
-                              ? 'Big tiles'
-                              : types.indexOf(e) == 1
-                                  ? 'Small tiles'
-                                  : 'List'),
-                          child: Icon(
-                            e == PeerUiType.grid
-                                ? Icons.grid_view_rounded
-                                : e == PeerUiType.list
-                                    ? Icons.view_list_rounded
-                                    : Icons.view_agenda_rounded,
-                            size: 18,
-                          )),
-                      e,
-                      peerCardUiType.value,
-                      dense: true,
-                      isOptionFixed(kOptionPeerCardUiType)
-                          ? null
-                          : (PeerUiType? v) async {
-                              if (v != null) {
-                                peerCardUiType.value = v;
-                                setState(() {});
-                                await bind.setLocalFlutterOption(
-                                  k: kOptionPeerCardUiType,
-                                  v: peerCardUiType.value.index.toString(),
-                                );
-                                if (Navigator.canPop(context)) {
-                                  Navigator.pop(context);
-                                }
-                              }
-                            }),
-                ),
-              ))));
-    }
-
-    var menuPos = RelativeRect.fromLTRB(0, 0, 0, 0);
-    return _hoverAction(
-        context: context,
-        toolTip: translate('Change view'),
-        child: Icon(
-          peerCardUiType.value == PeerUiType.grid
-              ? Icons.grid_view_rounded
-              : peerCardUiType.value == PeerUiType.list
-                  ? Icons.view_list_rounded
-                  : Icons.view_agenda_rounded,
-          size: 18,
-        ),
-        onTapDown: (details) {
-          final x = details.globalPosition.dx;
-          final y = details.globalPosition.dy;
-          menuPos = RelativeRect.fromLTRB(x, y, x, y);
-        },
-        onTap: () => showMenu(
-              context: context,
-              position: menuPos,
-              items: items,
-              elevation: 8,
-            ));
   }
 }
 

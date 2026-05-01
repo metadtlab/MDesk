@@ -1243,6 +1243,36 @@ impl<T: InvokeUiSession> Remote<T> {
         }
     }
 
+    fn refresh_video_after_secure_desktop_switch(&self) {
+        let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
+        if displays.is_empty() {
+            return;
+        }
+
+        for display in &displays {
+            self.handler.refresh_video(*display as _);
+        }
+
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=20 {
+                time::sleep(Duration::from_millis(1_000)).await;
+                for display in &displays {
+                    sender
+                        .send(Data::Message(client::LoginConfigHandler::refresh_display(
+                            *display,
+                        )))
+                        .ok();
+                }
+                log::info!(
+                    "Refresh displays {:?} after secure desktop switch, attempt {}",
+                    displays,
+                    attempt
+                );
+            }
+        });
+    }
+
     fn check_view_camera_support(&self, peer_version: &str, peer_platform: &str) -> bool {
         if self.peer_info.support_view_camera {
             return true;
@@ -1426,7 +1456,17 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::Clipboard(cb)) => {
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(vec![cb], ClipboardSide::Client);
+                        {
+                            let mut relay_msg = Message::new();
+                            relay_msg.set_clipboard(cb.clone());
+                            update_clipboard(vec![cb], ClipboardSide::Client);
+                            #[cfg(feature = "flutter")]
+                            crate::flutter::send_clipboard_msg_except_peer(
+                                &self.handler.get_id(),
+                                relay_msg,
+                                false,
+                            );
+                        }
                         #[cfg(target_os = "ios")]
                         {
                             let content = if cb.compress {
@@ -1445,7 +1485,17 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::MultiClipboards(_mcb)) => {
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(_mcb.clipboards, ClipboardSide::Client);
+                        {
+                            let mut relay_msg = Message::new();
+                            relay_msg.set_multi_clipboards(_mcb.clone());
+                            update_clipboard(_mcb.clipboards, ClipboardSide::Client);
+                            #[cfg(feature = "flutter")]
+                            crate::flutter::send_clipboard_msg_except_peer(
+                                &self.handler.get_id(),
+                                relay_msg,
+                                false,
+                            );
+                        }
                         #[cfg(target_os = "android")]
                         crate::clipboard::handle_msg_multi_clipboards(_mcb);
                     }
@@ -1786,6 +1836,9 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::Uac(uac)) => {
+                        if uac {
+                            self.refresh_video_after_secure_desktop_switch();
+                        }
                         let keyboard = self.handler.server_keyboard_enabled.read().unwrap().clone();
                         #[cfg(feature = "flutter")]
                         {
@@ -1819,6 +1872,9 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::ForegroundWindowElevated(elevated)) => {
+                        if elevated {
+                            self.refresh_video_after_secure_desktop_switch();
+                        }
                         let keyboard = self.handler.server_keyboard_enabled.read().unwrap().clone();
                         #[cfg(feature = "flutter")]
                         {
@@ -1853,6 +1909,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::ElevationResponse(err)) => {
                         if err.is_empty() {
+                            self.refresh_video_after_secure_desktop_switch();
                             self.handler.msgbox("wait-uac", "", "", "");
                         } else {
                             self.handler.cancel_msgbox("wait-uac");
@@ -2240,19 +2297,34 @@ impl<T: InvokeUiSession> Remote<T> {
         _peer: &mut Stream,
     ) {
         log::debug!("handling cliprdr msg from server peer");
-        #[cfg(feature = "flutter")]
-        if let Some(hbb_common::message_proto::cliprdr::Union::FormatList(_)) = &clip.union {
-            if self.client_conn_id
-                != clipboard::get_client_conn_id(&crate::flutter::get_cur_peer_id()).unwrap_or(0)
-            {
-                return;
-            }
-        }
-
         let Some(clip) = crate::clipboard_file::msg_2_clip(clip) else {
             log::warn!("failed to decode cliprdr msg from server peer");
             return;
         };
+
+        #[cfg(feature = "flutter")]
+        let is_format_list = matches!(&clip, clipboard::ClipboardFile::FormatList { .. });
+
+        #[cfg(feature = "flutter")]
+        {
+            let relay_msg = crate::clipboard_file::clip_2_msg(clip.clone());
+            if crate::flutter::relay_file_clipboard_msg_from_peer(
+                &self.handler.get_id(),
+                relay_msg,
+                is_format_list,
+                matches!(&clip, clipboard::ClipboardFile::TryEmpty),
+            ) {
+                return;
+            }
+        }
+
+        #[cfg(feature = "flutter")]
+        if is_format_list
+            && self.client_conn_id
+                != clipboard::get_client_conn_id(&crate::flutter::get_cur_peer_id()).unwrap_or(0)
+        {
+            return;
+        }
 
         let is_stopping_allowed = clip.is_beginning_message();
         let file_transfer_enabled = self.handler.is_file_clipboard_required();
@@ -2328,6 +2400,9 @@ impl<T: InvokeUiSession> Remote<T> {
             discard_queue: discard_queue.clone(),
         };
         let handler = self.handler.ui_handler.clone();
+        let session = self.handler.clone();
+        let mut black_frame_count = 0usize;
+        let mut last_black_refresh_instant: Option<Instant> = None;
         crate::client::start_video_thread(
             self.handler.clone(),
             display,
@@ -2341,6 +2416,20 @@ impl<T: InvokeUiSession> Remote<T> {
                   _texture: *mut c_void,
                   pixelbuffer: bool| {
                 *frame_count.write().unwrap() += 1;
+                if is_probably_black_frame(data) {
+                    black_frame_count += 1;
+                    if black_frame_count >= 12
+                        && last_black_refresh_instant
+                            .map(|t| t.elapsed().as_secs() >= 5)
+                            .unwrap_or(true)
+                    {
+                        session.refresh_video(display as _);
+                        last_black_refresh_instant = Some(Instant::now());
+                        log::info!("Refresh display {} after consecutive black frames", display);
+                    }
+                } else {
+                    black_frame_count = 0;
+                }
                 if pixelbuffer {
                     handler.on_rgba(display, data);
                 } else {
@@ -2383,6 +2472,38 @@ impl<T: InvokeUiSession> Remote<T> {
         msg.set_misc(misc);
         self.sender.send(Data::Message(msg)).ok();
     }
+}
+
+fn is_probably_black_frame(rgba: &scrap::ImageRgb) -> bool {
+    const MAX_BRIGHTNESS: u8 = 8;
+    const SAMPLE_LIMIT: usize = 2048;
+    const BLACK_RATIO_PERCENT: usize = 98;
+
+    if rgba.raw.len() < 4 || rgba.w == 0 || rgba.h == 0 {
+        return false;
+    }
+
+    let pixels = rgba.raw.len() / 4;
+    if pixels == 0 {
+        return false;
+    }
+
+    let step = std::cmp::max(1, pixels / SAMPLE_LIMIT);
+    let mut sampled = 0usize;
+    let mut black = 0usize;
+
+    for px in rgba.raw.chunks_exact(4).step_by(step) {
+        let brightness = match rgba.fmt {
+            scrap::ImageFormat::ARGB | scrap::ImageFormat::ABGR => px[1].max(px[2]).max(px[3]),
+            scrap::ImageFormat::Raw => px[0].max(px[1]).max(px[2]),
+        };
+        sampled += 1;
+        if brightness <= MAX_BRIGHTNESS {
+            black += 1;
+        }
+    }
+
+    sampled > 0 && black * 100 / sampled >= BLACK_RATIO_PERCENT
 }
 
 struct RemoveJob {

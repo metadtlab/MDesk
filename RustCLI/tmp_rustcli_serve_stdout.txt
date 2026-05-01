@@ -1,0 +1,3 @@
+starting rustcli host server
+version=1.4.35
+id=5270854

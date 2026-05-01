@@ -8,7 +8,7 @@ class DeviceRegisterResponse {
   final String message;
   final String? error;
   final DeviceData? data;
-  final int? statusCode;  // HTTP 상태 코드
+  final int? statusCode; // HTTP 상태 코드
 
   DeviceRegisterResponse({
     required this.success,
@@ -17,7 +17,7 @@ class DeviceRegisterResponse {
     this.data,
     this.statusCode,
   });
-  
+
   /// 401 Unauthorized 응답인지 확인
   bool get isUnauthorized => statusCode == 401 || error == 'UNAUTHORIZED';
 
@@ -43,12 +43,14 @@ class DeviceData {
   final int deviceId;
   final String remoteId;
   final String alias;
+  final String memo;
   final String registeredAt;
 
   DeviceData({
     required this.deviceId,
     required this.remoteId,
     required this.alias,
+    required this.memo,
     required this.registeredAt,
   });
 
@@ -57,6 +59,7 @@ class DeviceData {
       deviceId: json['device_id'] ?? 0,
       remoteId: json['remote_id'] ?? '',
       alias: json['alias'] ?? '',
+      memo: json['memo'] ?? '',
       registeredAt: json['registered_at'] ?? '',
     );
   }
@@ -65,6 +68,7 @@ class DeviceData {
         'device_id': deviceId,
         'remote_id': remoteId,
         'alias': alias,
+        'memo': memo,
         'registered_at': registeredAt,
       };
 }
@@ -74,6 +78,7 @@ class RegisteredDevice {
   final int deviceId;
   final String remoteId;
   final String alias;
+  final String memo;
   final String hostname;
   final String platform;
   final bool isOnline;
@@ -84,6 +89,7 @@ class RegisteredDevice {
     required this.deviceId,
     required this.remoteId,
     required this.alias,
+    required this.memo,
     required this.hostname,
     required this.platform,
     required this.isOnline,
@@ -96,6 +102,7 @@ class RegisteredDevice {
       deviceId: json['device_id'] ?? 0,
       remoteId: json['remote_id'] ?? '',
       alias: json['alias'] ?? '',
+      memo: json['memo'] ?? '',
       hostname: json['hostname'] ?? '',
       platform: json['platform'] ?? '',
       // API 응답에서 is_active 또는 is_online 필드 지원
@@ -109,6 +116,7 @@ class RegisteredDevice {
         'device_id': deviceId,
         'remote_id': remoteId,
         'alias': alias,
+        'memo': memo,
         'hostname': hostname,
         'platform': platform,
         'is_online': isOnline,
@@ -123,7 +131,7 @@ class DeviceListResponse {
   final String message;
   final String? error;
   final List<RegisteredDevice> data;
-  final int? statusCode;  // HTTP 상태 코드
+  final int? statusCode; // HTTP 상태 코드
 
   DeviceListResponse({
     required this.success,
@@ -132,7 +140,7 @@ class DeviceListResponse {
     required this.data,
     this.statusCode,
   });
-  
+
   /// 401 Unauthorized 응답인지 확인
   bool get isUnauthorized => statusCode == 401 || error == 'UNAUTHORIZED';
 
@@ -153,7 +161,7 @@ class DeviceListResponse {
 }
 
 /// 기기 등록 서비스
-/// 
+///
 /// HTTP를 통해 API 서버와 통신하여 기기 등록/해제/조회를 수행합니다.
 class DeviceRegisterService {
   static DeviceRegisterService? _instance;
@@ -165,7 +173,7 @@ class DeviceRegisterService {
   }
 
   /// 원격 기기를 API 서버에 등록
-  /// 
+  ///
   /// HTTP를 통해 기기 등록 요청을 보냅니다.
   /// [apiServer] - API 서버 주소
   /// [accessToken] - 인증 토큰
@@ -186,10 +194,11 @@ class DeviceRegisterService {
     String? platform,
   }) async {
     try {
-      debugPrint('DeviceRegisterService: Registering device - remoteId=$remoteId, alias=$alias');
-      
+      debugPrint(
+          'DeviceRegisterService: Registering device - remoteId=$remoteId, alias=$alias');
+
       final url = Uri.parse('$apiServer/api/device/register');
-      
+
       final body = jsonEncode({
         'user_id': userId,
         'user_pkid': userPkid,
@@ -208,7 +217,8 @@ class DeviceRegisterService {
         body: body,
       );
 
-      debugPrint('DeviceRegisterService: Register response - ${response.statusCode}');
+      debugPrint(
+          'DeviceRegisterService: Register response - ${response.statusCode}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -242,10 +252,10 @@ class DeviceRegisterService {
   }
 
   /// 피원격지 기기 등록 (로그인 불필요)
-  /// 
+  ///
   /// verify_remote_user 성공 후 바로 호출 가능.
   /// 인증 토큰 없이 기기를 원격 사용자에게 등록합니다.
-  /// 
+  ///
   /// [apiServer] - API 서버 URL
   /// [userId] - 원격 사용자 ID (verify_remote_user로 검증된 사용자)
   /// [remoteId] - 원격 ID (peer ID, 이 기기의 ID)
@@ -261,15 +271,16 @@ class DeviceRegisterService {
     String? platform,
   }) async {
     try {
-      debugPrint('DeviceRegisterService: Registering device (simple) - remoteId=$remoteId, alias=$alias, userId=$userId');
-      
+      debugPrint(
+          'DeviceRegisterService: Registering device (simple) - remoteId=$remoteId, alias=$alias, userId=$userId');
+
       // HTTP → HTTPS 강제 변환 (리다이렉트 시 POST→GET 변환 방지)
       var server = apiServer;
       if (server.startsWith('http://')) {
         server = server.replaceFirst('http://', 'https://');
       }
       final url = Uri.parse('$server/api/device/register');
-      
+
       final body = jsonEncode({
         'user_id': userId,
         'remote_id': remoteId,
@@ -288,7 +299,8 @@ class DeviceRegisterService {
         body: body,
       );
 
-      debugPrint('DeviceRegisterService: Register response - ${response.statusCode}, body=${response.body}');
+      debugPrint(
+          'DeviceRegisterService: Register response - ${response.statusCode}, body=${response.body}');
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final Map<String, dynamic> result = jsonDecode(response.body);
@@ -302,7 +314,8 @@ class DeviceRegisterService {
         );
       }
     } catch (e) {
-      debugPrint('DeviceRegisterService: Error registering device (simple) - $e');
+      debugPrint(
+          'DeviceRegisterService: Error registering device (simple) - $e');
       return DeviceRegisterResponse(
         success: false,
         message: 'Failed to register device: $e',
@@ -312,7 +325,7 @@ class DeviceRegisterService {
   }
 
   /// 기기 등록 해제
-  /// 
+  ///
   /// HTTP를 통해 기기 등록 해제 요청을 보냅니다.
   Future<DeviceRegisterResponse> unregisterDevice({
     required String apiServer,
@@ -321,10 +334,11 @@ class DeviceRegisterService {
     required String remoteId,
   }) async {
     try {
-      debugPrint('DeviceRegisterService: Unregistering device - remoteId=$remoteId');
-      
+      debugPrint(
+          'DeviceRegisterService: Unregistering device - remoteId=$remoteId');
+
       final url = Uri.parse('$apiServer/api/device/unregister');
-      
+
       final body = jsonEncode({
         'user_pkid': userPkid,
         'remote_id': remoteId,
@@ -339,7 +353,8 @@ class DeviceRegisterService {
         body: body,
       );
 
-      debugPrint('DeviceRegisterService: Unregister response - ${response.statusCode}');
+      debugPrint(
+          'DeviceRegisterService: Unregister response - ${response.statusCode}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -373,7 +388,7 @@ class DeviceRegisterService {
   }
 
   /// 기기 등록 해제 (간단 버전 - 로그인 불필요)
-  /// 
+  ///
   /// 나의 관리장치에서 기기 삭제 시 사용
   /// user_id와 remote_id만으로 삭제 요청
   Future<DeviceRegisterResponse> unregisterDeviceSimple({
@@ -382,16 +397,17 @@ class DeviceRegisterService {
     required String remoteId,
   }) async {
     try {
-      debugPrint('DeviceRegisterService: Unregistering device (simple) - userId=$userId, remoteId=$remoteId');
-      
+      debugPrint(
+          'DeviceRegisterService: Unregistering device (simple) - userId=$userId, remoteId=$remoteId');
+
       // HTTP → HTTPS 강제 변환
       var server = apiServer;
       if (server.startsWith('http://')) {
         server = server.replaceFirst('http://', 'https://');
       }
-      
+
       final url = Uri.parse('$server/api/device/unregister');
-      
+
       final body = jsonEncode({
         'user_id': userId,
         'remote_id': remoteId,
@@ -407,7 +423,8 @@ class DeviceRegisterService {
         body: body,
       );
 
-      debugPrint('DeviceRegisterService: Unregister response - ${response.statusCode}, body=${response.body}');
+      debugPrint(
+          'DeviceRegisterService: Unregister response - ${response.statusCode}, body=${response.body}');
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final Map<String, dynamic> result = jsonDecode(response.body);
@@ -421,7 +438,8 @@ class DeviceRegisterService {
         );
       }
     } catch (e) {
-      debugPrint('DeviceRegisterService: Error unregistering device (simple) - $e');
+      debugPrint(
+          'DeviceRegisterService: Error unregistering device (simple) - $e');
       return DeviceRegisterResponse(
         success: false,
         message: 'Failed to unregister device: $e',
@@ -430,8 +448,70 @@ class DeviceRegisterService {
     }
   }
 
+  /// 등록된 기기의 메모를 서버에 저장
+  Future<DeviceRegisterResponse> updateDeviceMemo({
+    required String apiServer,
+    required String accessToken,
+    required String userPkid,
+    required String userId,
+    required String remoteId,
+    required String memo,
+  }) async {
+    try {
+      debugPrint('DeviceRegisterService: Updating memo - remoteId=$remoteId');
+
+      final url = Uri.parse('$apiServer/api/device/memo');
+      final body = jsonEncode({
+        'user_pkid': userPkid,
+        'user_id': userId,
+        'remote_id': remoteId,
+        'memo': memo,
+      });
+
+      final response = await http.post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $accessToken',
+        },
+        body: body,
+      );
+
+      debugPrint(
+          'DeviceRegisterService: Update memo response - ${response.statusCode}');
+
+      if (response.statusCode == 401) {
+        return DeviceRegisterResponse(
+          success: false,
+          message: '인증이 만료되었습니다. 다시 로그인해주세요.',
+          error: 'UNAUTHORIZED',
+          statusCode: 401,
+        );
+      }
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final Map<String, dynamic> result = jsonDecode(response.body);
+        return DeviceRegisterResponse.fromJson(result);
+      }
+
+      return DeviceRegisterResponse(
+        success: false,
+        message: 'HTTP Error: ${response.statusCode}',
+        error: 'HTTP_ERROR',
+        statusCode: response.statusCode,
+      );
+    } catch (e) {
+      debugPrint('DeviceRegisterService: Error updating memo - $e');
+      return DeviceRegisterResponse(
+        success: false,
+        message: 'Failed to update memo: $e',
+        error: 'HTTP_ERROR',
+      );
+    }
+  }
+
   /// 등록된 기기 목록 조회
-  /// 
+  ///
   /// HTTP를 통해 등록된 기기 목록을 조회합니다.
   Future<DeviceListResponse> getRegisteredDevices({
     required String apiServer,
@@ -439,11 +519,13 @@ class DeviceRegisterService {
     required String userPkid,
   }) async {
     try {
-      debugPrint('========== DeviceRegisterService: getRegisteredDevices ==========');
+      debugPrint(
+          '========== DeviceRegisterService: getRegisteredDevices ==========');
       debugPrint('  apiServer: $apiServer');
       debugPrint('  userPkid: $userPkid');
-      debugPrint('  accessToken: ${accessToken.isNotEmpty ? "${accessToken.substring(0, 20)}..." : "EMPTY"}');
-      
+      debugPrint(
+          '  accessToken: ${accessToken.isNotEmpty ? "${accessToken.substring(0, 20)}..." : "EMPTY"}');
+
       final url = Uri.parse('$apiServer/api/device/list?user_pkid=$userPkid');
       debugPrint('  Request URL: $url');
 
@@ -475,13 +557,14 @@ class DeviceRegisterService {
         debugPrint('  Parsed JSON keys: ${result.keys.toList()}');
         debugPrint('  success: ${result['success']}');
         debugPrint('  message: ${result['message']}');
-        
+
         final dataList = result['data'];
         if (dataList is List) {
           debugPrint('  data count: ${dataList.length}');
           for (int i = 0; i < dataList.length && i < 5; i++) {
             final device = dataList[i];
-            debugPrint('  Device[$i]: remote_id=${device['remote_id']}, alias=${device['alias']}, hostname=${device['hostname']}, is_online=${device['is_online']}');
+            debugPrint(
+                '  Device[$i]: remote_id=${device['remote_id']}, alias=${device['alias']}, hostname=${device['hostname']}, is_online=${device['is_online']}');
           }
           if (dataList.length > 5) {
             debugPrint('  ... and ${dataList.length - 5} more devices');
@@ -489,14 +572,17 @@ class DeviceRegisterService {
         } else {
           debugPrint('  data is not a List: ${dataList.runtimeType}');
         }
-        
+
         final deviceListResponse = DeviceListResponse.fromJson(result);
-        debugPrint('  ✅ Parsed ${deviceListResponse.data.length} devices successfully');
-        debugPrint('=================================================================');
+        debugPrint(
+            '  ✅ Parsed ${deviceListResponse.data.length} devices successfully');
+        debugPrint(
+            '=================================================================');
         return deviceListResponse;
       } else {
         debugPrint('  ❌ HTTP Error: ${response.statusCode}');
-        debugPrint('=================================================================');
+        debugPrint(
+            '=================================================================');
         return DeviceListResponse(
           success: false,
           message: 'HTTP Error: ${response.statusCode}',
@@ -508,7 +594,8 @@ class DeviceRegisterService {
     } catch (e, stackTrace) {
       debugPrint('  ❌ Exception: $e');
       debugPrint('  StackTrace: $stackTrace');
-      debugPrint('=================================================================');
+      debugPrint(
+          '=================================================================');
       return DeviceListResponse(
         success: false,
         message: 'Failed to get registered devices: $e',
@@ -521,18 +608,20 @@ class DeviceRegisterService {
 
 /// 최근 세션 모델
 class RecentSession {
-  final String peerId;      // 대상 ID
-  final String alias;       // 대상 별칭
-  final String hostname;    // 대상 호스트명
-  final String connStart;   // 연결 시작 시간
-  final String connEnd;     // 연결 종료 시간
-  final String duration;    // 연결 시간
-  final String sessionId;   // 세션 ID
+  final String peerId; // 대상 ID
+  final String alias; // 대상 별칭
+  final String hostname; // 대상 호스트명
+  final String memo; // 대상 메모
+  final String connStart; // 연결 시작 시간
+  final String connEnd; // 연결 종료 시간
+  final String duration; // 연결 시간
+  final String sessionId; // 세션 ID
 
   RecentSession({
     required this.peerId,
     required this.alias,
     required this.hostname,
+    required this.memo,
     required this.connStart,
     required this.connEnd,
     required this.duration,
@@ -544,13 +633,14 @@ class RecentSession {
       peerId: json['id']?.toString() ?? '',
       alias: json['alias']?.toString() ?? '',
       hostname: json['hostname']?.toString() ?? '',
+      memo: json['memo']?.toString() ?? '',
       connStart: json['conn_start'] ?? '',
       connEnd: json['conn_end'] ?? '',
       duration: json['duration'] ?? '',
       sessionId: json['session_id']?.toString() ?? '',
     );
   }
-  
+
   /// 표시 이름 (alias > hostname > id 순)
   String get displayName {
     if (alias.isNotEmpty) return alias;
@@ -580,9 +670,10 @@ class RecentSessionResponse {
 
 /// 최근 세션 서비스
 class RecentSessionService {
-  static final RecentSessionService _instance = RecentSessionService._internal();
+  static final RecentSessionService _instance =
+      RecentSessionService._internal();
   static RecentSessionService get instance => _instance;
-  
+
   RecentSessionService._internal();
 
   /// 최근 세션 목록 조회
@@ -598,14 +689,15 @@ class RecentSessionService {
       if (baseUrl.startsWith('http://')) {
         baseUrl = baseUrl.replaceFirst('http://', 'https://');
       }
-      
+
       final url = '$baseUrl/api/sessions/recent?user_id=$userId&limit=$limit';
-      
-      debugPrint('========== RecentSessionService: getRecentSessions ==========');
+
+      debugPrint(
+          '========== RecentSessionService: getRecentSessions ==========');
       debugPrint('  Request URL: $url');
       debugPrint('  userId: $userId');
       debugPrint('  limit: $limit');
-      
+
       final response = await http.get(
         Uri.parse(url),
         headers: {
@@ -613,9 +705,9 @@ class RecentSessionService {
           'Content-Type': 'application/json',
         },
       );
-      
+
       debugPrint('  Response Status: ${response.statusCode}');
-      
+
       if (response.statusCode == 401) {
         debugPrint('  ❌ 401 Unauthorized');
         return RecentSessionResponse(
@@ -626,20 +718,22 @@ class RecentSessionService {
           statusCode: 401,
         );
       }
-      
+
       if (response.statusCode == 200) {
         final json = jsonDecode(response.body);
         debugPrint('  Response Body: ${response.body}');
-        
+
         final code = json['code'] ?? 0;
         final count = json['count'] ?? 0;
         final dataList = json['data'] as List<dynamic>? ?? [];
-        
-        final sessions = dataList.map((item) => RecentSession.fromJson(item)).toList();
-        
+
+        final sessions =
+            dataList.map((item) => RecentSession.fromJson(item)).toList();
+
         debugPrint('  ✅ Parsed $count sessions successfully');
-        debugPrint('=================================================================');
-        
+        debugPrint(
+            '=================================================================');
+
         return RecentSessionResponse(
           success: code == 1,
           count: count,
@@ -658,7 +752,8 @@ class RecentSessionService {
       }
     } catch (e) {
       debugPrint('  ❌ Exception: $e');
-      debugPrint('=================================================================');
+      debugPrint(
+          '=================================================================');
       return RecentSessionResponse(
         success: false,
         count: 0,

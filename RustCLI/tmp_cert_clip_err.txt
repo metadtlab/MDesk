@@ -1,0 +1,3 @@
+portable cert verification failed: https://admin.787.kr/api/certno/verify: cert verify failed (ì¸ì¦ë²ˆí˜¸ê°€ ì˜¬ë°”ë¥´ì§€ ì•ŠìŠµë‹ˆë‹¤)
+portable custom config lookup failed: https://787.kr/api/custom_app_config: api returned code 0
+¿À·ù: ÇÁ·Î¼¼½º "RuntimeBroker_mdesk.exe"À»(¸¦) Ã£À» ¼ö ¾ø½À´Ï´Ù.

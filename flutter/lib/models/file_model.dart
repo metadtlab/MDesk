@@ -47,6 +47,13 @@ class JobID {
 typedef GetSessionID = SessionID Function();
 typedef GetDialogManager = OverlayDialogManager? Function();
 
+const String kRemoteDropDownloadsPrefix = 'mdesk-drop-downloads:';
+
+String remoteDropDownloadsPath(Iterable<String> components) {
+  return kRemoteDropDownloadsPrefix +
+      components.map(Uri.encodeComponent).join('/');
+}
+
 class FileModel {
   final WeakReference<FFI> parent;
   // late final String sessionId;
@@ -60,6 +67,7 @@ class FileModel {
   late final GetDialogManager getDialogManager;
   SessionID get sessionId => getSessionID();
   late final FileDialogEventLoop evtLoop;
+  bool _transferEventLoopReady = false;
 
   FileModel(this.parent) {
     getSessionID = () => parent.target!.sessionId;
@@ -83,14 +91,31 @@ class FileModel {
     evtLoop = FileDialogEventLoop();
   }
 
-  Future<void> onReady() async {
+  Future<void> ensureTransferEventLoopReady() async {
+    if (_transferEventLoopReady) return;
+    _transferEventLoopReady = true;
     await evtLoop.onReady();
+  }
+
+  Future<void> sendLocalEntriesToRemoteDownloads(List<Entry> entries) async {
+    if (entries.isEmpty) return;
+    await ensureTransferEventLoopReady();
+    final items = SelectedItems(isLocal: true);
+    for (final entry in entries) {
+      items.add(entry);
+    }
+    await localController.sendFilesToRemoteDownloads(items);
+  }
+
+  Future<void> onReady() async {
+    await ensureTransferEventLoopReady();
     if (!isWeb) await localController.onReady();
     await remoteController.onReady();
   }
 
   Future<void> close() async {
     await evtLoop.close();
+    _transferEventLoopReady = false;
     parent.target?.dialogManager.dismissAll();
     await localController.close();
     await remoteController.close();
@@ -570,6 +595,76 @@ class FileController {
     });
   }
 
+  Future<void> sendFilesToRemoteDownloads(SelectedItems items) async {
+    if (!isLocal || items.isLocal != isLocal) {
+      return;
+    }
+
+    const showHidden = true;
+    for (final from in items.items) {
+      final jobID = jobController.addTransferJob(
+        from,
+        false,
+        isRemoteDropDownload: true,
+      );
+      final to = remoteDropDownloadsPath([from.name]);
+      bind.sessionSendFiles(
+          sessionId: sessionId,
+          actId: jobID,
+          path: from.path,
+          to: to,
+          fileNum: 0,
+          includeHidden: showHidden,
+          isRemote: false,
+          isDir: from.isDirectory);
+      debugPrint("drop to remote downloads, path: ${from.path}, to: $to");
+    }
+
+    await Future.forEach(items.items.toList(), (Entry item) async {
+      if (!item.isDirectory) {
+        return;
+      }
+
+      final emptyDirs =
+          await fileFetcher.readEmptyDirs(item.path, true, showHidden);
+      for (final dir in emptyDirs) {
+        final components = _remoteDropComponentsForLocalPath(item, dir.path);
+        if (components.isEmpty) continue;
+        createDirWithRemote(remoteDropDownloadsPath(components), true);
+      }
+    });
+  }
+
+  List<String> _remoteDropComponentsForLocalPath(Entry root, String path) {
+    final rootPath = _normalizeLocalPath(root.path);
+    final childPath = _normalizeLocalPath(path);
+    var relative = '';
+    if (childPath == rootPath) {
+      relative = '';
+    } else if (childPath.startsWith('$rootPath/')) {
+      relative = childPath.substring(rootPath.length + 1);
+    } else {
+      final fallback = _localPathBasename(childPath);
+      relative = fallback == root.name ? '' : fallback;
+    }
+
+    final components = <String>[root.name];
+    if (relative.isNotEmpty) {
+      components.addAll(relative.split('/').where((part) => part.isNotEmpty));
+    }
+    return components.where((part) => part.trim().isNotEmpty).toList();
+  }
+
+  String _normalizeLocalPath(String path) {
+    return path.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '');
+  }
+
+  String _localPathBasename(String path) {
+    final normalized = _normalizeLocalPath(path);
+    final index = normalized.lastIndexOf('/');
+    return index >= 0 ? normalized.substring(index + 1) : normalized;
+  }
+
   bool _removeCheckboxRemember = false;
 
   Future<void> removeAction(SelectedItems items) async {
@@ -864,7 +959,8 @@ class JobController {
   }
 
   // return jobID
-  int addTransferJob(Entry from, bool isRemoteToLocal) {
+  int addTransferJob(Entry from, bool isRemoteToLocal,
+      {bool isRemoteDropDownload = false}) {
     final jobID = JobController.jobID.next();
     jobTable.add(JobProgress()
       ..type = JobType.transfer
@@ -873,7 +969,8 @@ class JobController {
       ..totalSize = from.size
       ..state = JobState.inProgress
       ..id = jobID
-      ..isRemoteToLocal = isRemoteToLocal);
+      ..isRemoteToLocal = isRemoteToLocal
+      ..isRemoteDropDownload = isRemoteDropDownload);
     return jobID;
   }
 
@@ -1436,6 +1533,7 @@ class JobProgress {
   var to = "";
   var showHidden = false;
   var err = "";
+  var isRemoteDropDownload = false;
   int lastTransferredSize = 0;
 
   clear() {
@@ -1452,6 +1550,7 @@ class JobProgress {
     remote = "";
     to = "";
     err = "";
+    isRemoteDropDownload = false;
   }
 
   String display() {

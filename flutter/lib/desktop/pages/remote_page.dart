@@ -1,9 +1,10 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/scheduler.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -15,6 +16,7 @@ import '../../common/widgets/remote_input.dart';
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/toolbar.dart';
+import '../../models/file_model.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
@@ -86,11 +88,12 @@ class _RemotePageState extends State<RemotePage>
   late RxBool _zoomCursor;
   late RxBool _remoteCursorMoved;
   late RxBool _keyboardEnabled;
+  final _dropToDownloadsVisible = false.obs;
 
   var _blockableOverlayState = BlockableOverlayState();
 
   final FocusNode _rawKeyFocusNode = FocusNode(debugLabel: "rawkeyFocusNode");
-  
+
   // 화이트보드 컨트롤러
   final WhiteboardController _whiteboardController = WhiteboardController();
 
@@ -128,7 +131,7 @@ class _RemotePageState extends State<RemotePage>
           _ffi.ffiModel.pi.platform, _ffi.dialogManager);
       _ffi.recordingModel
           .updateStatus(bind.sessionGetIsRecording(sessionId: _ffi.sessionId));
-      
+
       // 화이트보드 컨트롤러에 원격 화면 해상도 설정
       _updateWhiteboardRemoteDisplaySize();
     });
@@ -253,16 +256,16 @@ class _RemotePageState extends State<RemotePage>
       stateGlobal.setFullscreen(false);
     }
   }
-  
+
   /// 화이트보드 컨트롤러에 원격 화면 해상도 설정
   void _updateWhiteboardRemoteDisplaySize() {
     try {
-      final displays = _ffi.ffiModel.pi.getCurDisplays();
-      if (displays.isNotEmpty) {
-        final display = displays[0];
+      final width = _ffi.canvasModel.getDisplayWidth().toDouble();
+      final height = _ffi.canvasModel.getDisplayHeight().toDouble();
+      if (width > 0 && height > 0) {
         _whiteboardController.setRemoteDisplaySize(
-          display.width.toDouble(),
-          display.height.toDouble(),
+          width,
+          height,
         );
       }
     } catch (e) {
@@ -394,7 +397,7 @@ class _RemotePageState extends State<RemotePage>
 
     return Scaffold(
       backgroundColor: Theme.of(context).colorScheme.background,
-      body: Obx(() {
+      body: _buildRemoteDropTarget(Obx(() {
         final imageReady = _ffi.ffiModel.pi.isSet.isTrue &&
             _ffi.ffiModel.waitForFirstImage.isFalse;
         if (imageReady) {
@@ -419,8 +422,383 @@ class _RemotePageState extends State<RemotePage>
           // The toolbar's block state won't work properly when reconnecting, but that's okay.
           return bodyWidget();
         }
-      }),
+      })),
     );
+  }
+
+  Widget _buildRemoteDropTarget(Widget child) {
+    if (isWeb) {
+      return child;
+    }
+    return DropTarget(
+      onDragEntered: (_) {
+        if (!_isActiveRemoteDropTarget()) return;
+        _dropToDownloadsVisible.value = true;
+      },
+      onDragExited: (_) {
+        if (!_isActiveRemoteDropTarget()) return;
+        _dropToDownloadsVisible.value = false;
+      },
+      onDragDone: (details) {
+        if (!_isActiveRemoteDropTarget()) return;
+        _dropToDownloadsVisible.value = false;
+        _handleRemoteFileDrop(details);
+      },
+      child: Stack(
+        children: [
+          child,
+          Obx(() => _buildRemoteDropProgressPanel()),
+          Obx(() => _dropToDownloadsVisible.isTrue
+              ? _buildRemoteDropOverlay()
+              : const Offstage()),
+        ],
+      ),
+    );
+  }
+
+  bool _isActiveRemoteDropTarget() {
+    final controller = widget.tabController;
+    if (controller == null) {
+      return true;
+    }
+    final state = controller.state.value;
+    if (state.tabs.isEmpty ||
+        state.selected < 0 ||
+        state.selected >= state.tabs.length) {
+      return false;
+    }
+    return state.selectedTabInfo.key == widget.id;
+  }
+
+  Widget _buildRemoteDropOverlay() {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Container(
+          color: Colors.black.withValues(alpha: 0.20),
+          alignment: Alignment.center,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            decoration: BoxDecoration(
+              color:
+                  Theme.of(context).colorScheme.surface.withValues(alpha: 0.92),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Theme.of(context).colorScheme.primary),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.file_download_outlined,
+                    color: Theme.of(context).colorScheme.primary),
+                const SizedBox(width: 10),
+                Text(
+                  '다운로드 폴더로 복사',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurface,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRemoteDropProgressPanel() {
+    final jobs = _ffi.fileModel.jobController.jobTable
+        .where(
+            (job) => job.isRemoteDropDownload && job.type == JobType.transfer)
+        .where((job) => job.state != JobState.done)
+        .toList()
+        .reversed
+        .toList();
+    if (jobs.isEmpty) {
+      return const Offstage();
+    }
+
+    final visibleJobs = jobs.take(3).toList();
+    return Positioned(
+      right: 16,
+      bottom: 16,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color:
+                  Theme.of(context).colorScheme.surface.withValues(alpha: 0.94),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: Theme.of(context)
+                    .colorScheme
+                    .outline
+                    .withValues(alpha: 0.35),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.18),
+                  blurRadius: 16,
+                  offset: const Offset(0, 8),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.file_upload_outlined,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '\ud53c\uc6d0\uaca9\uc790 \ub2e4\uc6b4\ub85c\ub4dc \ud3f4\ub354\ub85c \ubcf5\uc0ac \uc911',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurface,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                for (final job in visibleJobs)
+                  _buildRemoteDropProgressItem(job),
+                if (jobs.length > visibleJobs.length)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      '+${jobs.length - visibleJobs.length} more',
+                      style: TextStyle(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: 0.65),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRemoteDropProgressItem(JobProgress job) {
+    final progress = _remoteDropProgressValue(job);
+    final progressText = progress == null
+        ? null
+        : '${(progress * 100).clamp(0, 100).toStringAsFixed(0)}%';
+    final title = job.fileName.isNotEmpty
+        ? job.fileName
+        : _localPathBasename(job.jobName);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Tooltip(
+                  message: title,
+                  waitDuration: const Duration(milliseconds: 500),
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurface,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              if (progressText != null)
+                Text(
+                  progressText,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.primary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              const SizedBox(width: 4),
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: IconButton(
+                  tooltip: translate('Cancel'),
+                  padding: EdgeInsets.zero,
+                  iconSize: 16,
+                  onPressed: () => _dismissRemoteDropJob(job),
+                  icon: Icon(
+                    Icons.close,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurface
+                        .withValues(alpha: 0.70),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 7,
+              backgroundColor: Theme.of(context)
+                  .colorScheme
+                  .onSurface
+                  .withValues(alpha: 0.12),
+              valueColor: AlwaysStoppedAnimation<Color>(
+                Theme.of(context).colorScheme.primary,
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _remoteDropProgressStatus(job),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Theme.of(context)
+                  .colorScheme
+                  .onSurface
+                  .withValues(alpha: 0.72),
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  double? _remoteDropProgressValue(JobProgress job) {
+    if (job.totalSize <= 0) return null;
+    return (job.finishedSize / job.totalSize).clamp(0.0, 1.0).toDouble();
+  }
+
+  String _remoteDropProgressStatus(JobProgress job) {
+    if (job.state == JobState.error) {
+      return job.err.isNotEmpty ? job.err : translate('Error');
+    }
+    if (job.state == JobState.paused) {
+      return translate('Waiting');
+    }
+
+    final parts = <String>[];
+    if (job.totalSize > 0) {
+      final finishedSize =
+          job.finishedSize > job.totalSize ? job.totalSize : job.finishedSize;
+      parts.add(
+        '${readableFileSize(finishedSize.toDouble())} / ${readableFileSize(job.totalSize.toDouble())}',
+      );
+    }
+    if (job.speed > 0 && job.state == JobState.inProgress) {
+      parts.add('${readableFileSize(job.speed)}/s');
+    }
+    if (job.fileCount > 1) {
+      var handledFileCount = job.recvJobRes ? job.fileNum + 1 : job.fileNum;
+      if (handledFileCount > job.fileCount) handledFileCount = job.fileCount;
+      parts.add('$handledFileCount/${job.fileCount} files');
+    }
+    return parts.isEmpty
+        ? '\ubcf5\uc0ac \uc900\ube44 \uc911'
+        : parts.join('  ');
+  }
+
+  void _dismissRemoteDropJob(JobProgress job) {
+    final jobController = _ffi.fileModel.jobController;
+    if (job.state == JobState.none ||
+        job.state == JobState.inProgress ||
+        job.state == JobState.paused) {
+      unawaited(jobController.cancelJob(job.id));
+    }
+    final index = jobController.getJob(job.id);
+    if (index >= 0) {
+      jobController.jobTable.removeAt(index);
+      jobController.jobTable.refresh();
+    }
+  }
+
+  Future<void> _handleRemoteFileDrop(DropDoneDetails details) async {
+    if (details.files.isEmpty) return;
+    if (_ffi.ffiModel.pi.isSet.isFalse) {
+      showToast(translate('Connecting...'));
+      return;
+    }
+    if (_ffi.ffiModel.permissions['file'] == false) {
+      showToast(translate('No permission of file transfer'));
+      return;
+    }
+
+    final entries = <Entry>[];
+    for (final file in details.files) {
+      final entry = _entryFromDroppedFile(file.path, file.name);
+      if (entry != null) {
+        entries.add(entry);
+      }
+    }
+    if (entries.isEmpty) return;
+
+    try {
+      await _ffi.fileModel.sendLocalEntriesToRemoteDownloads(entries);
+      showToast('피원격자 다운로드 폴더로 전송을 시작했습니다');
+    } catch (e) {
+      debugPrint('Failed to send dropped files to remote downloads: $e');
+      showToast(translate('Error'));
+    }
+  }
+
+  Entry? _entryFromDroppedFile(String filePath, String fileName) {
+    if (filePath.trim().isEmpty) return null;
+    final type = FileSystemEntity.typeSync(filePath);
+    if (type == FileSystemEntityType.notFound) return null;
+
+    final isDirectory = type == FileSystemEntityType.directory;
+    var size = 0;
+    if (!isDirectory) {
+      try {
+        size = File(filePath).lengthSync();
+      } catch (_) {
+        size = 0;
+      }
+    }
+
+    final name = fileName.trim().isNotEmpty
+        ? fileName.trim()
+        : _localPathBasename(filePath);
+    if (name.isEmpty) return null;
+
+    return Entry()
+      ..path = filePath
+      ..name = name
+      ..entryType = isDirectory ? 1 : 4
+      ..size = size;
+  }
+
+  String _localPathBasename(String filePath) {
+    final normalized = filePath.replaceAll('\\', '/');
+    final index = normalized.lastIndexOf('/');
+    return index >= 0 ? normalized.substring(index + 1) : normalized;
   }
 
   @override
@@ -569,7 +947,7 @@ class _RemotePageState extends State<RemotePage>
             QualityMonitor(_ffi.qualityMonitorModel), null, null),
       ),
     );
-    
+
     // 화이트보드 오버레이 추가
     paints.add(
       WhiteboardOverlay(
@@ -577,7 +955,7 @@ class _RemotePageState extends State<RemotePage>
         ffi: _ffi,
       ),
     );
-    
+
     return Stack(
       children: paints,
     );

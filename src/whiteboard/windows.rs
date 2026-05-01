@@ -151,10 +151,10 @@ pub(super) fn create_event_loop() -> ResultType<()> {
                     if stroke.points.len() < 2 {
                         continue;
                     }
-                    
+
                     let rgba = super::argb_to_rgba(stroke.argb);
                     let mut paint = Paint::default();
-                    
+
                     // 도구에 따른 알파값 조정
                     let alpha = if stroke.tool == 1 {
                         // highlighter: 반투명
@@ -162,36 +162,36 @@ pub(super) fn create_event_loop() -> ResultType<()> {
                     } else {
                         rgba.3
                     };
-                    
+
                     // Note: The real color is bgra here.
                     paint.set_color_rgba8(rgba.2, rgba.1, rgba.0, alpha);
                     paint.anti_alias = true;
-                    
+
                     let mut pb = PathBuilder::new();
                     let first = &stroke.points[0];
                     // 정규화된 좌표를 실제 좌표로 변환
                     let start_x = first.x * width.get() as f32;
                     let start_y = first.y * height.get() as f32;
                     pb.move_to(start_x, start_y);
-                    
+
                     for i in 1..stroke.points.len() {
                         let p = &stroke.points[i];
                         let px = p.x * width.get() as f32;
                         let py = p.y * height.get() as f32;
                         pb.line_to(px, py);
                     }
-                    
+
                     if let Some(path) = pb.finish() {
                         let mut stroke_style = Stroke::default();
                         stroke_style.width = stroke.stroke_width;
                         stroke_style.line_cap = tiny_skia::LineCap::Round;
                         stroke_style.line_join = tiny_skia::LineJoin::Round;
-                        
+
                         if stroke.tool == 2 {
                             // eraser: 지우기 (투명하게 그리기)
                             paint.blend_mode = tiny_skia::BlendMode::Clear;
                         }
-                        
+
                         pixmap.stroke_path(
                             &path,
                             &paint,

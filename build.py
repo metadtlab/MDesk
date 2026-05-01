@@ -23,6 +23,11 @@ elif osx:
 else:
     flutter_build_dir = 'build/linux/x64/release/bundle/'
 flutter_build_dir_2 = f'flutter/{flutter_build_dir}'
+# MSI/포터블 공통: 이 폴더 내용을 Flutter Release 출력에 합침 → 기본 설치 경로 Program Files\MDesk
+WINDOWS_INSTALL_EXTRA_DIR = os.path.join('res', 'windows_install_extra')
+# preprocess.py 는 res/msi 에서 실행되므로, 여기서 Flutter Release 로 가는 상대 경로
+FLUTTER_WINDOWS_RELEASE_FOR_MSI = '../../' + flutter_build_dir_2.replace(
+    '\\', '/').rstrip('/')
 skip_cargo = False
 
 
@@ -617,6 +622,41 @@ def restore_portable_cargo_toml(backup_path):
         print(f'Warning: Could not restore portable Cargo.toml: {e}')
 
 
+_SKIP_WINDOWS_INSTALL_EXTRA_FILES = frozenset({'.gitkeep', 'README.txt', 'readme.txt'})
+
+
+def copy_windows_install_extra_to_release():
+    """res/windows_install_extra → flutter/build/.../Release (하위 디렉터리 구조 유지)."""
+    src_root = WINDOWS_INSTALL_EXTRA_DIR
+    dst_root = flutter_build_dir_2
+    if not os.path.isdir(src_root):
+        return
+    if not os.path.isdir(dst_root):
+        print(
+            f'Warning: skip windows install extra copy, missing output dir {dst_root}'
+        )
+        return
+    copied = []
+    for root, _dirs, files in os.walk(src_root):
+        rel = os.path.relpath(root, src_root)
+        dst_dir = (
+            dst_root if rel in (os.curdir, '.') else os.path.join(dst_root, rel)
+        )
+        os.makedirs(dst_dir, exist_ok=True)
+        for name in files:
+            if name in _SKIP_WINDOWS_INSTALL_EXTRA_FILES:
+                continue
+            s = os.path.join(root, name)
+            d = os.path.join(dst_dir, name)
+            shutil.copy2(s, d)
+            copied.append(os.path.relpath(s, src_root))
+    if copied:
+        print(
+            f'Windows install extra ({len(copied)} file(s)) → {dst_root}: '
+            + ', '.join(copied)
+        )
+
+
 def build_flutter_arch_manjaro(version, features):
     if not skip_cargo:
         system2(f'cargo build --features {features} --lib --release')
@@ -628,17 +668,29 @@ def build_flutter_arch_manjaro(version, features):
     system2('HBB=`pwd`/.. FLUTTER=1 makepkg -f')
 
 
-def build_msi(version, dist_dir='rustdesk'):
-    """MSI 설치 파일 빌드 (MDesk로 설정)"""
+def build_msi(version, dist_dir=None):
+    """MSI 설치 파일 빌드 (MDesk로 설정).
+
+    dist_dir: preprocess.py 기준 입력 폴더(Flutter Release 전체). 기본은 flutter/build/.../Release.
+    예전 기본값 ../../rustdesk 는 빌드 산출물과 무관해 tools 등이 MSI 에 빠졌음.
+    """
     if not windows:
         print('MSI build is only supported on Windows')
         return
     
+    # MSI 입력에 res/windows_install_extra 내용을 항상 합쳐 둠 (예: tools/DeviceRemote.exe)
+    try:
+        copy_windows_install_extra_to_release()
+    except Exception as e:
+        print(f'Warning: copy_windows_install_extra failed: {e}')
+
     try:
         os.chdir('res/msi')
         # preprocess.py를 MDesk로 실행
         python_cmd = 'python' if windows else 'python3'
-        system2(f'{python_cmd} preprocess.py --arp --app-name MDesk -d ../../{dist_dir}')
+        if dist_dir is None:
+            dist_dir = FLUTTER_WINDOWS_RELEASE_FOR_MSI
+        system2(f'{python_cmd} preprocess.py --arp --app-name MDesk -d {dist_dir}')
         
         # MSBuild로 MSI 빌드 (MSBuild가 PATH에 있다고 가정)
         # 실제 빌드는 사용자가 별도로 수행해야 할 수 있음
@@ -671,7 +723,8 @@ def build_flutter_windows(version, features, skip_portable_pack):
             restore_runner_rc(rc_backup)
     shutil.copy2('target/release/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)
-    
+    copy_windows_install_extra_to_release()
+
     # Update executable metadata to MDesk (before code signing)
     exe_path_for_metadata = os.path.join(flutter_build_dir_2, 'MDesk.exe')
     if os.path.exists(exe_path_for_metadata):

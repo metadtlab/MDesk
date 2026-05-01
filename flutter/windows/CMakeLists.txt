@@ -109,6 +109,18 @@ set(RUSTDESK_LIB "../../target/${RUSTDESK_LIB_BUILD_TYPE}/librustdesk.dll")
 install(FILES "${RUSTDESK_LIB}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
 COMPONENT Runtime RENAME librustdesk.dll)
 
+# res/windows_install_extra/tools/*.exe → 설치 루트/tools (예: DeviceRemote.exe)
+set(WINDOWS_EXTRA_TOOLS "${CMAKE_CURRENT_SOURCE_DIR}/../../res/windows_install_extra/tools")
+if(EXISTS "${WINDOWS_EXTRA_TOOLS}")
+  message(STATUS "Install extra tools dir: ${WINDOWS_EXTRA_TOOLS}")
+  install(DIRECTORY "${WINDOWS_EXTRA_TOOLS}/"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}/tools"
+    COMPONENT Runtime
+    FILES_MATCHING PATTERN "*.exe")
+else()
+  message(WARNING "Install extra tools dir NOT FOUND: ${WINDOWS_EXTRA_TOOLS}")
+endif()
+
 # Fully re-copy the assets directory on each build to avoid having stale files
 # from a previous install.
 set(FLUTTER_ASSET_DIR_NAME "flutter_assets")

@@ -62,7 +62,11 @@ pub fn get_custom_server_from_string(s: &str) -> ResultType<CustomServer> {
      *
      * This allows using a ',' (comma) symbol as a final delimiter.
      */
-    if s.to_lowercase().contains("host=") || s.to_lowercase().contains("p=[") || s.to_lowercase().contains("portable") || s.to_lowercase().contains("id=") {
+    if s.to_lowercase().contains("host=")
+        || s.to_lowercase().contains("p=[")
+        || s.to_lowercase().contains("portable")
+        || s.to_lowercase().contains("id=")
+    {
         let find_host = s.to_lowercase().find("host=");
         let find_p = s.to_lowercase().find("p=[");
         let find_portable = s.to_lowercase().find("portable");

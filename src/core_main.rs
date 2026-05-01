@@ -45,6 +45,7 @@ pub fn core_main() -> Option<Vec<String>> {
         return None;
     }
     crate::load_custom_client();
+    config::apply_product_default_settings();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
@@ -131,14 +132,12 @@ pub fn core_main() -> Option<Vec<String>> {
     if _is_flutter_invoke_new_connection {
         return core_main_invoke_new_connection(std::env::args());
     }
-    let click_setup = cfg!(windows)
-        && !args.iter().any(|a| a.starts_with("--"))
-        && {
-            let exe_path = std::env::current_exe()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or(arg_exe.clone());
-            crate::common::is_setup(&exe_path)
-        };
+    let click_setup = cfg!(windows) && !args.iter().any(|a| a.starts_with("--")) && {
+        let exe_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(arg_exe.clone());
+        crate::common::is_setup(&exe_path)
+    };
     if click_setup && !config::is_disable_installation() {
         args.clear();
         args.push("--install".to_owned());
@@ -426,7 +425,11 @@ pub fn core_main() -> Option<Vec<String>> {
                 println!("Settings are disabled!");
                 return None;
             }
-            let encoded = args[0].chars().skip(4).take(args[0].len() - 5).collect::<String>();
+            let encoded = args[0]
+                .chars()
+                .skip(4)
+                .take(args[0].len() - 5)
+                .collect::<String>();
             let password = crate::custom_server::decode_password_external(&encoded);
             if crate::platform::is_installed() && is_root() {
                 if let Err(err) = crate::ipc::set_permanent_password(password) {
@@ -509,7 +512,8 @@ pub fn core_main() -> Option<Vec<String>> {
                             if !key_exists && !lic.key.is_empty() {
                                 crate::ui_interface::set_option("key".into(), lic.key);
                             }
-                            let current_host = crate::ui_interface::get_option("custom-rendezvous-server");
+                            let current_host =
+                                crate::ui_interface::get_option("custom-rendezvous-server");
                             if current_host.is_empty() {
                                 crate::ui_interface::set_option(
                                     "custom-rendezvous-server".into(),

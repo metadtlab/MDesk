@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/formatter/id_formatter.dart';
 import 'package:flutter_hbb/desktop/widgets/refresh_wrapper.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
+import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
@@ -3942,7 +3943,8 @@ void checkUpdate() {
 }
 
 /// MDesk 버전 체크 - admin.787.kr API 사용
-Future<void> checkMDeskUpdate() async {
+/// 반환: 새 버전 있음 `true`, 이미 최신 `false`, 실패·응답 오류 `null`
+Future<bool?> checkMDeskUpdate() async {
   try {
     final currentVersion = await bind.mainGetVersion();
     debugPrint('MDesk Update Check: Current version = $currentVersion');
@@ -3956,8 +3958,6 @@ Future<void> checkMDeskUpdate() async {
       if (jsonData['code'] == 1 && jsonData['data'] != null) {
         final data = jsonData['data'];
         final latestVersion = data['file_version'] as String? ?? '';
-        final fileName = data['file_name'] as String? ?? '';
-        final productName = data['product_name'] as String? ?? 'MDesk';
         
         debugPrint('MDesk Update Check: Latest version = $latestVersion');
         
@@ -3980,17 +3980,22 @@ Future<void> checkMDeskUpdate() async {
           } else {
             stateGlobal.forceUpdate.value = false;
           }
+          return true;
         } else {
           debugPrint('MDesk Update Check: Already up to date');
           stateGlobal.updateUrl.value = '';
           stateGlobal.forceUpdate.value = false;
+          return false;
         }
       }
+      return null;
     } else {
       debugPrint('MDesk Update Check: API error ${response.statusCode}');
+      return null;
     }
   } catch (e) {
     debugPrint('MDesk Update Check: Error $e');
+    return null;
   }
 }
 
@@ -4100,7 +4105,11 @@ void showForceUpdateDialog(BuildContext context) {
                 onPressed: () {
                   final url = stateGlobal.updateUrl.value;
                   if (url.isNotEmpty) {
-                    launchUrl(Uri.parse(url));
+                    if (isWindows) {
+                      handleDirectDownloadUpdate(url);
+                    } else {
+                      launchUrl(Uri.parse(url));
+                    }
                   }
                 },
                 icon: const Icon(Icons.download),

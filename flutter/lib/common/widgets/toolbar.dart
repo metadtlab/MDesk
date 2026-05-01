@@ -94,6 +94,20 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
   final sessionId = ffi.sessionId;
   final isDefaultConn = ffi.connType == ConnType.defaultConn;
 
+  void refreshAfterSecureDesktopSwitch() {
+    Future<void> refresh() async {
+      try {
+        await sessionRefreshVideo(sessionId, pi);
+      } catch (e) {
+        debugPrint('Failed to refresh video after secure desktop switch: $e');
+      }
+    }
+
+    unawaited(refresh());
+    unawaited(Future.delayed(const Duration(milliseconds: 700), refresh));
+    unawaited(Future.delayed(const Duration(milliseconds: 1800), refresh));
+  }
+
   List<TTextMenu> v = [];
   // elevation
   if (isDefaultConn &&
@@ -228,8 +242,11 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       (pi.platform == kPeerPlatformLinux || pi.sasEnabled)) {
     v.add(
       TTextMenu(
-          child: Text('${translate("Insert Ctrl + Alt + Del")}'),
-          onPressed: () => bind.sessionCtrlAltDel(sessionId: sessionId)),
+          child: Text(translate("Insert Ctrl + Alt + Del")),
+          onPressed: () {
+            bind.sessionCtrlAltDel(sessionId: sessionId);
+            refreshAfterSecureDesktopSwitch();
+          }),
     );
   }
   // restart

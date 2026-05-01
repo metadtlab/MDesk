@@ -185,6 +185,28 @@ pub enum AuthConnType {
     Terminal,
 }
 
+/// 피원격지(호스트) 관점 접속 인증 방식 — `[AccessAudit]` 로그용
+#[derive(Debug, Clone, Copy)]
+enum AccessAuthMethod {
+    RegisteredRemoteUser,
+    PermanentPassword,
+    TemporaryPassword,
+    RecentSession,
+    TwoFactor,
+}
+
+impl AccessAuthMethod {
+    fn as_audit_str(self) -> &'static str {
+        match self {
+            Self::RegisteredRemoteUser => "registered_remote_user",
+            Self::PermanentPassword => "permanent_password",
+            Self::TemporaryPassword => "temporary_password",
+            Self::RecentSession => "recent_session",
+            Self::TwoFactor => "2fa",
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Clone, Debug)]
 enum TerminalUserToken {
@@ -669,7 +691,7 @@ impl Connection {
                                 clipboard::ClipboardFile::FormatList { format_list } => {
                                     // 서버 → 클라이언트 클립보드 파일 전송 감지
                                     let has_file_format = format_list.iter().any(|(_, format)| {
-                                        format.contains("FileGroupDescriptor") || 
+                                        format.contains("FileGroupDescriptor") ||
                                         format.contains("FileContents")
                                     });
                                     if has_file_format {
@@ -1240,10 +1262,10 @@ impl Connection {
         }
         let url = self.server_audit_conn.clone();
         let mut v = v;
-        
+
         // conn_id는 항상 포함
         v["conn_id"] = json!(self.inner.id);
-        
+
         // close 액션일 때는 별도 태스크에서 직접 HTTP 요청 전송 (연결 종료 시에도 확실히 전송)
         if v["action"] == "close" {
             log::info!("Sending conn audit (close) to {}: {:?}", url, v);
@@ -1260,13 +1282,13 @@ impl Connection {
             });
             return;
         }
-        
+
         // new 및 기타 액션일 때는 전체 정보 전송
         v["id"] = json!(Config::get_id());
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["from_id"] = json!(self.lr.my_id.clone());
         v["session_id"] = json!(self.lr.session_id);
-        
+
         log::info!("Sending conn audit to {}: {:?}", url, v);
         allow_err!(self.tx_post_seq.send((url, v)));
     }
@@ -1302,19 +1324,19 @@ impl Connection {
         let mut files = files;
         files.sort_by(|a, b| b.1.cmp(&a.1));
         files.truncate(10);
-        
+
         // files를 [[filename, size], ...] 형식으로 변환
         let files_array: Vec<Value> = files
             .iter()
             .map(|(name, size)| json!([name, size]))
             .collect();
-        
+
         // info 필드 구성: {"files": [[...]], "ip": "..."}
         let info = json!({
             "files": files_array,
             "ip": self.ip.clone()
         });
-        
+
         // 사용자 요청 형식에 맞춤:
         // id = 연결하는 클라이언트 ID (from_id)
         // peer_id = 서버(자신)의 ID
@@ -1405,6 +1427,11 @@ impl Connection {
                     });
                 }
             });
+            self.log_access_audit(
+                "PENDING",
+                None,
+                "비밀번호 등 1차 인증 통과, 2FA(TOTP) 코드 입력 대기",
+            );
             self.send_login_error(crate::client::REQUIRE_2FA).await;
             return;
         }
@@ -1426,6 +1453,7 @@ impl Connection {
             self.session_key(),
             self.tx_from_authed.clone(),
             self.lr.clone(),
+            crate::common::overlay_remote_peer_ip(&self.lr, &self.ip),
         ));
         self.session_last_recv_time = SESSIONS
             .lock()
@@ -1435,7 +1463,7 @@ impl Connection {
         self.post_conn_audit(
             json!({"peer": ((&self.lr.my_id, &self.lr.my_name)), "type": conn_type}),
         );
-        
+
         // 포터블 모드에서 원격 연결 시 agentclose API 호출
         #[cfg(windows)]
         {
@@ -1443,13 +1471,22 @@ impl Connection {
             let custom_id = Config::get_option("custom-id");
             if !agent_id.is_empty() && conn_type == 0 {
                 // Remote 연결일 때만 (conn_type == 0)
-                let user_id = if custom_id.is_empty() { "admin".to_string() } else { custom_id };
-                let url = format!("https://787.kr/api/agentclose/{}/{}", user_id, agent_id);
+                let user_id = if custom_id.is_empty() {
+                    "admin".to_string()
+                } else {
+                    custom_id
+                };
+                let url = format!(
+                    "https://787.kr/api/agentclose/{}/{}?mdeskid={}",
+                    user_id,
+                    agent_id,
+                    Config::get_id()
+                );
                 log::info!("[MDesk] Client authorized! Calling agentclose API: {}", url);
                 crate::common::get_request_fire_and_forget(url);
             }
         }
-        
+
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
         let mut res = LoginResponse::new();
@@ -1820,8 +1857,10 @@ impl Connection {
 
     #[cfg(windows)]
     fn auto_refresh_login_screen_if_needed(&self) {
-        let is_remote_session =
-            self.file_transfer.is_none() && !self.view_camera && self.port_forward_socket.is_none() && !self.terminal;
+        let is_remote_session = self.file_transfer.is_none()
+            && !self.view_camera
+            && self.port_forward_socket.is_none()
+            && !self.terminal;
         let is_login_screen = crate::platform::is_prelogin() || crate::platform::is_locked();
         if !is_remote_session || !is_login_screen {
             return;
@@ -1835,9 +1874,7 @@ impl Connection {
         let server = self.server.clone();
         tokio::spawn(async move {
             time::sleep(Duration::from_millis(1200)).await;
-            log::info!(
-                "[Display] Windows 로그인/잠금 화면 자동 2차 새로 고침 실행"
-            );
+            log::info!("[Display] Windows 로그인/잠금 화면 자동 2차 새로 고침 실행");
             video_service::refresh();
             server.upgrade().map(|s| {
                 s.read().unwrap().set_video_service_opt(
@@ -1873,6 +1910,16 @@ impl Connection {
         self.file && self.enable_file_transfer
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn remote_drop_file_transfer_enabled(&self) -> bool {
+        self.file && self.enable_file_transfer
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    fn remote_drop_file_transfer_enabled(&self) -> bool {
+        false
+    }
+
     #[cfg(feature = "unix-file-copy-paste")]
     fn can_sub_file_clipboard_service(&self) -> bool {
         self.clipboard_enabled()
@@ -1889,6 +1936,7 @@ impl Connection {
             port_forward: self.port_forward_address.clone(),
             peer_id,
             name,
+            ip: self.ip.clone(),
             authorized,
             keyboard: self.keyboard,
             clipboard: self.clipboard,
@@ -1980,6 +2028,33 @@ impl Connection {
         self.tx_input.send(MessageInput::Key((msg, press))).ok();
     }
 
+    /// 피원격지에서 원격 접속 시도를 감사 로그로 남김. 로그 검색: `[AccessAudit]`
+    ///
+    /// - `outcome`: SUCCESS | FAIL | PENDING
+    /// - `auth_method`: 인증에 성공한 경우에만 Some
+    /// - `detail`: 사람이 읽을 수 있는 사유(실패·대기 시 중요)
+    fn log_access_audit(&self, outcome: &str, auth_method: Option<AccessAuthMethod>, detail: &str) {
+        let method_str = auth_method.map(|m| m.as_audit_str()).unwrap_or("-");
+        let detail_trim = detail.trim();
+        let detail_out = if detail_trim.is_empty() {
+            "-"
+        } else {
+            detail_trim
+        };
+        log::info!(
+            "[AccessAudit] outcome={} auth_method={} detail={} remote_peer_id={} remote_peer_name={} remote_platform={} source_ip={} local_device_id={} conn_inner_id={}",
+            outcome,
+            method_str,
+            detail_out,
+            self.lr.my_id,
+            self.lr.my_name,
+            self.lr.my_platform,
+            self.ip,
+            Config::get_id(),
+            self.inner.id(),
+        );
+    }
+
     fn validate_one_password(&self, password: String) -> bool {
         if password.len() == 0 {
             return false;
@@ -1993,35 +2068,35 @@ impl Connection {
         hasher2.finalize()[..] == self.lr.password[..]
     }
 
-    fn validate_password(&mut self) -> bool {
+    fn validate_password(&mut self) -> Result<AccessAuthMethod, String> {
         log::info!("========== 암호 검증 시작 ==========");
         log::info!("접속 시도 피어: {}", self.lr.my_id);
-        
-        // 먼저 등록된 원격자의 연결 암호로 인증 시도
-        log::info!("[1단계] 등록된 원격자 암호로 인증 시도...");
-        if self.validate_registered_remote_user() {
-            log::info!("★★★ 등록된 원격자로 인증 성공: {} ★★★", self.lr.my_id);
-            return true;
-        }
-        log::info!("[1단계] 등록된 원격자 인증 실패");
 
-        // 포터블 모드: 현재 실행 파일이 설치 경로가 아닌 곳에서 실행 중
-        // 설치된 상태에서 일회용 비밀번호가 표시되면: 일회용 비밀번호만 사용
+        log::info!("[1단계] 등록된 원격자 암호로 인증 시도...");
+        match self.validate_registered_remote_user() {
+            Ok(()) => {
+                log::info!("★★★ 등록된 원격자로 인증 성공: {} ★★★", self.lr.my_id);
+                return Ok(AccessAuthMethod::RegisteredRemoteUser);
+            }
+            Err(e) => {
+                log::info!("[1단계] 등록된 원격자 인증 실패: {}", e);
+            }
+        }
+
         let is_portable = crate::is_running_portable();
         log::info!("포터블 모드: {}", is_portable);
-        
+
         if is_portable {
-            // 포터블 모드: 고정 비밀번호 우선, 없으면 일회용 비밀번호
             log::info!("[2단계-포터블] 고정 비밀번호 확인...");
             if password::permanent_enabled() {
                 let permanent_password = Config::get_permanent_password();
                 log::info!("고정 비밀번호 설정됨: {}", !permanent_password.is_empty());
-                if !permanent_password.is_empty() && self.validate_one_password(permanent_password) {
+                if !permanent_password.is_empty() && self.validate_one_password(permanent_password)
+                {
                     log::info!("★★★ 고정 비밀번호로 인증 성공 ★★★");
-                    return true;
+                    return Ok(AccessAuthMethod::PermanentPassword);
                 }
             }
-            // 고정 비밀번호가 없거나 틀린 경우, 일회용 비밀번호 시도
             log::info!("[2단계-포터블] 일회용 비밀번호 확인...");
             if password::temporary_enabled() {
                 let password = password::temporary_password();
@@ -2033,14 +2108,16 @@ impl Connection {
                         Some(password),
                         Some(false),
                     );
-                    return true;
+                    return Ok(AccessAuthMethod::TemporaryPassword);
                 }
             }
             log::info!("========== 암호 검증 실패 (포터블 모드) ==========");
-            return false;
+            return Err(
+                "포터블 모드: 등록 원격자·고정·일회용 비밀번호 모두 실패(또는 해당 방식 미설정)"
+                    .to_string(),
+            );
         }
-        
-        // 설치된 상태: 일회용 비밀번호가 표시되면 일회용만 사용
+
         log::info!("[2단계-설치] 일회용 비밀번호 확인...");
         if password::temporary_enabled() {
             let password = password::temporary_password();
@@ -2052,63 +2129,72 @@ impl Connection {
                     Some(password),
                     Some(false),
                 );
-                return true;
+                return Ok(AccessAuthMethod::TemporaryPassword);
             }
-            // 일회용 비밀번호가 활성화된 상태에서는 고정 비밀번호 사용 불가
             log::info!("========== 암호 검증 실패 (일회용 모드) ==========");
-            return false;
+            return Err(
+                "설치형+일회용 표시 ON: 제출한 비밀번호가 현재 일회용과 불일치".to_string(),
+            );
         }
-        
-        // 일회용 비밀번호가 비활성화된 경우: 고정 비밀번호만 사용
+
         log::info!("[2단계-설치] 고정 비밀번호 확인...");
         if password::permanent_enabled() {
             let permanent_password = Config::get_permanent_password();
             log::info!("고정 비밀번호 설정됨: {}", !permanent_password.is_empty());
             if self.validate_one_password(permanent_password) {
                 log::info!("★★★ 고정 비밀번호로 인증 성공 ★★★");
-                return true;
+                return Ok(AccessAuthMethod::PermanentPassword);
             }
+            log::info!("========== 암호 검증 실패 ==========");
+            return Err("설치형: 고정 비밀번호가 켜져 있으나 제출한 비밀번호와 불일치".to_string());
         }
         log::info!("========== 암호 검증 실패 ==========");
-        false
+        Err(
+            "설치형: 일회용 표시 OFF·고정 비밀번호 미사용 — 위 등록 원격자 단계만으로는 인증 불가"
+                .to_string(),
+        )
     }
 
     /// 등록된 원격자의 연결 암호로 인증 확인
-    fn validate_registered_remote_user(&self) -> bool {
-        use hbb_common::config::{LocalConfig, Config};
-        
+    fn validate_registered_remote_user(&self) -> Result<(), String> {
+        use hbb_common::config::{Config, LocalConfig};
+
         log::info!("[RemoteUser] ========== 원격자 인증 시작 ==========");
         log::info!("[RemoteUser] 접속 시도 피어 ID: {}", self.lr.my_id);
         log::info!("[RemoteUser] 포터블 모드: {}", crate::is_running_portable());
-        
-        // 설정 파일 경로 출력
-        let config_path = Config::path("MDesk_local.toml");
+
+        let config_path = Config::path(format!("{}_local.toml", crate::get_app_name()));
         log::info!("[RemoteUser] 설정 파일 경로: {:?}", config_path);
         log::info!("[RemoteUser] 파일 존재 여부: {}", config_path.exists());
-        
-        // 파일에서 직접 읽기 (캐시된 값이 아닌 최신 값 사용)
+
         let registered_users_json = LocalConfig::get_option_from_file("registered_remote_users");
-        log::info!("[RemoteUser] registered_remote_users 값 길이: {}", registered_users_json.len());
-        
+        log::info!(
+            "[RemoteUser] registered_remote_users 값 길이: {}",
+            registered_users_json.len()
+        );
+
         if registered_users_json.is_empty() {
-            // 캐시된 값도 확인
             let cached_value = LocalConfig::get_option("registered_remote_users");
             log::info!("[RemoteUser] 캐시된 값 길이: {}", cached_value.len());
-            
             log::info!("[RemoteUser] 등록된 원격자 없음 (registered_remote_users 비어있음)");
             log::info!("[RemoteUser] 설정 파일을 확인하세요: {:?}", config_path);
-            return false;
+            return Err(
+                "registered_remote_users 옵션 비어 있음(LocalConfig/_local.toml에 등록 목록 없음)"
+                    .to_string(),
+            );
         }
-        
-        log::info!("[RemoteUser] 등록된 원격자 JSON 길이: {}", registered_users_json.len());
 
-        // JSON 파싱
+        log::info!(
+            "[RemoteUser] 등록된 원격자 JSON 길이: {}",
+            registered_users_json.len()
+        );
+
         let users: Vec<serde_json::Value> = match serde_json::from_str(&registered_users_json) {
             Ok(v) => v,
             Err(e) => {
                 log::error!("[RemoteUser] JSON 파싱 실패: {}", e);
                 log::error!("[RemoteUser] JSON 내용: {}", registered_users_json);
-                return false;
+                return Err(format!("registered_remote_users JSON 파싱 실패: {}", e));
             }
         };
 
@@ -2126,22 +2212,28 @@ impl Connection {
             requester_account_id,
             self.ip
         );
-        
+
         // 접속 시도 이름(my_name)을 정규화한 계정 ID와 일치하는 등록 원격자의 연결 암호만 인증 시도
         let mut matched_user_id = false;
         for (idx, user) in users.iter().enumerate() {
             let user_id = user.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let normalized_user_id = user_id.trim().to_lowercase();
             let user_name = user.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            
+
             // 암호화된 연결 암호 가져오기
             let encrypted_password = user
                 .get("connectionPassword")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            
-            log::info!("[RemoteUser] [{}/{}] 인증 시도 - 사용자: {} ({}), 저장된 암호 길이: {}", 
-                idx + 1, users.len(), user_name, user_id, encrypted_password.len());
+
+            log::info!(
+                "[RemoteUser] [{}/{}] 인증 시도 - 사용자: {} ({}), 저장된 암호 길이: {}",
+                idx + 1,
+                users.len(),
+                user_name,
+                user_id,
+                encrypted_password.len()
+            );
 
             if normalized_user_id != requester_account_id {
                 log::info!(
@@ -2165,35 +2257,68 @@ impl Connection {
                 self.lr.my_name,
                 self.lr.my_id
             );
-            
+
             if encrypted_password.is_empty() {
-                log::info!("[RemoteUser] [{}/{}] 암호가 비어있어 건너뜀", idx + 1, users.len());
+                log::info!(
+                    "[RemoteUser] [{}/{}] 암호가 비어있어 건너뜀",
+                    idx + 1,
+                    users.len()
+                );
                 continue;
             }
 
             // 암호 복호화 및 검증 (암호화된 암호와 평문 암호 모두 시도)
             let decrypted_password = self.decrypt_connection_password(encrypted_password);
-            log::info!("[RemoteUser] [{}/{}] 복호화된 암호 길이: {}", idx + 1, users.len(), decrypted_password.len());
-            
+            log::info!(
+                "[RemoteUser] [{}/{}] 복호화된 암호 길이: {}",
+                idx + 1,
+                users.len(),
+                decrypted_password.len()
+            );
+
             // 1. 복호화된 암호로 시도
-            log::info!("[RemoteUser] [{}/{}] 복호화된 암호로 검증 시도...", idx + 1, users.len());
+            log::info!(
+                "[RemoteUser] [{}/{}] 복호화된 암호로 검증 시도...",
+                idx + 1,
+                users.len()
+            );
             if self.validate_one_password(decrypted_password.clone()) {
-                log::info!("[RemoteUser] ★★★ 인증 성공 (복호화된 암호) - 사용자: {} ({}) ★★★", user_name, user_id);
-                return true;
+                log::info!(
+                    "[RemoteUser] ★★★ 인증 성공 (복호화된 암호) - 사용자: {} ({}) ★★★",
+                    user_name,
+                    user_id
+                );
+                return Ok(());
             }
-            log::info!("[RemoteUser] [{}/{}] 복호화된 암호 검증 실패", idx + 1, users.len());
-            
+            log::info!(
+                "[RemoteUser] [{}/{}] 복호화된 암호 검증 실패",
+                idx + 1,
+                users.len()
+            );
+
             // 2. 복호화된 암호와 원본이 다르면, 원본(평문)으로도 시도
             if decrypted_password != encrypted_password {
-                log::info!("[RemoteUser] [{}/{}] 평문 암호로 검증 시도...", idx + 1, users.len());
+                log::info!(
+                    "[RemoteUser] [{}/{}] 평문 암호로 검증 시도...",
+                    idx + 1,
+                    users.len()
+                );
                 if self.validate_one_password(encrypted_password.to_string()) {
-                    log::info!("[RemoteUser] ★★★ 인증 성공 (평문 암호) - 사용자: {} ({}) ★★★", user_name, user_id);
-                    return true;
+                    log::info!(
+                        "[RemoteUser] ★★★ 인증 성공 (평문 암호) - 사용자: {} ({}) ★★★",
+                        user_name,
+                        user_id
+                    );
+                    return Ok(());
                 }
-                log::info!("[RemoteUser] [{}/{}] 평문 암호 검증 실패", idx + 1, users.len());
+                log::info!(
+                    "[RemoteUser] [{}/{}] 평문 암호 검증 실패",
+                    idx + 1,
+                    users.len()
+                );
             }
         }
-        
+
         if !matched_user_id {
             log::warn!(
                 "[RemoteUser] 비교용 계정 ID와 일치하는 등록 원격자 없음 - 비교용 계정 ID: {}, 접속 시도 이름: {}, 접속 기기 ID: {}, 등록 ID 목록: {:?}",
@@ -2202,11 +2327,15 @@ impl Connection {
                 self.lr.my_id,
                 registered_ids
             );
+            return Err(format!(
+                "요청 계정 ID('{}', 이름='{}')가 등록 목록과 불일치. 등록 ID: {:?}",
+                requester_account_id, self.lr.my_name, registered_ids
+            ));
         }
-        
+
         log::info!("[RemoteUser] 일치하는 ID의 등록 원격자 암호 검증 실패");
         log::info!("[RemoteUser] ========== 원격자 인증 종료 ==========");
-        false
+        Err("등록 원격자 ID는 일치했으나 연결 암호가 틀림".to_string())
     }
 
     /// 연결 암호 복호화
@@ -2215,7 +2344,7 @@ impl Connection {
     /// 3차: 평문으로 간주
     fn decrypt_connection_password(&self, encrypted: &str) -> String {
         use hbb_common::password_security::decrypt_str_or_original;
-        
+
         if encrypted.is_empty() {
             log::info!("[RemoteUser] 복호화: 빈 암호");
             return String::new();
@@ -2233,19 +2362,23 @@ impl Connection {
 
         // 2차: 레거시 XOR + Base64 복호화 시도 (하위호환)
         {
-            use hbb_common::base64::{Engine as _, engine::general_purpose::STANDARD};
+            use hbb_common::base64::{engine::general_purpose::STANDARD, Engine as _};
             const LEGACY_KEY: &[u8] = b"MDesk2024SecureKey!@#";
-            
+
             if let Ok(bytes) = STANDARD.decode(encrypted) {
                 let decrypted: Vec<u8> = bytes
                     .iter()
                     .enumerate()
                     .map(|(i, &b)| b ^ LEGACY_KEY[i % LEGACY_KEY.len()])
                     .collect();
-                
+
                 if let Ok(s) = String::from_utf8(decrypted) {
-                    if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
-                        log::info!("[RemoteUser] 복호화: 레거시 XOR 복호화 성공 (마이그레이션 필요)");
+                    if s.chars()
+                        .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+                    {
+                        log::info!(
+                            "[RemoteUser] 복호화: 레거시 XOR 복호화 성공 (마이그레이션 필요)"
+                        );
                         return s;
                     }
                 }
@@ -2256,7 +2389,6 @@ impl Connection {
         log::info!("[RemoteUser] 복호화: 평문 암호로 사용");
         encrypted.to_string()
     }
-
 
     fn is_recent_session(&mut self, tfa: bool) -> bool {
         SESSIONS
@@ -2523,6 +2655,11 @@ impl Connection {
             // If err is LOGIN_MSG_DESKTOP_SESSION_NOT_READY, just keep this msg and go on checking password.
             if !err_msg.is_empty() && err_msg != crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY
             {
+                self.log_access_audit(
+                    "FAIL",
+                    None,
+                    &format!("데스크톱/세션 준비 실패(로그인 단계 전): {}", err_msg),
+                );
                 self.send_login_error(err_msg).await;
                 return true;
             }
@@ -2533,9 +2670,7 @@ impl Connection {
             // `is_logon_ui()` remains as a fallback for the logon UI process.
             #[cfg(target_os = "windows")]
             let is_logon = || {
-                crate::platform::is_prelogin()
-                    || crate::platform::is_locked()
-                    || {
+                crate::platform::is_prelogin() || crate::platform::is_locked() || {
                     match crate::platform::is_logon_ui() {
                         Ok(result) => result,
                         Err(e) => {
@@ -2554,6 +2689,17 @@ impl Connection {
                 && !hbb_common::is_domain_port_str(&lr.username)
                 && lr.username != Config::get_id()
             {
+                self.log_access_audit(
+                    "FAIL",
+                    None,
+                    &format!(
+                        "연결 대상 ID 불일치: 요청 username='{}', 이 PC ID='{}'. (원격 peer {} / {})",
+                        lr.username,
+                        Config::get_id(),
+                        lr.my_id,
+                        lr.my_name
+                    ),
+                );
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;
                 return false;
@@ -2562,6 +2708,15 @@ impl Connection {
                     && is_logon()))
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
+                let approve = format!("{:?}", password::approve_mode());
+                self.log_access_audit(
+                    "PENDING",
+                    None,
+                    &format!(
+                        "수동 승인 모드: UI에서 승인 필요 (approve_mode={})",
+                        approve
+                    ),
+                );
                 self.try_start_cm(lr.my_id, lr.my_name, false);
                 if hbb_common::get_version_number(&lr.version)
                     >= hbb_common::get_version_number("1.2.0")
@@ -2572,17 +2727,51 @@ impl Connection {
                 return true;
             } else if self.is_recent_session(false) {
                 if err_msg.is_empty() {
+                    self.log_access_audit(
+                        "SUCCESS",
+                        Some(AccessAuthMethod::RecentSession),
+                        "이미 인증된 세션(최근 세션) 재사용",
+                    );
                     #[cfg(target_os = "linux")]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
                     self.send_logon_response().await;
                     self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
                 } else {
+                    self.log_access_audit(
+                        "FAIL",
+                        Some(AccessAuthMethod::RecentSession),
+                        &format!("최근 세션은 유효하나 데스크톱 준비 오류: {}", err_msg),
+                    );
                     self.send_login_error(err_msg).await;
                 }
             } else if lr.password.is_empty() {
                 if err_msg.is_empty() {
-                    self.try_start_cm(lr.my_id, lr.my_name, false);
+                    #[cfg(feature = "headless")]
+                    {
+                        self.log_access_audit(
+                            "PENDING",
+                            None,
+                            "비밀번호 미전송: headless 모드 — 클라이언트에 비밀번호 입력 요청",
+                        );
+                        self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_EMPTY)
+                            .await;
+                        return true;
+                    }
+                    #[cfg(not(feature = "headless"))]
+                    {
+                        self.log_access_audit(
+                            "PENDING",
+                            None,
+                            "비밀번호 미전송: 연결 관리자(UI) 승인·입력 대기",
+                        );
+                        self.try_start_cm(lr.my_id, lr.my_name, false);
+                    }
                 } else {
+                    self.log_access_audit(
+                        "FAIL",
+                        None,
+                        &format!("비밀번호 비어 있음 + 데스크톱 세션 미준비: {}", err_msg),
+                    );
                     self.send_login_error(
                         crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY,
                     )
@@ -2591,40 +2780,65 @@ impl Connection {
             } else {
                 let (failure, res) = self.check_failure(0).await;
                 if !res {
+                    self.log_access_audit(
+                        "FAIL",
+                        None,
+                        "동일 IP에서 단시간 내 로그인 실패 획수 초과(차단) — Too many wrong attempts / Please try 1 minute later",
+                    );
                     return true;
                 }
-                if !self.validate_password() {
-                    self.update_failure(failure, false, 0);
-                    if err_msg.is_empty() {
-                        self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
-                            .await;
-                        self.try_start_cm(lr.my_id, lr.my_name, false);
-                    } else {
-                        self.send_login_error(
-                            crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG,
-                        )
-                        .await;
+                match self.validate_password() {
+                    Ok(method) => {
+                        self.log_access_audit("SUCCESS", Some(method), "비밀번호 검증 성공");
+                        self.update_failure(failure, true, 0);
+                        if err_msg.is_empty() {
+                            #[cfg(target_os = "linux")]
+                            self.linux_headless_handle.wait_desktop_cm_ready().await;
+                            self.send_logon_response().await;
+                            self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
+                        } else {
+                            self.log_access_audit(
+                                "FAIL",
+                                Some(method),
+                                &format!("비밀번호는 성공했으나 이후 단계 실패: {}", err_msg),
+                            );
+                            self.send_login_error(err_msg).await;
+                        }
                     }
-                } else {
-                    self.update_failure(failure, true, 0);
-                    if err_msg.is_empty() {
-                        #[cfg(target_os = "linux")]
-                        self.linux_headless_handle.wait_desktop_cm_ready().await;
-                        self.send_logon_response().await;
-                        self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
-                    } else {
-                        self.send_login_error(err_msg).await;
+                    Err(reason) => {
+                        self.log_access_audit("FAIL", None, &reason);
+                        self.update_failure(failure, false, 0);
+                        if err_msg.is_empty() {
+                            self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
+                                .await;
+                            self.try_start_cm(lr.my_id, lr.my_name, false);
+                        } else {
+                            self.send_login_error(
+                                crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
         } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
             let (failure, res) = self.check_failure(1).await;
             if !res {
+                self.log_access_audit(
+                    "FAIL",
+                    None,
+                    "2FA 단계: 동일 IP 로그인 실패 횟수 제한으로 차단",
+                );
                 return true;
             }
             if let Some(totp) = self.require_2fa.as_ref() {
                 if let Ok(res) = totp.check_current(&tfa.code) {
                     if res {
+                        self.log_access_audit(
+                            "SUCCESS",
+                            Some(AccessAuthMethod::TwoFactor),
+                            "2FA(TOTP) 검증 성공",
+                        );
                         self.update_failure(failure, true, 1);
                         self.require_2fa.take();
                         raii::AuthedConnID::set_session_2fa(self.session_key());
@@ -2644,10 +2858,21 @@ impl Connection {
                             });
                         }
                     } else {
+                        self.log_access_audit(
+                            "FAIL",
+                            Some(AccessAuthMethod::TwoFactor),
+                            "2FA(TOTP) 코드 불일치",
+                        );
                         self.update_failure(failure, false, 1);
                         self.send_login_error(crate::client::LOGIN_MSG_2FA_WRONG)
                             .await;
                     }
+                } else {
+                    self.log_access_audit(
+                        "FAIL",
+                        Some(AccessAuthMethod::TwoFactor),
+                        "2FA(TOTP) 코드 검증 처리 오류(check_current 실패)",
+                    );
                 }
             }
         } else if let Some(message::Union::TestDelay(t)) = msg.union {
@@ -2935,8 +3160,8 @@ impl Connection {
                     #[cfg(target_os = "windows")]
                     if let Some(cliprdr::Union::FormatList(format_list)) = &clip.union {
                         let has_file_format = format_list.formats.iter().any(|f| {
-                            f.format.contains("FileGroupDescriptor") || 
-                            f.format.contains("FileContents")
+                            f.format.contains("FileGroupDescriptor")
+                                || f.format.contains("FileContents")
                         });
                         if has_file_format {
                             log::info!("Clipboard file transfer detected from client");
@@ -2948,7 +3173,7 @@ impl Connection {
                             );
                         }
                     }
-                    
+
                     if let Some(cliprdr::Union::Files(files)) = &clip.union {
                         self.post_file_audit(
                             FileAuditType::RemoteReceive,
@@ -3027,6 +3252,34 @@ impl Connection {
                         if let Some(file_action::Union::Send(s)) = fa.union.as_ref() {
                             if JobType::from_proto(s.file_type) == JobType::Printer {
                                 handle_fa = true;
+                            }
+                        }
+                    }
+                    if !handle_fa {
+                        let remote_drop_job = match fa.union.as_ref() {
+                            Some(file_action::Union::Receive(r))
+                                if fs::is_remote_drop_downloads_path(&r.path) =>
+                            {
+                                Some((r.id, r.file_num))
+                            }
+                            Some(file_action::Union::Create(c))
+                                if fs::is_remote_drop_downloads_path(&c.path) =>
+                            {
+                                Some((c.id, -1))
+                            }
+                            _ => None,
+                        };
+                        if let Some((id, file_num)) = remote_drop_job {
+                            if self.remote_drop_file_transfer_enabled() {
+                                handle_fa = true;
+                            } else {
+                                self.send(fs::new_error(
+                                    id,
+                                    "No permission of file transfer",
+                                    file_num,
+                                ))
+                                .await;
+                                return true;
                             }
                         }
                     }
@@ -3918,16 +4171,19 @@ impl Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn handle_whiteboard_message(&mut self, text: &str) {
         use crate::whiteboard;
-        
+
         const WB_PREFIX: &str = "##WB##";
         let json_str = &text[WB_PREFIX.len()..];
-        
+
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
             let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            
+
             match msg_type {
                 "state" => {
-                    let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let enabled = data
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if enabled {
                         // 화이트보드 활성화
                         whiteboard::register_whiteboard(whiteboard::get_key_draw(self.inner.id));
@@ -3946,7 +4202,7 @@ impl Connection {
                         data.get("strokeWidth").and_then(|v| v.as_f64()),
                         data.get("tool").and_then(|v| v.as_u64()),
                     ) {
-                        let draw_points: Vec<(f32, f32)> = points
+                        let mut draw_points: Vec<(f32, f32)> = points
                             .iter()
                             .filter_map(|p| {
                                 let x = p.get("x").and_then(|v| v.as_f64())?;
@@ -3954,7 +4210,84 @@ impl Connection {
                                 Some((x as f32, y as f32))
                             })
                             .collect();
-                        
+
+                        fn parse_rect(
+                            value: Option<&serde_json::Value>,
+                        ) -> Option<(f32, f32, f32, f32)> {
+                            let rect = value?;
+                            let x = rect.get("x")?.as_f64()? as f32;
+                            let y = rect.get("y")?.as_f64()? as f32;
+                            let w = rect.get("w")?.as_f64()? as f32;
+                            let h = rect.get("h")?.as_f64()? as f32;
+                            Some((x, y, w, h))
+                        }
+
+                        let coord_space = data.get("coordSpace").and_then(|v| v.as_str());
+                        let mut display_rect = None;
+                        let mut virtual_rect = None;
+
+                        if coord_space == Some("display-local-v1") {
+                            display_rect = parse_rect(data.get("displayRect"));
+                            virtual_rect = parse_rect(data.get("virtualRect"));
+                        }
+
+                        // Backward compatibility:
+                        // old controller builds don't send coordSpace/displayRect/virtualRect.
+                        // In that case, treat incoming points as "current display local" and
+                        // convert them to virtual-desktop normalized coordinates on host side.
+                        if (display_rect.is_none() || virtual_rect.is_none())
+                            && coord_space.is_none()
+                        {
+                            let displays = display_service::get_sync_displays();
+                            if !displays.is_empty() {
+                                let mut min_x = i32::MAX;
+                                let mut min_y = i32::MAX;
+                                let mut max_x = i32::MIN;
+                                let mut max_y = i32::MIN;
+                                for d in &displays {
+                                    min_x = min_x.min(d.x);
+                                    min_y = min_y.min(d.y);
+                                    max_x = max_x.max(d.x + d.width);
+                                    max_y = max_y.max(d.y + d.height);
+                                }
+
+                                let current = displays.get(self.display_idx).or_else(|| {
+                                    displays.get(*display_service::PRIMARY_DISPLAY_IDX)
+                                });
+                                if let Some(d) = current {
+                                    display_rect = Some((
+                                        d.x as f32,
+                                        d.y as f32,
+                                        d.width as f32,
+                                        d.height as f32,
+                                    ));
+                                    virtual_rect = Some((
+                                        min_x as f32,
+                                        min_y as f32,
+                                        (max_x - min_x) as f32,
+                                        (max_y - min_y) as f32,
+                                    ));
+                                }
+                            }
+                        }
+
+                        if let (Some((dx, dy, dw, dh)), Some((vx, vy, vw, vh))) =
+                            (display_rect, virtual_rect)
+                        {
+                            if dw > 0.0 && dh > 0.0 && vw > 0.0 && vh > 0.0 {
+                                draw_points = draw_points
+                                    .into_iter()
+                                    .map(|(x, y)| {
+                                        let abs_x = dx + x * dw;
+                                        let abs_y = dy + y * dh;
+                                        let gx = ((abs_x - vx) / vw).clamp(0.0, 1.0);
+                                        let gy = ((abs_y - vy) / vh).clamp(0.0, 1.0);
+                                        (gx, gy)
+                                    })
+                                    .collect();
+                            }
+                        }
+
                         whiteboard::send_draw_stroke(
                             self.inner.id,
                             draw_points,
@@ -3978,7 +4311,7 @@ impl Connection {
             log::error!("Failed to parse whiteboard message: {}", json_str);
         }
     }
-    
+
     #[cfg(any(target_os = "android", target_os = "ios"))]
     fn handle_whiteboard_message(&mut self, _text: &str) {
         // 모바일에서는 화이트보드 미지원
@@ -5329,6 +5662,7 @@ mod raii {
             session_key: SessionKey,
             sender: mpsc::UnboundedSender<Data>,
             lr: LoginRequest,
+            peer_ip: String,
         ) -> Self {
             let printer = conn_type == crate::server::AuthConnType::Remote
                 && crate::is_support_remote_print(&lr.version)
@@ -5352,11 +5686,16 @@ mod raii {
                     .unwrap()
                     .on_connection_open(conn_id);
             }
-            // Show remote overlay indicator on Windows
             #[cfg(target_os = "windows")]
-            if conn_type == AuthConnType::Remote {
-                crate::platform::windows::remote_overlay::show_remote_indicator();
+            {
+                if conn_type == AuthConnType::Remote {
+                    crate::platform::windows::remote_overlay::show_remote_indicator(conn_id, peer_ip);
+                } else {
+                    drop(peer_ip);
+                }
             }
+            #[cfg(not(target_os = "windows"))]
+            drop(peer_ip);
             Self(conn_id, conn_type)
         }
 
@@ -5466,7 +5805,7 @@ mod raii {
             // Hide remote overlay indicator on Windows
             #[cfg(target_os = "windows")]
             if self.1 == AuthConnType::Remote {
-                crate::platform::windows::remote_overlay::hide_remote_indicator();
+                crate::platform::windows::remote_overlay::hide_remote_indicator(self.0);
             }
             if self.1 == AuthConnType::Remote || self.1 == AuthConnType::ViewCamera {
                 scrap::codec::Encoder::update(scrap::codec::EncodingUpdate::Remove(self.0));

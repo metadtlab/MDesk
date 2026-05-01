@@ -64,13 +64,15 @@ class ServerModel with ChangeNotifier {
   HttpClient _createSecureHttpClient() {
     return HttpClient()
       ..badCertificateCallback = (X509Certificate cert, String host, int port) {
-        debugPrint('ServerModel SSL BadCertificate callback - host=$host, port=$port');
+        debugPrint(
+            'ServerModel SSL BadCertificate callback - host=$host, port=$port');
         return true; // 모든 인증서 허용
       };
   }
 
   // SSL 우회 POST 요청
-  Future<http.Response> _securePost(String url, {Map<String, String>? headers, Object? body, Duration? timeout}) async {
+  Future<http.Response> _securePost(String url,
+      {Map<String, String>? headers, Object? body, Duration? timeout}) async {
     final httpClient = _createSecureHttpClient();
     try {
       final request = await httpClient.postUrl(Uri.parse(url));
@@ -80,7 +82,8 @@ class ServerModel with ChangeNotifier {
       if (body != null) {
         request.write(body);
       }
-      final response = await request.close().timeout(timeout ?? const Duration(seconds: 10));
+      final response =
+          await request.close().timeout(timeout ?? const Duration(seconds: 10));
       final responseBody = await response.transform(utf8.decoder).join();
       return http.Response(responseBody, response.statusCode);
     } finally {
@@ -93,7 +96,8 @@ class ServerModel with ChangeNotifier {
     final httpClient = _createSecureHttpClient();
     try {
       final request = await httpClient.getUrl(Uri.parse(url));
-      final response = await request.close().timeout(timeout ?? const Duration(seconds: 10));
+      final response =
+          await request.close().timeout(timeout ?? const Duration(seconds: 10));
       final responseBody = await response.transform(utf8.decoder).join();
       return http.Response(responseBody, response.statusCode);
     } finally {
@@ -111,7 +115,7 @@ class ServerModel with ChangeNotifier {
       final url = 'https://787.kr/api/custom_app_config';
       final body = jsonEncode({'username': id});
       debugPrint('ServerModel: Sending POST to $url with body: $body');
-      
+
       final response = await _securePost(
         url,
         headers: {'Content-Type': 'application/json'},
@@ -126,32 +130,43 @@ class ServerModel with ChangeNotifier {
         final data = jsonDecode(response.body);
         if (data['code'] == 1) {
           customConfig = CustomConfig.fromJson(data);
-          debugPrint('ServerModel: Custom config applied for ${customConfig?.appName}');
-          
+          debugPrint(
+              'ServerModel: Custom config applied for ${customConfig?.appName}');
+
           // API에서 받은 password가 있으면 실제 영구 비밀번호로 설정
           debugPrint('=== ServerModel Password Setup ===');
-          debugPrint('ServerModel: API password from config = "${customConfig?.password}"');
-          debugPrint('ServerModel: API encryptedPassword = "${customConfig?.encryptedPassword}"');
-          debugPrint('ServerModel: password isEmpty = ${customConfig?.password.isEmpty}');
-          
+          debugPrint(
+              'ServerModel: API password from config = "${customConfig?.password}"');
+          debugPrint(
+              'ServerModel: API encryptedPassword = "${customConfig?.encryptedPassword}"');
+          debugPrint(
+              'ServerModel: password isEmpty = ${customConfig?.password.isEmpty}');
+
           if (customConfig != null && customConfig!.password.isNotEmpty) {
-            debugPrint('ServerModel: Setting permanent password: "${customConfig!.password}"');
-            await bind.mainSetPermanentPassword(password: customConfig!.password);
+            debugPrint(
+                'ServerModel: Setting permanent password: "${customConfig!.password}"');
+            await bind.mainSetPermanentPassword(
+                password: customConfig!.password);
             debugPrint('ServerModel: Permanent password set from API');
-            
+
             // 설정 후 확인
             final savedPw = await bind.mainGetPermanentPassword();
-            debugPrint('ServerModel: Saved permanent password (verify) = "$savedPw"');
-            debugPrint('ServerModel: Password match = ${savedPw == customConfig!.password}');
+            debugPrint(
+                'ServerModel: Saved permanent password (verify) = "$savedPw"');
+            debugPrint(
+                'ServerModel: Password match = ${savedPw == customConfig!.password}');
           } else {
-            debugPrint('ServerModel: No password in config, skipping password setup');
+            debugPrint(
+                'ServerModel: No password in config, skipping password setup');
           }
-          
+
           // 현재 인증 방식 확인
-          final currentVerificationMethod = bind.mainGetOptionSync(key: 'verification-method');
-          debugPrint('ServerModel: Current verification method = "$currentVerificationMethod"');
+          final currentVerificationMethod =
+              bind.mainGetOptionSync(key: 'verification-method');
+          debugPrint(
+              'ServerModel: Current verification method = "$currentVerificationMethod"');
           debugPrint('=== ServerModel Password Setup END ===');
-          
+
           notifyListeners();
         }
       }
@@ -345,7 +360,7 @@ class ServerModel with ChangeNotifier {
     final approveMode = await bind.mainGetOption(key: kOptionApproveMode);
     final numericOneTimePassword =
         await mainGetBoolOption(kOptionAllowNumericOneTimePassword);
-    
+
     if (_approveMode != approveMode) {
       _approveMode = approveMode;
       update = true;
@@ -666,19 +681,27 @@ class ServerModel with ChangeNotifier {
       // 포터블 모드 여부 확인 (custom-agentid가 설정되어 있으면 포터블 모드)
       final agentId = bind.mainGetOptionSync(key: 'custom-agentid');
       final customId = bind.mainGetOptionSync(key: 'custom-id');
-      
+
       if (agentId.isEmpty) {
-        debugPrint('ServerModel: Not portable mode (no agentid), skip API call');
+        debugPrint(
+            'ServerModel: Not portable mode (no agentid), skip API call');
         return;
       }
-      
+
       final userId = customId.isNotEmpty ? customId : 'admin';
-      final url = 'https://787.kr/api/agentclose/$userId/$agentId';
-      
-      debugPrint('ServerModel: Client connected in portable mode! Calling agentclose API: $url');
-      
-      final response = await _secureGet(url, timeout: const Duration(seconds: 5));
-      debugPrint('ServerModel: agentclose response: ${response.statusCode} - ${response.body}');
+      final mdeskId = serverId.text.replaceAll(' ', '');
+      final query = mdeskId.isNotEmpty && !mdeskId.contains('...')
+          ? '?mdeskid=${Uri.encodeComponent(mdeskId)}'
+          : '';
+      final url = 'https://787.kr/api/agentclose/$userId/$agentId$query';
+
+      debugPrint(
+          'ServerModel: Client connected in portable mode! Calling agentclose API: $url');
+
+      final response =
+          await _secureGet(url, timeout: const Duration(seconds: 5));
+      debugPrint(
+          'ServerModel: agentclose response: ${response.statusCode} - ${response.body}');
     } catch (e) {
       debugPrint('ServerModel: agentclose API error: $e');
     }
@@ -707,12 +730,12 @@ class ServerModel with ChangeNotifier {
   void showLoginDialog(Client client) {
     showClientDialog(
       client,
-      client.isFileTransfer 
-          ? "Transfer file" 
+      client.isFileTransfer
+          ? "Transfer file"
           : client.isViewCamera
               ? "View camera"
-              : client.isTerminal 
-                  ? "Terminal" 
+              : client.isTerminal
+                  ? "Terminal"
                   : "Share screen",
       'Do you accept?',
       'android_new_connection_tip',

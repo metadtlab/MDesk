@@ -23,11 +23,7 @@ use hbb_common::{
     },
 };
 #[cfg(target_os = "windows")]
-use hbb_common::{
-    config::keys::*,
-    tokio::sync::Mutex as TokioMutex,
-    ResultType,
-};
+use hbb_common::{config::keys::*, tokio::sync::Mutex as TokioMutex, ResultType};
 use serde_derive::Serialize;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 use std::iter::FromIterator;
@@ -36,6 +32,8 @@ use std::sync::Arc;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
+    path::PathBuf,
+    process::Command,
     sync::{
         atomic::{AtomicI64, Ordering},
         RwLock,
@@ -53,6 +51,7 @@ pub struct Client {
     pub port_forward: String,
     pub name: String,
     pub peer_id: String,
+    pub ip: String,
     pub keyboard: bool,
     pub clipboard: bool,
     pub audio: bool,
@@ -136,6 +135,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
         port_forward: String,
         peer_id: String,
         name: String,
+        ip: String,
         authorized: bool,
         keyboard: bool,
         clipboard: bool,
@@ -157,6 +157,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             port_forward,
             name: name.clone(),
             peer_id: peer_id.clone(),
+            ip: ip.clone(),
             keyboard,
             clipboard,
             audio,
@@ -409,9 +410,9 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                         }
                         Ok(Some(data)) => {
                             match data {
-                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, from_switch} => {
+                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, ip, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, from_switch} => {
                                     log::debug!("conn_id: {}", id);
-                                    self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, from_switch, self.tx.clone());
+                                    self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, ip, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, from_switch, self.tx.clone());
                                     self.conn_id = id;
                                     #[cfg(target_os = "windows")]
                                     {
@@ -681,6 +682,7 @@ pub async fn start_listen<T: InvokeUiCM>(
                 port_forward,
                 peer_id,
                 name,
+                ip,
                 authorized,
                 keyboard,
                 clipboard,
@@ -701,6 +703,7 @@ pub async fn start_listen<T: InvokeUiCM>(
                     port_forward,
                     peer_id,
                     name,
+                    ip,
                     authorized,
                     keyboard,
                     clipboard,
@@ -741,6 +744,30 @@ pub async fn start_listen<T: InvokeUiCM>(
 }
 
 #[cfg(not(any(target_os = "ios")))]
+fn open_remote_drop_download_folder(folder: PathBuf) {
+    if !folder.exists() {
+        log::warn!("Remote drop download folder does not exist: {:?}", folder);
+        return;
+    }
+    std::thread::spawn(move || {
+        #[cfg(target_os = "windows")]
+        let result = Command::new("explorer.exe").arg(&folder).spawn();
+        #[cfg(target_os = "macos")]
+        let result = Command::new("open").arg(&folder).spawn();
+        #[cfg(target_os = "linux")]
+        let result = Command::new("xdg-open").arg(&folder).spawn();
+
+        if let Err(err) = result {
+            log::error!(
+                "Failed to open remote drop download folder {:?}: {}",
+                folder,
+                err
+            );
+        }
+    });
+}
+
+#[cfg(not(any(target_os = "ios")))]
 async fn handle_fs(
     fs: ipc::FS,
     write_jobs: &mut Vec<fs::TransferJob>,
@@ -775,6 +802,14 @@ async fn handle_fs(
             remove_file(path, id, file_num, tx).await;
         }
         ipc::FS::CreateDir { path, id } => {
+            let path = match fs::resolve_remote_drop_downloads_path(&path) {
+                Ok(Some(path)) => get_string(&path),
+                Ok(None) => path,
+                Err(err) => {
+                    send_raw(fs::new_error(id, err, -1), tx);
+                    return;
+                }
+            };
             create_dir(path, id, tx).await;
         }
         ipc::FS::NewWrite {
@@ -786,13 +821,22 @@ async fn handle_fs(
             total_size,
             conn_id,
         } => {
+            let is_remote_drop_downloads = fs::is_remote_drop_downloads_path(&path);
+            let path = match fs::resolve_remote_drop_downloads_path(&path) {
+                Ok(Some(path)) => path,
+                Ok(None) => PathBuf::from(&path),
+                Err(err) => {
+                    send_raw(fs::new_error(id, err, file_num), tx);
+                    return;
+                }
+            };
             // cm has no show_hidden context
             // dummy remote, show_hidden, is_remote
             let mut job = fs::TransferJob::new_write(
                 id,
                 fs::JobType::Generic,
                 "".to_string(),
-                fs::DataSource::FilePath(PathBuf::from(&path)),
+                fs::DataSource::FilePath(path),
                 file_num,
                 false,
                 false,
@@ -806,6 +850,10 @@ async fn handle_fs(
                     .collect(),
                 overwrite_detection,
             );
+            if is_remote_drop_downloads {
+                job.set_mtime_to_now(true);
+                job.set_open_folder_on_done(true);
+            }
             job.total_size = total_size;
             job.conn_id = conn_id;
             write_jobs.push(job);
@@ -821,8 +869,12 @@ async fn handle_fs(
         ipc::FS::WriteDone { id, file_num } => {
             if let Some(job) = fs::remove_job(id, write_jobs) {
                 job.modify_time();
+                let folder_to_open = job.folder_to_open_on_done();
                 send_raw(fs::new_done(id, file_num), tx);
                 tx_log.map(|tx| tx.send(serialize_transfer_job(&job, true, false, "")));
+                if let Some(folder) = folder_to_open {
+                    open_remote_drop_download_folder(folder);
+                }
             }
         }
         ipc::FS::WriteError { id, file_num, err } => {

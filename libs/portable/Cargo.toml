@@ -1,6 +1,6 @@
 [package]
 name = "rustdesk-portable-packer"
-version = "1.4.26"
+version = "1.4.45"
 edition = "2021"
 description = "MDesk Remote Desktop"
 

@@ -95,10 +95,26 @@ class _DesktopTabPageState extends State<DesktopTabPage> {
 
   @override
   Widget build(BuildContext context) {
-    final tabWidget = Container(
-        child: Scaffold(
-            backgroundColor: Theme.of(context).colorScheme.background,
-            body: DesktopTab(
+    // 배경 이미지는 여기서 한 번만 그려 탭바·본문 패턴이 어긋나지 않게 함
+    final tabWidget = Scaffold(
+      backgroundColor: Colors.transparent,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          Positioned.fill(
+            child: Container(
+              decoration: BoxDecoration(
+                color: Theme.of(context).scaffoldBackgroundColor,
+                image: const DecorationImage(
+                  image: AssetImage('assets/NTp3h.jpg'),
+                  fit: BoxFit.cover,
+                  alignment: Alignment.center,
+                ),
+              ),
+            ),
+          ),
+          Positioned.fill(
+            child: DesktopTab(
               controller: tabController,
               tail: Offstage(
                 offstage: bind.isIncomingOnly() || bind.isDisableSettings(),
@@ -109,7 +125,11 @@ class _DesktopTabPageState extends State<DesktopTabPage> {
                   isClose: false,
                 ),
               ),
-            )));
+            ),
+          ),
+        ],
+      ),
+    );
     return isMacOS || kUseCompatibleUiMode
         ? tabWidget
         : Obx(

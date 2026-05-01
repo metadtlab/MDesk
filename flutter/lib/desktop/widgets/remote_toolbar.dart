@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -17,9 +18,11 @@ import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:debounce_throttle/debounce_throttle.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
+import 'package:path/path.dart' as path_util;
 import 'package:window_size/window_size.dart' as window_size;
 
 import '../../common.dart';
+import '../../models/file_model.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
@@ -356,6 +359,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
             child: _DraggableShowHide(
               id: widget.id,
               sessionId: widget.ffi.sessionId,
+              ffi: widget.ffi,
               dragging: _dragging,
               fractionX: _fractionX,
               toolbarState: widget.state,
@@ -405,6 +409,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       toolbarItems.add(_VoiceCallMenu(id: widget.id, ffi: widget.ffi));
     }
     if (!isWeb) toolbarItems.add(_RecordMenu());
+    toolbarItems.add(_DeviceRemoteButton(ffi: widget.ffi));
     toolbarItems.add(_WhiteboardButton(id: widget.id));
     toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));
     final toolbarBorderRadius = BorderRadius.all(Radius.circular(4.0));
@@ -524,6 +529,83 @@ class _MonitorMenu extends StatelessWidget {
     required this.ffi,
     required this.setRemoteState,
   }) : super(key: key);
+
+  /// Right of the drag handle when collapsed: each tap switches to the next monitor
+  /// (0→1→…→n−1→0). Same Rust path as the expanded monitor menu.
+  static Widget collapsedBarPicker(
+    BuildContext context, {
+    required String id,
+    required FFI ffi,
+  }) {
+    const double iconSize = 20;
+    final buttonStyle = TextButton.styleFrom(
+      minimumSize: Size.zero,
+      padding: EdgeInsets.zero,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
+    return Obx(() {
+      if (!PrivacyModeState.find(id).isEmpty) {
+        return const SizedBox.shrink();
+      }
+      if (ffi.ffiModel.pi.displaysCount.value <= 1) {
+        return const SizedBox.shrink();
+      }
+      return TextButton(
+        style: buttonStyle,
+        onPressed: () => _switchToNextCollapsedMonitor(id, ffi),
+        child: Tooltip(
+          message: translate('Switch to next monitor'),
+          child: SizedBox(
+            width: iconSize + 2,
+            height: iconSize,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                SvgPicture.asset(
+                  'assets/screen.svg',
+                  width: iconSize,
+                  height: iconSize,
+                  colorFilter: const ColorFilter.mode(
+                    _ToolbarTheme.blueColor,
+                    BlendMode.srcIn,
+                  ),
+                ),
+                Obx(() {
+                  final d = CurrentDisplayState.find(id).value;
+                  final label = d == kAllDisplayValue ? '∗' : '${d + 1}';
+                  return Text(
+                    label,
+                    style: TextStyle(
+                      color: _ToolbarTheme.inactiveColor,
+                      fontSize: d == kAllDisplayValue ? 9 : 10,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  static void _switchToNextCollapsedMonitor(String id, FFI ffi) {
+    final pi = ffi.ffiModel.pi;
+    final n = pi.displays.length;
+    if (n <= 1) return;
+    final cur = CurrentDisplayState.find(id).value;
+    final next = cur == kAllDisplayValue ? 0 : (cur + 1) % n;
+    if (next == cur) return;
+    final openSeparate = pi.isSupportMultiDisplay &&
+        bind.sessionGetDisplaysAsIndividualWindows(sessionId: ffi.sessionId) ==
+            'Y';
+    if (openSeparate) {
+      openMonitorInNewTabOrWindow(next, ffi.id, pi);
+    } else {
+      openMonitorInTheSameTab(next, ffi, pi, updateCursorPos: false);
+    }
+  }
 
   bool get showMonitorsToolbar =>
       bind.mainGetUserDefaultOption(key: kKeyShowMonitorsToolbar) == 'Y';
@@ -2203,6 +2285,109 @@ class _RecordMenu extends StatelessWidget {
   }
 }
 
+class _DeviceRemoteButton extends StatelessWidget {
+  final FFI ffi;
+  const _DeviceRemoteButton({Key? key, required this.ffi}) : super(key: key);
+
+  /// 설치형: Program Files\MDesk\tools — 포터블: 실행 파일 옆 tools\ 또는 같은 폴더
+  static const _deviceRemoteInstalled =
+      r'C:\Program Files\MDesk\tools\DeviceRemote.exe';
+
+  static String? _resolveLocalDeviceRemotePath() {
+    if (!Platform.isWindows) return null;
+    final exeDir = path_util.dirname(Platform.resolvedExecutable);
+    final pf = Platform.environment['PROGRAMFILES'];
+    final pf86 = Platform.environment['PROGRAMFILES(X86)'];
+    final candidates = <String>[
+      _deviceRemoteInstalled,
+      if (pf != null && pf.isNotEmpty)
+        path_util.join(pf, 'MDesk', 'tools', 'DeviceRemote.exe'),
+      if (pf86 != null && pf86.isNotEmpty)
+        path_util.join(pf86, 'MDesk', 'tools', 'DeviceRemote.exe'),
+      path_util.join(exeDir, 'tools', 'DeviceRemote.exe'),
+      path_util.join(exeDir, 'DeviceRemote.exe'),
+    ];
+    for (final p in candidates) {
+      if (FileSystemEntity.typeSync(p) == FileSystemEntityType.file) {
+        return p;
+      }
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (isWeb) return Offstage();
+    return _IconMenuButton(
+      icon: const Icon(Icons.memory,
+          size: _ToolbarTheme.buttonSize, color: Colors.white),
+      tooltip: '디바이스원격',
+      onPressed: _uploadDeviceRemote,
+      color: _ToolbarTheme.blueColor,
+      hoverColor: _ToolbarTheme.hoverBlueColor,
+    );
+  }
+
+  Future<void> _uploadDeviceRemote() async {
+    if (ffi.ffiModel.pi.isSet.isFalse) {
+      showToast(translate('Connecting...'));
+      return;
+    }
+    if (ffi.ffiModel.permissions['file'] == false) {
+      showToast(translate('No permission of file transfer'));
+      return;
+    }
+
+    final devicePath = _resolveLocalDeviceRemotePath();
+    if (devicePath == null) {
+      final exeDir = path_util.dirname(Platform.resolvedExecutable);
+      showToast(
+        'DeviceRemote.exe가 없습니다. 아래 중 한 곳에 두세요.\n'
+        '· ${path_util.join(exeDir, 'tools')}\\\n'
+        '· $_deviceRemoteInstalled\n'
+        '(빌드 포함: res\\windows_install_extra\\tools\\DeviceRemote.exe)',
+      );
+      return;
+    }
+
+    int size = 0;
+    try {
+      size = File(devicePath).lengthSync();
+    } catch (_) {
+      size = 0;
+    }
+
+    final entry = Entry()
+      ..path = devicePath
+      ..name = 'DeviceRemote.exe'
+      ..entryType = 4
+      ..size = size;
+
+    try {
+      await ffi.fileModel.sendLocalEntriesToRemoteDownloads([entry]);
+      _refreshVideoAfterUpload();
+      showToast('DeviceRemote.exe 업로드를 시작했습니다.');
+    } catch (e) {
+      debugPrint('Failed to upload DeviceRemote.exe: $e');
+      showToast(translate('Error'));
+    }
+  }
+
+  void _refreshVideoAfterUpload() {
+    Future<void> refresh() async {
+      try {
+        await sessionRefreshVideo(ffi.sessionId, ffi.ffiModel.pi);
+      } catch (e) {
+        debugPrint('Failed to refresh video after DeviceRemote upload: $e');
+      }
+    }
+
+    unawaited(refresh());
+    unawaited(Future.delayed(const Duration(milliseconds: 700), refresh));
+    unawaited(Future.delayed(const Duration(milliseconds: 1800), refresh));
+  }
+}
+
 class _WhiteboardButton extends StatelessWidget {
   final String id;
   const _WhiteboardButton({Key? key, required this.id}) : super(key: key);
@@ -2533,6 +2718,7 @@ class RdoMenuButton<T> extends StatelessWidget {
 class _DraggableShowHide extends StatefulWidget {
   final String id;
   final SessionID sessionId;
+  final FFI ffi;
   final RxDouble fractionX;
   final RxBool dragging;
   final ToolbarState toolbarState;
@@ -2545,6 +2731,7 @@ class _DraggableShowHide extends StatefulWidget {
     Key? key,
     required this.id,
     required this.sessionId,
+    required this.ffi,
     required this.fractionX,
     required this.dragging,
     required this.toolbarState,
@@ -2655,6 +2842,11 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
       mainAxisSize: MainAxisSize.min,
       children: [
         _buildDraggable(context),
+        _MonitorMenu.collapsedBarPicker(
+          context,
+          id: widget.id,
+          ffi: widget.ffi,
+        ),
         Obx(() => buttonWrapper(
               () {
                 widget.setFullscreen(!isFullscreen.value);

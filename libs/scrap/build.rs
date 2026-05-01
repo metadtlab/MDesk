@@ -55,8 +55,8 @@ fn link_vcpkg(mut path: PathBuf, name: &str) -> PathBuf {
         target = target.replace("x64", "x86");
     }
     println!("cargo:info={}", target);
-    if let Ok(vcpkg_root) = std::env::var("VCPKG_INSTALLED_ROOT") {
-        path = vcpkg_root.into();
+    if let Ok(raw) = std::env::var("VCPKG_INSTALLED_ROOT") {
+        path = PathBuf::from(raw.trim());
     } else {
         path.push("installed");
     }
@@ -129,8 +129,12 @@ fn find_package(name: &str) -> Vec<PathBuf> {
         && std::env::var(no_pkg_config_var_name).as_deref() != Ok("1")
     {
         link_pkg_config(name)
-    } else if let Ok(vcpkg_root) = std::env::var("VCPKG_ROOT") {
-        vec![link_vcpkg(vcpkg_root.into(), name)]
+    } else if let Ok(raw) = std::env::var("VCPKG_ROOT") {
+        let vcpkg_root = PathBuf::from(raw.trim());
+        if vcpkg_root.as_os_str().is_empty() {
+            panic!("VCPKG_ROOT is set but empty after trimming whitespace");
+        }
+        vec![link_vcpkg(vcpkg_root, name)]
     } else {
         // Try using homebrew
         vec![link_homebrew_m1(name)]
@@ -164,6 +168,27 @@ fn generate_bindings(
 
 fn gen_vcpkg_package(package: &str, ffi_header: &str, generated: &str, regex: &str) {
     let includes = find_package(package);
+    if package == "libvpx" {
+        let mut ok = false;
+        for dir in &includes {
+            if dir.join("vpx").join("vp8.h").is_file() {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            panic!(
+                "libvpx headers missing (expected vpx/vp8.h under vcpkg include). \
+                 The install may be incomplete (e.g. vpx.lib present but empty include/vpx). \
+                 Fix (classic vcpkg): cd %VCPKG_ROOT% && vcpkg remove libvpx:x64-windows-static --classic --recurse && vcpkg install libvpx:x64-windows-static --classic\n\
+                 Checked: {:?}",
+                includes
+                    .first()
+                    .map(|p| p.join("vpx"))
+                    .unwrap_or_default()
+            );
+        }
+    }
     let src_dir = env::var_os("CARGO_MANIFEST_DIR").unwrap();
     let src_dir = Path::new(&src_dir);
     let out_dir = env::var_os("OUT_DIR").unwrap();

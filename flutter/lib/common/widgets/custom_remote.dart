@@ -11,26 +11,29 @@ import '../../models/platform_model.dart';
 import 'login.dart';
 import '../../utils/device_register_service.dart';
 
+/// 상담사 추가 버튼·관련 안내 표시. 추후 사용 시 true로 변경.
+const bool _kShowAddCounselorButton = false;
+
 class CustomRemoteView extends StatefulWidget {
   final EdgeInsets? menuPadding;
-  
+
   const CustomRemoteView({Key? key, this.menuPadding}) : super(key: key);
 
   @override
   State<CustomRemoteView> createState() => _CustomRemoteViewState();
 }
 
-class _CustomRemoteViewState extends State<CustomRemoteView> 
+class _CustomRemoteViewState extends State<CustomRemoteView>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   List<Map<String, dynamic>> _counselors = [];
-  List<Map<String, dynamic>> _devices = [];  // 디바이스 목록
+  List<Map<String, dynamic>> _devices = []; // 디바이스 목록
   bool _isLoading = false;
   bool _isFetching = false;
   String _message = '';
   late AnimationController _blinkController;
-  Timer? _autoRefreshTimer;  // 자동 새로고침 타이머
-  bool _isAppFocused = true;  // 앱 포커스 상태
-  
+  Timer? _autoRefreshTimer; // 자동 새로고침 타이머
+  bool _isAppFocused = true; // 앱 포커스 상태
+
   // 인증번호 관련 상태
   String _certCode = '';
   String _certExpireTime = '';
@@ -39,20 +42,20 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);  // 앱 상태 감시 등록
-    
+    WidgetsBinding.instance.addObserver(this); // 앱 상태 감시 등록
+
     // 깜빡임 애니메이션 컨트롤러 설정
     _blinkController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 800),
     )..repeat(reverse: true);
 
-    // 초기 로딩 시 상담원 목록 및 디바이스 목록 조회
+    // 초기 로딩 시 상담사 목록 및 디바이스 목록 조회
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (gFFI.userModel.isLogin) {
         _fetchCounselors(showLoading: true);
         _fetchDevices();
-        _searchCertNo();  // 인증번호 조회
+        _searchCertNo(); // 인증번호 조회
         _startAutoRefresh();
       }
     });
@@ -65,7 +68,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       if (mounted && gFFI.userModel.isLogin && _isAppFocused) {
         _fetchCounselors();
         _fetchDevices();
-        _searchCertNo();  // 인증번호 조회
+        _searchCertNo(); // 인증번호 조회
       }
     });
   }
@@ -75,29 +78,29 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final wasFocused = _isAppFocused;
     _isAppFocused = state == AppLifecycleState.resumed;
-    
+
     // 포커스 복귀 시 즉시 새로고침
     if (!wasFocused && _isAppFocused && mounted && gFFI.userModel.isLogin) {
       _fetchCounselors();
       _fetchDevices();
-      _searchCertNo();  // 인증번호 조회
+      _searchCertNo(); // 인증번호 조회
     }
   }
 
   // 401 응답 처리 (토큰 무효화 - 비밀번호 변경 등)
   Future<void> _handleUnauthorized() async {
     debugPrint('CustomRemote: 401 Unauthorized - Token invalidated');
-    
+
     // 자동 새로고침 중지
     _autoRefreshTimer?.cancel();
-    
+
     // 사용자 로그아웃 처리
     await gFFI.userModel.reset(resetOther: true);
-    
+
     // 사용자에게 알림
     if (mounted) {
       showToast('비밀번호가 변경되어 다시 로그인해주세요');
-      
+
       // 로그인 다이얼로그 표시
       Future.delayed(const Duration(milliseconds: 500), () {
         if (mounted) {
@@ -109,16 +112,16 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);  // 앱 상태 감시 해제
+    WidgetsBinding.instance.removeObserver(this); // 앱 상태 감시 해제
     _autoRefreshTimer?.cancel();
     _blinkController.dispose();
     super.dispose();
   }
 
-  // 상담원 목록 조회
+  // 상담사 목록 조회
   Future<void> _fetchCounselors({bool showLoading = false}) async {
     if (_isFetching) return;
-    
+
     // 초기 로딩 시에만 로딩 인디케이터 표시 (새로고침 시 깜빡임 방지)
     if (showLoading || _counselors.isEmpty) {
       setState(() {
@@ -130,7 +133,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       final username = gFFI.userModel.userName.value;
       final token = bind.mainGetLocalOption(key: 'access_token');
       final url = 'https://787.kr/api/$username/agents';
-      
+
       debugPrint('Fetch Agents URL: $url');
 
       final response = await http.get(
@@ -141,7 +144,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         },
       ).timeout(const Duration(seconds: 10));
 
-      debugPrint('Fetch Agents Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'Fetch Agents Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -153,21 +157,24 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         final responseData = jsonDecode(response.body);
         if (responseData is Map && responseData['code'] == 1) {
           // 'agents' 또는 'data' 필드 지원
-          final List<dynamic> agentList = responseData['agents'] ?? responseData['data'] ?? [];
-          final newCounselors = agentList.map((e) => e is Map<String, dynamic> ? e : {'agent_name': e.toString()}).toList();
-          
-          // 이전 목록과 비교하여 새로 온라인이 된 상담원 찾기
+          final List<dynamic> agentList =
+              responseData['agents'] ?? responseData['data'] ?? [];
+          final newCounselors = agentList
+              .map((e) =>
+                  e is Map<String, dynamic> ? e : {'agent_name': e.toString()})
+              .toList();
+
+          // 이전 목록과 비교하여 새로 온라인이 된 상담사 찾기
           for (var newAgent in newCounselors) {
             final String name = _getCounselorName(newAgent);
             final String mdeskId = _getMdeskId(newAgent);
-            
+
             if (mdeskId.isNotEmpty) {
               // 이전 목록에 없었거나, mdesk_id가 비어있었다면 새로 접속한 것
-              bool wasOnline = _counselors.any((oldAgent) => 
-                _getAgentNum(oldAgent) == _getAgentNum(newAgent) && 
-                _getMdeskId(oldAgent).isNotEmpty
-              );
-              
+              bool wasOnline = _counselors.any((oldAgent) =>
+                  _getAgentNum(oldAgent) == _getAgentNum(newAgent) &&
+                  _getMdeskId(oldAgent).isNotEmpty);
+
               if (!wasOnline && _counselors.isNotEmpty) {
                 // 접속 알림 표시 (짙은 녹색)
                 showToast('$name님이 접속하셨습니다!');
@@ -196,15 +203,15 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     try {
       final userPkid = gFFI.userModel.userPkid.value;
       final token = bind.mainGetLocalOption(key: 'access_token');
-      
+
       if (userPkid.isEmpty) {
         debugPrint('Fetch Devices: userPkid is empty, skipping');
         return;
       }
-      
+
       final apiServer = await bind.mainGetApiServer();
       final url = '$apiServer/api/device/list?user_pkid=$userPkid';
-      
+
       debugPrint('Fetch Devices URL: $url');
 
       final response = await http.get(
@@ -215,7 +222,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         },
       ).timeout(const Duration(seconds: 10));
 
-      debugPrint('Fetch Devices Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'Fetch Devices Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -229,7 +237,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
           final List<dynamic> deviceList = responseData['data'] ?? [];
           setState(() {
             _devices = deviceList
-                .map((e) => e is Map ? Map<String, dynamic>.from(e) : <String, dynamic>{})
+                .map((e) => e is Map
+                    ? Map<String, dynamic>.from(e)
+                    : <String, dynamic>{})
                 .toList();
           });
           debugPrint('Fetch Devices: ${_devices.length} devices loaded');
@@ -248,7 +258,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     }).toList();
   }
 
-  // 상담원 추가
+  // 상담사 추가
   Future<void> _addCounselor() async {
     setState(() {
       _isLoading = true;
@@ -259,7 +269,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       final username = gFFI.userModel.userName.value;
       final token = bind.mainGetLocalOption(key: 'access_token');
       final url = 'https://787.kr/api/$username/addnum';
-      
+
       debugPrint('AddNum Request URL: $url');
 
       final response = await http.get(
@@ -280,7 +290,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
       if (response.statusCode == 200) {
         setState(() {
-          _message = '상담원 추가 완료!';
+          _message = '상담사 추가 완료!';
         });
         // 추가 후 목록 새로고침
         await _fetchCounselors();
@@ -310,28 +320,33 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
     try {
       final username = gFFI.userModel.userName.value;
-      final userPkid = gFFI.userModel.userPkid.value;  // user_pk_id 추가
+      final userPkid = gFFI.userModel.userPkid.value; // user_pk_id 추가
       final mdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
+      final token = bind.mainGetLocalOption(key: 'access_token');
       final url = 'https://admin.787.kr/api/certno/generate';
-      
+
       final body = jsonEncode({
         'customer_id': username,
-        'user_pk_id': userPkid,  // user_pk_id 전달 (서버에서 인증번호 prefix로 사용)
+        'user_pk_id': userPkid, // user_pk_id 전달 (서버에서 인증번호 prefix로 사용)
         'mdesk_id': mdeskId,
       });
-      
+
       debugPrint('CertNo Generate Request URL: $url');
       debugPrint('CertNo Generate Request Body: $body');
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Content-Type': 'application/json',
+              if (token.isNotEmpty) 'Authorization': 'Bearer $token',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 10));
 
-      debugPrint('CertNo Generate Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'CertNo Generate Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -373,43 +388,48 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   // 인증번호 취소 API 호출
   Future<void> _cancelCertNo() async {
     if (_certCode.isEmpty) return;
-    
+
     final certCodeToCancel = _certCode;
-    
+
     // 먼저 UI에서 즉시 제거
     setState(() {
       _certCode = '';
       _certExpireTime = '';
     });
-    
+
     try {
       final username = gFFI.userModel.userName.value;
       final userPkid = gFFI.userModel.userPkid.value;
       final mdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
+      final token = bind.mainGetLocalOption(key: 'access_token');
       final url = 'https://admin.787.kr/api/certno/cancel';
-      
+
       final body = jsonEncode({
         'customer_id': username,
         'user_pk_id': userPkid,
         'mdesk_id': mdeskId,
         'cert_code': certCodeToCancel,
       });
-      
+
       debugPrint('CertNo Cancel Request URL: $url');
       debugPrint('CertNo Cancel Request Body: $body');
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Content-Type': 'application/json',
+              if (token.isNotEmpty) 'Authorization': 'Bearer $token',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 10));
 
-      debugPrint('CertNo Cancel Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'CertNo Cancel Response: ${response.statusCode} - ${response.body}');
 
       final data = jsonDecode(response.body);
-      
+
       switch (response.statusCode) {
         case 200:
           if (data['success'] == true) {
@@ -445,29 +465,34 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     try {
       final username = gFFI.userModel.userName.value;
       final mdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
-      
+      final token = bind.mainGetLocalOption(key: 'access_token');
+
       if (username.isEmpty || mdeskId.isEmpty || mdeskId.contains('...')) {
         return;
       }
-      
+
       final url = 'https://admin.787.kr/api/certno/search';
       final body = jsonEncode({
         'customer_id': username,
         'mdesk_id': mdeskId,
       });
-      
+
       debugPrint('CertNo Search Request URL: $url');
       debugPrint('CertNo Search Request Body: $body');
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Content-Type': 'application/json',
+              if (token.isNotEmpty) 'Authorization': 'Bearer $token',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 10));
 
-      debugPrint('CertNo Search Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'CertNo Search Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -499,7 +524,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     }
   }
 
-  // 상담원 삭제
+  // 상담사 삭제
   Future<void> _deleteCounselor(int agentNum) async {
     setState(() {
       _isLoading = true;
@@ -510,7 +535,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       final username = gFFI.userModel.userName.value;
       final token = bind.mainGetLocalOption(key: 'access_token');
       final url = 'https://787.kr/api/$username/delnum/$agentNum';
-      
+
       debugPrint('DeleteNum Request URL: $url');
 
       final response = await http.delete(
@@ -521,7 +546,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         },
       ).timeout(const Duration(seconds: 10));
 
-      debugPrint('DeleteNum Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'DeleteNum Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -533,7 +559,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         // 200: 삭제 성공, 404: 이미 삭제되었거나 존재하지 않음 (조용히 처리)
         if (response.statusCode == 200) {
           setState(() {
-            _message = '상담원 삭제 완료!';
+            _message = '상담사 삭제 완료!';
           });
         }
         // 삭제 후 목록 새로고침
@@ -557,7 +583,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
   String _getCounselorName(Map<String, dynamic> agent) {
     // agent_name 필드 사용
-    return agent['agent_name']?.toString() ?? '상담원';
+    return agent['agent_name']?.toString() ?? '상담사';
   }
 
   int _getAgentNum(Map<String, dynamic> agent) {
@@ -572,9 +598,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   Future<void> _showRegisterDeviceDialog() async {
     final remoteIdController = TextEditingController();
     final aliasController = TextEditingController();
-    
+
     // 별칭은 서버에서만 관리하므로 로컬 저장/불러오기 없음
-    
+
     final result = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) {
@@ -659,13 +685,13 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       final username = gFFI.userModel.userName.value;
       final userPkid = gFFI.userModel.userPkid.value;
       final token = bind.mainGetLocalOption(key: 'access_token');
-      
+
       // 시스템 정보 수집
       String hostname = '';
       String platform = '';
       String uuid = '';
       String version = '';
-      
+
       try {
         if (!isWeb) {
           hostname = Platform.localHostname;
@@ -683,13 +709,13 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         } else {
           platform = 'Web';
         }
-        
+
         uuid = await bind.mainGetUuid();
         version = await bind.mainGetVersion();
       } catch (e) {
         debugPrint('Error getting system info: $e');
       }
-      
+
       // agent_id 가져오기 (있는 경우)
       String? agentId;
       try {
@@ -699,10 +725,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       } catch (e) {
         debugPrint('Error getting agent_id: $e');
       }
-      
+
       // HTTP 직접 호출 방식 사용
       final url = 'https://admin.787.kr/api/device/register';
-      
+
       // 요청 본문 구성 - alias는 사용자가 입력한 값 그대로 사용
       final bodyMap = <String, dynamic>{
         'user_id': username,
@@ -714,28 +740,31 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         'uuid': uuid,
         'version': version,
       };
-      
+
       // agent_id가 있으면 추가
       if (agentId != null && agentId.isNotEmpty) {
         bodyMap['agent_id'] = agentId;
       }
-      
+
       final body = jsonEncode(bodyMap);
 
       debugPrint('Register Device URL: $url');
       debugPrint('Register Device Body: $body');
       debugPrint('Register Device - alias: $alias');
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $token',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 10));
 
-      debugPrint('Register Device Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'Register Device Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -807,7 +836,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       final userPkid = gFFI.userModel.userPkid.value;
       final token = bind.mainGetLocalOption(key: 'access_token');
       final url = 'https://admin.787.kr/api/device/unregister';
-      
+
       final body = jsonEncode({
         'user_pkid': userPkid,
         'remote_id': remoteId,
@@ -815,16 +844,19 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
       debugPrint('Unregister Device URL: $url');
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $token',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 10));
 
-      debugPrint('Unregister Device Response: ${response.statusCode} - ${response.body}');
+      debugPrint(
+          'Unregister Device Response: ${response.statusCode} - ${response.body}');
 
       // 401 응답 처리 (토큰 무효화)
       if (response.statusCode == 401) {
@@ -883,7 +915,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                 translate('Login to access custom remote connections'),
                 style: TextStyle(
                   fontSize: 14,
-                  color: Theme.of(context).textTheme.bodyMedium?.color?.withOpacity(0.7),
+                  color: Theme.of(context)
+                      .textTheme
+                      .bodyMedium
+                      ?.color
+                      ?.withOpacity(0.7),
                 ),
               ),
               const SizedBox(height: 24),
@@ -918,11 +954,15 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               ),
               const SizedBox(height: 8),
               Text(
-                '상담원 관리 및 다이렉트 연결 기능을 사용하시려면\n멤버십을 업그레이드 해주세요.',
+                '상담사 관리 및 다이렉트 연결 기능을 사용하시려면\n멤버십을 업그레이드 해주세요.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,
-                  color: Theme.of(context).textTheme.bodyMedium?.color?.withOpacity(0.7),
+                  color: Theme.of(context)
+                      .textTheme
+                      .bodyMedium
+                      ?.color
+                      ?.withOpacity(0.7),
                 ),
               ),
             ],
@@ -930,8 +970,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         );
       }
 
-      // 로그인된 상태 - 상담원 관리 UI
-      // agent_num == 0 인 상담원 찾기 (바로 원격 연결용)
+      // 로그인된 상태 - 상담사 관리 UI
+      // agent_num == 0 인 상담사 찾기 (바로 원격 연결용)
       Map<String, dynamic>? directAgent;
       for (var agent in _counselors) {
         if (_getAgentNum(agent) == 0 && _getMdeskId(agent).isNotEmpty) {
@@ -948,7 +988,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
             // 인증번호 표시 (생성된 경우에만)
             if (_certCode.isNotEmpty) ...[
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 decoration: BoxDecoration(
                   gradient: LinearGradient(
                     colors: [
@@ -984,7 +1025,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                     const SizedBox(width: 12),
                     IconButton(
                       onPressed: _cancelCertNo,
-                      icon: const Icon(Icons.close, color: Colors.white, size: 18),
+                      icon: const Icon(Icons.close,
+                          color: Colors.white, size: 18),
                       padding: EdgeInsets.zero,
                       constraints: const BoxConstraints(),
                       tooltip: '인증번호 취소',
@@ -994,12 +1036,12 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               ),
               const SizedBox(height: 12),
             ],
-            // agent_num == 0인 상담원이 있으면 바로 원격 버튼 표시
+            // agent_num == 0인 상담사이 있으면 바로 원격 버튼 표시
             if (directAgent != null) ...[
               _buildDirectRemoteButton(directAgent),
               const SizedBox(height: 12),
             ],
-            // 상담원 목록 (가로로 쌓임) - 상단
+            // 상담사 목록 (가로로 쌓임) - 상단
             Expanded(
               child: _isFetching
                   ? const Center(child: CircularProgressIndicator())
@@ -1008,13 +1050,6 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                           child: Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              Text(
-                                '상담원 추가 버튼을 눌러주세요',
-                                style: TextStyle(
-                                  color: Theme.of(context).disabledColor,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
                               TextButton.icon(
                                 onPressed: _fetchCounselors,
                                 icon: const Icon(Icons.refresh, size: 16),
@@ -1030,7 +1065,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                             child: Wrap(
                               spacing: 8,
                               runSpacing: 8,
-                              children: _counselors.where((agent) => _getAgentNum(agent) != 0).map((agent) {
+                              children: _counselors
+                                  .where((agent) => _getAgentNum(agent) != 0)
+                                  .map((agent) {
                                 final num = _getAgentNum(agent);
                                 final name = _getCounselorName(agent);
                                 final mdeskId = _getMdeskId(agent);
@@ -1039,35 +1076,44 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                 return InkWell(
                                   onTap: () {
                                     if (mdeskId.isNotEmpty) {
-                                      final mdeskIdClean = mdeskId.replaceAll(' ', '');
+                                      final mdeskIdClean =
+                                          mdeskId.replaceAll(' ', '');
                                       try {
                                         // 1. IDTextEditingController 찾아서 업데이트
-                                        if (Get.isRegistered<IDTextEditingController>()) {
-                                          Get.find<IDTextEditingController>().id = mdeskIdClean;
+                                        if (Get.isRegistered<
+                                            IDTextEditingController>()) {
+                                          Get.find<IDTextEditingController>()
+                                              .id = mdeskIdClean;
                                         }
 
                                         // 2. 일반 TextEditingController 찾아서 업데이트 (화면 표시용)
                                         // ConnectionPage에서 Get.put<TextEditingController>(_idEditingController)로 등록됨
-                                        if (Get.isRegistered<TextEditingController>()) {
-                                          final controller = Get.find<TextEditingController>();
-                                          controller.text = formatID(mdeskIdClean);
-                                          
+                                        if (Get.isRegistered<
+                                            TextEditingController>()) {
+                                          final controller =
+                                              Get.find<TextEditingController>();
+                                          controller.text =
+                                              formatID(mdeskIdClean);
+
                                           // 커서를 끝으로 이동
-                                          controller.selection = TextSelection.fromPosition(
-                                            TextPosition(offset: controller.text.length),
+                                          controller.selection =
+                                              TextSelection.fromPosition(
+                                            TextPosition(
+                                                offset: controller.text.length),
                                           );
                                         }
-                                        
+
                                         showToast('ID가 입력되었습니다: $mdeskIdClean');
 
                                         // 3. 즉시 연결 실행
-                                        debugPrint('CustomRemote: Starting direct connection to $mdeskIdClean');
+                                        debugPrint(
+                                            'CustomRemote: Starting direct connection to $mdeskIdClean');
                                         connect(context, mdeskIdClean);
                                       } catch (e) {
                                         debugPrint('Error filling ID: $e');
                                       }
                                     } else {
-                                      showToast('해당 상담원은 오프라인입니다.');
+                                      showToast('해당 상담사은 오프라인입니다.');
                                     }
                                   },
                                   borderRadius: BorderRadius.circular(16),
@@ -1075,10 +1121,14 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                     avatar: Stack(
                                       children: [
                                         CircleAvatar(
-                                          backgroundColor: Theme.of(context).colorScheme.primary,
+                                          backgroundColor: Theme.of(context)
+                                              .colorScheme
+                                              .primary,
                                           child: Text(
                                             '$num',
-                                            style: const TextStyle(color: Colors.white, fontSize: 12),
+                                            style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 12),
                                           ),
                                         ),
                                         if (isOnline)
@@ -1091,12 +1141,17 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                                 width: 14,
                                                 height: 14,
                                                 decoration: BoxDecoration(
-                                                  color: const Color(0xFF00E676),
+                                                  color:
+                                                      const Color(0xFF00E676),
                                                   shape: BoxShape.circle,
-                                                  border: Border.all(color: Colors.white, width: 2),
+                                                  border: Border.all(
+                                                      color: Colors.white,
+                                                      width: 2),
                                                   boxShadow: [
                                                     BoxShadow(
-                                                      color: const Color(0xFF00E676).withOpacity(0.9),
+                                                      color: const Color(
+                                                              0xFF00E676)
+                                                          .withOpacity(0.9),
                                                       blurRadius: 12,
                                                       spreadRadius: 3,
                                                     )
@@ -1108,8 +1163,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                       ],
                                     ),
                                     label: Text(name),
-                                    deleteIcon: const Icon(Icons.close, size: 16),
-                                    onDeleted: _isLoading ? null : () => _deleteCounselor(num),
+                                    deleteIcon:
+                                        const Icon(Icons.close, size: 16),
+                                    onDeleted: _isLoading
+                                        ? null
+                                        : () => _deleteCounselor(num),
                                   ),
                                 );
                               }).toList(),
@@ -1119,7 +1177,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
             ),
 
             const Divider(),
-            
+
             // 디바이스 목록 (agent_id별로 그룹화하여 표시)
             if (_devices.isNotEmpty) ...[
               const SizedBox(height: 8),
@@ -1127,29 +1185,28 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                 height: 60,
                 child: ListView(
                   scrollDirection: Axis.horizontal,
-                  children: _devices
-                      .where((device) {
-                        final agentId = device['agent_id']?.toString() ?? '';
-                        return agentId.isNotEmpty && agentId != '0';
-                      })
-                      .map((device) {
+                  children: _devices.where((device) {
+                    final agentId = device['agent_id']?.toString() ?? '';
+                    return agentId.isNotEmpty && agentId != '0';
+                  }).map((device) {
                     final remoteId = device['remote_id']?.toString() ?? '';
                     final agentId = device['agent_id']?.toString() ?? '';
                     final hostname = device['hostname']?.toString() ?? '';
                     final isActive = device['is_active'] == true;
-                    
+
                     final deviceAlias = device['alias']?.toString() ?? '';
-                    
+
                     return Container(
                       margin: const EdgeInsets.only(right: 8),
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
                       decoration: BoxDecoration(
-                        color: isActive 
+                        color: isActive
                             ? const Color(0xFF1B5E20).withOpacity(0.15)
                             : Theme.of(context).cardColor,
                         borderRadius: BorderRadius.circular(8),
                         border: Border.all(
-                          color: isActive 
+                          color: isActive
                               ? const Color(0xFF4CAF50)
                               : Theme.of(context).dividerColor,
                         ),
@@ -1169,15 +1226,19 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 4, vertical: 1),
                                   decoration: BoxDecoration(
-                                    color: Theme.of(context).colorScheme.primary,
+                                    color:
+                                        Theme.of(context).colorScheme.primary,
                                     borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(
-                                    deviceAlias.isNotEmpty 
-                                        ? deviceAlias 
-                                        : (agentId.isNotEmpty ? '상담원$agentId' : '-'),
+                                    deviceAlias.isNotEmpty
+                                        ? deviceAlias
+                                        : (agentId.isNotEmpty
+                                            ? '상담사$agentId'
+                                            : '-'),
                                     style: const TextStyle(
                                       color: Colors.white,
                                       fontSize: 9,
@@ -1203,7 +1264,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                               style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.w600,
-                                color: Theme.of(context).textTheme.bodyLarge?.color,
+                                color: Theme.of(context)
+                                    .textTheme
+                                    .bodyLarge
+                                    ?.color,
                               ),
                             ),
                             if (hostname.isNotEmpty)
@@ -1211,7 +1275,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                 hostname,
                                 style: TextStyle(
                                   fontSize: 9,
-                                  color: Theme.of(context).textTheme.bodySmall?.color,
+                                  color: Theme.of(context)
+                                      .textTheme
+                                      .bodySmall
+                                      ?.color,
                                 ),
                                 overflow: TextOverflow.ellipsis,
                               ),
@@ -1225,32 +1292,35 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               const SizedBox(height: 8),
             ],
 
-            // 하단: 상담원 추가 버튼 + 인증번호원격 버튼 + 새로고침 + 메시지
+            // 하단: (옵션) 상담사 추가 + 인증번호원격 + 새로고침 + 메시지
             Row(
               children: [
-                Expanded(
-                  flex: 1,
-                  child: ElevatedButton.icon(
-                    onPressed: _isLoading ? null : _addCounselor,
-                    icon: _isLoading
-                        ? const SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.person_add, size: 18),
-                    label: Text(
-                      _isLoading ? '추가 중...' : '상담원 추가',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                if (_kShowAddCounselorButton) ...[
+                  Expanded(
+                    flex: 1,
+                    child: ElevatedButton.icon(
+                      onPressed: _isLoading ? null : _addCounselor,
+                      icon: _isLoading
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.person_add, size: 18),
+                      label: Text(
+                        _isLoading ? '추가 중...' : '상담사 추가',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 8),
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 6),
+                  const SizedBox(width: 6),
+                ],
                 Expanded(
                   flex: 1,
                   child: ElevatedButton.icon(
@@ -1271,17 +1341,20 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFFFF6B35),
                       foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 8),
                     ),
                   ),
                 ),
                 const SizedBox(width: 4),
                 IconButton(
-                  onPressed: _isFetching ? null : () async {
-                    await _fetchCounselors();
-                    await _fetchDevices();
-                    await _searchCertNo();  // 인증번호 조회
-                  },
+                  onPressed: _isFetching
+                      ? null
+                      : () async {
+                          await _fetchCounselors();
+                          await _fetchDevices();
+                          await _searchCertNo(); // 인증번호 조회
+                        },
                   icon: const Icon(Icons.refresh),
                   tooltip: '새로고침',
                 ),
@@ -1291,9 +1364,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                     child: Text(
                       _message,
                       style: TextStyle(
-                        color: _message.contains('완료') || _message.contains('성공') 
-                            ? Colors.green 
-                            : Colors.red,
+                        color:
+                            _message.contains('완료') || _message.contains('성공')
+                                ? Colors.green
+                                : Colors.red,
                         fontWeight: FontWeight.w500,
                       ),
                       overflow: TextOverflow.ellipsis,
@@ -1308,19 +1382,21 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     });
   }
 
-  // agent_num == 0인 상담원을 위한 바로 원격 버튼
+  // agent_num == 0인 상담사을 위한 바로 원격 버튼
   Widget _buildDirectRemoteButton(Map<String, dynamic> agent) {
     final mdeskId = _getMdeskId(agent);
     final mdeskIdClean = mdeskId.replaceAll(' ', '');
-    
+
     return AnimatedBuilder(
       animation: _blinkController,
       builder: (context, child) {
         // 애니메이션 값으로 테두리 색상 및 glow 효과 조절 (0.0 ~ 1.0 범위 유지)
-        final glowOpacity = (0.3 + (_blinkController.value * 0.4)).clamp(0.0, 1.0);
-        final borderOpacity = (0.5 + (_blinkController.value * 0.3)).clamp(0.0, 1.0);
+        final glowOpacity =
+            (0.3 + (_blinkController.value * 0.4)).clamp(0.0, 1.0);
+        final borderOpacity =
+            (0.5 + (_blinkController.value * 0.3)).clamp(0.0, 1.0);
         final borderWidth = 2.0 + (_blinkController.value * 2.0);
-        
+
         return Container(
           width: double.infinity,
           decoration: BoxDecoration(

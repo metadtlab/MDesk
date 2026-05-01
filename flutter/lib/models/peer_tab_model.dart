@@ -24,6 +24,15 @@ class PeerTabModel with ChangeNotifier {
   int get currentTab => _currentTab;
   int _currentTab = 0; // index in tabNames
   static const int maxTabCount = 7;
+  /// Tree View 탭(상단 스위치) 아이콘 PNG.
+  static const String assetTabTreeView = 'assets/peer_tab_tree_view.png';
+  /// Discovered(발견됨) 탭(상단 스위치) 아이콘 PNG.
+  static const String assetTabDiscovered = 'assets/peer_tab_discovered.png';
+  /// 사용자 정의 원격 탭(상단 스위치) 아이콘 PNG.
+  static const String assetTabCustomRemote = 'assets/peer_tab_custom_remote.png';
+  /// `tabNames` 마지막 항목(사용자 정의 원격). `PeerTabIndex`는 6개뿐이라 별도 인덱스로 둠.
+  static const int tabIndexCustomRemote = maxTabCount - 1;
+
   static const List<String> tabNames = [
     'Tree View', // 팀뷰어 스타일 트리뷰
     'Recent sessions',
@@ -41,6 +50,16 @@ class PeerTabModel with ChangeNotifier {
     IconFont.addressBook,
     IconFont.deviceGroupFill,
     Icons.settings_remote, // 사용자 정의 원격 아이콘
+  ];
+  /// 데스크톱 탭 스위치용 이모지(시인성). icons 와 동일 인덱스.
+  static const List<String> tabEmojis = [
+    '🌳', // Tree View
+    '⏱️', // Recent sessions
+    '⭐', // Favorites
+    '🧭', // Discovered
+    '📇', // Address book
+    '🖥️', // Accessible devices
+    '📡', // Custom Remote
   ];
   List<bool> get isEnabled => [
         true, // Tree View - 항상 활성화
@@ -148,6 +167,13 @@ class PeerTabModel with ChangeNotifier {
       return icons[index];
     }
     return Icons.help;
+  }
+
+  String tabEmoji(int index) {
+    if (index >= 0 && index < tabEmojis.length) {
+      return tabEmojis[index];
+    }
+    return '❔';
   }
 
   setMultiSelectionMode(bool mode) {

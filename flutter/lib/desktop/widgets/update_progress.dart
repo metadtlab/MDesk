@@ -9,6 +9,44 @@ import 'package:url_launcher/url_launcher.dart';
 
 final _isExtracting = false.obs;
 
+/// GitHub 릴리스 페이지 URL이 아닌, 설치 파일의 직접 URL(예: `.exe`)을 앱 내에서 받은 뒤 설치를 진행합니다.
+/// [openInBrowserOnErrorUrl]: 다운로드 실패 시 브라우저로 열 주소(미지정이면 [downloadUrl]).
+void handleDirectDownloadUpdate(String downloadUrl,
+    {String? openInBrowserOnErrorUrl}) {
+  _isExtracting.value = false;
+  final fallbackUrl = openInBrowserOnErrorUrl ?? downloadUrl;
+  final SimpleWrapper downloadId = SimpleWrapper('');
+  final SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
+  gFFI.dialogManager.dismissAll();
+  gFFI.dialogManager.show((setState, close, context) {
+    return CustomAlertDialog(
+        title: Obx(() => Text(translate(_isExtracting.isTrue
+            ? 'Preparing for installation ...'
+            : 'Downloading {$appName}'))),
+        content: UpdateProgress(fallbackUrl, downloadUrl, downloadId, onCanceled)
+            .marginSymmetric(horizontal: 8)
+            .paddingOnly(top: 12),
+        actions: [
+          if (_isExtracting.isFalse)
+            dialogButton(translate('Cancel'), onPressed: () async {
+              onCanceled.value();
+              await bind.mainSetCommon(
+                  key: 'cancel-downloader', value: downloadId.value);
+              for (int i = 0; i < 10; i++) {
+                await Future.delayed(const Duration(milliseconds: 300));
+                final isCanceled = 'error:Downloader not found' ==
+                    await bind.mainGetCommon(
+                        key: 'download-data-${downloadId.value}');
+                if (isCanceled) {
+                  break;
+                }
+              }
+              close();
+            }, isOutline: true),
+        ]);
+  });
+}
+
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
   String downloadUrl = releasePageUrl.replaceAll('tag', 'download');

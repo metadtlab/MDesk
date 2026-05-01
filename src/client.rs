@@ -2687,6 +2687,7 @@ impl LoginConfigHandler {
             option: self.get_option_message(true).into(),
             session_id: self.session_id,
             version: crate::VERSION.to_string(),
+            client_local_ip: crate::common::client_local_ip_for_login_request(),
             os_login: Some(OSLogin {
                 username: os_username,
                 password: os_password,

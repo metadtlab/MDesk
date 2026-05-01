@@ -1,4 +1,4 @@
-use super::{Cursor, CustomEvent, DrawStroke, DrawPoint};
+use super::{Cursor, CustomEvent, DrawPoint, DrawStroke};
 use crate::{
     ipc::{self, Data},
     CHILD_PROCESS,
@@ -45,9 +45,18 @@ pub fn get_key_draw(conn_id: i32) -> String {
 }
 
 /// 드로잉 스트로크 전송
-pub fn send_draw_stroke(conn_id: i32, points: Vec<(f32, f32)>, argb: u32, stroke_width: f32, tool: u8) {
+pub fn send_draw_stroke(
+    conn_id: i32,
+    points: Vec<(f32, f32)>,
+    argb: u32,
+    stroke_width: f32,
+    tool: u8,
+) {
     let k = get_key_draw(conn_id);
-    let draw_points: Vec<DrawPoint> = points.iter().map(|(x, y)| DrawPoint { x: *x, y: *y }).collect();
+    let draw_points: Vec<DrawPoint> = points
+        .iter()
+        .map(|(x, y)| DrawPoint { x: *x, y: *y })
+        .collect();
     let stroke = DrawStroke {
         points: draw_points,
         argb,

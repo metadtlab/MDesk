@@ -1770,47 +1770,135 @@ pub fn try_add_firewall_rule_on_first_run() {
 
     // 기존 방화벽 규칙 삭제 (이미 존재할 수 있으므로)
     let _ = std::process::Command::new("netsh")
-        .args(&["advfirewall", "firewall", "delete", "rule", "name", &rule_name])
+        .args(&[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            "name",
+            &rule_name,
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     // TCP와 UDP 규칙을 각각 명시적으로 추가
     // 아웃바운드 규칙 (TCP, UDP)
     let output_out_tcp = std::process::Command::new("netsh")
-        .args(&["advfirewall", "firewall", "add", "rule", "name", &rule_name, "dir", "out", "action", "allow", "program", &exe, "protocol", "TCP", "enable", "yes", "profile", "any"])
+        .args(&[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name",
+            &rule_name,
+            "dir",
+            "out",
+            "action",
+            "allow",
+            "program",
+            &exe,
+            "protocol",
+            "TCP",
+            "enable",
+            "yes",
+            "profile",
+            "any",
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     let output_out_udp = std::process::Command::new("netsh")
-        .args(&["advfirewall", "firewall", "add", "rule", "name", &rule_name, "dir", "out", "action", "allow", "program", &exe, "protocol", "UDP", "enable", "yes", "profile", "any"])
+        .args(&[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name",
+            &rule_name,
+            "dir",
+            "out",
+            "action",
+            "allow",
+            "program",
+            &exe,
+            "protocol",
+            "UDP",
+            "enable",
+            "yes",
+            "profile",
+            "any",
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     // 인바운드 규칙 (TCP, UDP) - 랑데부 서버 통신을 위해 TCP 인바운드 필수
     let output_in_tcp = std::process::Command::new("netsh")
-        .args(&["advfirewall", "firewall", "add", "rule", "name", &rule_name, "dir", "in", "action", "allow", "program", &exe, "protocol", "TCP", "enable", "yes", "profile", "any"])
+        .args(&[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name",
+            &rule_name,
+            "dir",
+            "in",
+            "action",
+            "allow",
+            "program",
+            &exe,
+            "protocol",
+            "TCP",
+            "enable",
+            "yes",
+            "profile",
+            "any",
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     let output_in_udp = std::process::Command::new("netsh")
-        .args(&["advfirewall", "firewall", "add", "rule", "name", &rule_name, "dir", "in", "action", "allow", "program", &exe, "protocol", "UDP", "enable", "yes", "profile", "any"])
+        .args(&[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name",
+            &rule_name,
+            "dir",
+            "in",
+            "action",
+            "allow",
+            "program",
+            &exe,
+            "protocol",
+            "UDP",
+            "enable",
+            "yes",
+            "profile",
+            "any",
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     // 성공했는지 확인
-    let success = output_out_tcp.is_ok() && output_out_udp.is_ok() && 
-                  output_in_tcp.is_ok() && output_in_udp.is_ok() &&
-                  output_out_tcp.as_ref().unwrap().status.success() &&
-                  output_out_udp.as_ref().unwrap().status.success() &&
-                  output_in_tcp.as_ref().unwrap().status.success() &&
-                  output_in_udp.as_ref().unwrap().status.success();
+    let success = output_out_tcp.is_ok()
+        && output_out_udp.is_ok()
+        && output_in_tcp.is_ok()
+        && output_in_udp.is_ok()
+        && output_out_tcp.as_ref().unwrap().status.success()
+        && output_out_udp.as_ref().unwrap().status.success()
+        && output_in_tcp.as_ref().unwrap().status.success()
+        && output_in_udp.as_ref().unwrap().status.success();
 
     if success {
-        log::info!("Firewall rules (TCP/UDP, inbound/outbound) added successfully: {}", rule_name);
+        log::info!(
+            "Firewall rules (TCP/UDP, inbound/outbound) added successfully: {}",
+            rule_name
+        );
     } else {
         // 실패 시 에러 메시지 출력
         let mut failed_rules = Vec::new();
-        
+
         if let Ok(output) = &output_out_tcp {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1839,9 +1927,13 @@ pub fn try_add_firewall_rule_on_first_run() {
                 failed_rules.push("inbound UDP");
             }
         }
-        
+
         if !failed_rules.is_empty() {
-            log::warn!("Failed to add firewall rules: {} (may need administrator privileges). Path: {}", failed_rules.join(", "), exe);
+            log::warn!(
+                "Failed to add firewall rules: {} (may need administrator privileges). Path: {}",
+                failed_rules.join(", "),
+                exe
+            );
         }
     }
 }
@@ -1865,7 +1957,7 @@ pub fn disable_firewall_notifications() {
             .args(&["/C", &cmd])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
-        
+
         if let Ok(output) = output {
             if output.status.success() {
                 log::debug!("Disabled firewall notifications for profile: {}", reg_path);
@@ -3829,15 +3921,13 @@ pub mod remote_overlay {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::Once;
-    use winapi::um::wingdi::{
-        CreateFontW, CreateSolidBrush, SetBkMode, SetTextColor, TRANSPARENT,
-    };
+    use winapi::um::wingdi::{CreateFontW, CreateSolidBrush, SetBkMode, SetTextColor, TRANSPARENT};
     use winapi::um::winuser::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
         GetSystemMetrics, PeekMessageW, PostMessageW, RegisterClassExW, SetLayeredWindowAttributes,
         ShowWindow, TranslateMessage, UpdateWindow, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, MSG,
-        PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_PAINT,
-        WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY,
+        WM_PAINT, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     static OVERLAY_HWND: AtomicPtr<winapi::shared::windef::HWND__> =
@@ -3847,11 +3937,30 @@ pub mod remote_overlay {
     static ACTIVE_CONNECTIONS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
+    lazy_static::lazy_static! {
+        /// 원격(제어) 세션별 소스 IP — 연결 ID당 하나
+        static ref OVERLAY_PEER_IPS: Mutex<HashMap<i32, String>> = Mutex::new(HashMap::new());
+        /// 오버레이 하단에 그리는 IP 줄 (중복 제거·정렬)
+        static ref OVERLAY_IP_LINE: Mutex<String> = Mutex::new(String::new());
+    }
+
+    fn normalize_peer_ip(s: &str) -> String {
+        s.split('%').next().unwrap_or(s).trim().to_string()
+    }
+
+    fn rebuild_overlay_state_locked(g: &HashMap<i32, String>) {
+        ACTIVE_CONNECTIONS.store(g.len(), Ordering::SeqCst);
+        let mut v: Vec<String> = g.values().cloned().collect();
+        v.sort();
+        v.dedup();
+        *OVERLAY_IP_LINE.lock().unwrap_or_else(|e| e.into_inner()) = v.join(", ");
+    }
+
     const OVERLAY_CLASS_NAME: &str = "RustDeskRemoteOverlay";
-    const OVERLAY_WIDTH: i32 = 220;  // 텍스트 길이에 맞게 조정
-    const OVERLAY_HEIGHT: i32 = 56;  // 두 배 크기
+    const OVERLAY_WIDTH: i32 = 300;
+    const OVERLAY_HEIGHT: i32 = 76; // 제목 + 소형 IP 두 줄
     const WM_UPDATE_OVERLAY: u32 = WM_USER + 100;
-    const BLINK_INTERVAL_MS: u64 = 1500;  // 1.5초 깜빡임 간격
+    const BLINK_INTERVAL_MS: u64 = 1500; // 1.5초 깜빡임 간격
 
     unsafe extern "system" fn overlay_wnd_proc(
         hwnd: HWND,
@@ -3861,58 +3970,83 @@ pub mod remote_overlay {
     ) -> LRESULT {
         match msg {
             WM_PAINT => {
+                let ip_line = OVERLAY_IP_LINE
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+
                 let mut ps: winapi::um::winuser::PAINTSTRUCT = std::mem::zeroed();
                 let hdc = winapi::um::winuser::BeginPaint(hwnd, &mut ps);
 
-                // Blue background
-                let brush = CreateSolidBrush(0x00CC6600); // RGB(0, 102, 204) in BGR format
                 let rect = winapi::shared::windef::RECT {
                     left: 0,
                     top: 0,
                     right: OVERLAY_WIDTH,
                     bottom: OVERLAY_HEIGHT,
                 };
+                let brush = CreateSolidBrush(0x00CC6600); // RGB(0, 102, 204) in BGR format
                 winapi::um::winuser::FillRect(hdc, &rect, brush);
                 winapi::um::wingdi::DeleteObject(brush as *mut _);
 
-                // White text
                 SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, 0x00FFFFFF); // White
 
-                // Create font (두 배 크기)
-                let font = CreateFontW(
-                    32,                  // height (두 배)
-                    0,                   // width
-                    0,                   // escapement
-                    0,                   // orientation
-                    700,                 // weight (bold)
-                    0,                   // italic
-                    0,                   // underline
-                    0,                   // strikeout
-                    1,                   // charset
-                    0,                   // out precision
-                    0,                   // clip precision
-                    0,                   // quality
-                    0,                   // pitch and family
-                    std::ptr::null(),    // face name
-                );
-                let old_font = winapi::um::wingdi::SelectObject(hdc, font as *mut _);
+                let title_font =
+                    CreateFontW(28, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, std::ptr::null());
+                let old_font = winapi::um::wingdi::SelectObject(hdc, title_font as *mut _);
 
-                // Draw text "MDESK 원격중"
-                let text: Vec<u16> = "MDESK 원격중".encode_utf16().chain(std::iter::once(0)).collect();
-                let mut text_rect = rect;
+                SetTextColor(hdc, 0x00FFFFFF);
+                let mut title_rect = winapi::shared::windef::RECT {
+                    left: 8,
+                    top: 6,
+                    right: OVERLAY_WIDTH - 8,
+                    bottom: if ip_line.is_empty() {
+                        OVERLAY_HEIGHT - 8
+                    } else {
+                        46
+                    },
+                };
+                let text: Vec<u16> = "MDESK 원격중"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
                 winapi::um::winuser::DrawTextW(
                     hdc,
                     text.as_ptr(),
                     -1,
-                    &mut text_rect,
+                    &mut title_rect,
                     winapi::um::winuser::DT_CENTER
                         | winapi::um::winuser::DT_VCENTER
-                        | winapi::um::winuser::DT_SINGLELINE,
+                        | winapi::um::winuser::DT_SINGLELINE
+                        | winapi::um::winuser::DT_NOPREFIX,
                 );
 
                 winapi::um::wingdi::SelectObject(hdc, old_font);
-                winapi::um::wingdi::DeleteObject(font as *mut _);
+                winapi::um::wingdi::DeleteObject(title_font as *mut _);
+
+                if !ip_line.is_empty() {
+                    let ip_font =
+                        CreateFontW(16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, std::ptr::null());
+                    let old_font_ip = winapi::um::wingdi::SelectObject(hdc, ip_font as *mut _);
+                    SetTextColor(hdc, 0x00E0E0E0);
+                    let mut ip_rect = winapi::shared::windef::RECT {
+                        left: 6,
+                        top: 42,
+                        right: OVERLAY_WIDTH - 6,
+                        bottom: OVERLAY_HEIGHT - 8,
+                    };
+                    let ip_w: Vec<u16> = ip_line.encode_utf16().chain(std::iter::once(0)).collect();
+                    winapi::um::winuser::DrawTextW(
+                        hdc,
+                        ip_w.as_ptr(),
+                        -1,
+                        &mut ip_rect,
+                        winapi::um::winuser::DT_CENTER
+                            | winapi::um::winuser::DT_WORDBREAK
+                            | winapi::um::winuser::DT_NOPREFIX,
+                    );
+                    winapi::um::wingdi::SelectObject(hdc, old_font_ip);
+                    winapi::um::wingdi::DeleteObject(ip_font as *mut _);
+                }
 
                 winapi::um::winuser::EndPaint(hwnd, &ps);
                 0
@@ -4069,31 +4203,40 @@ pub mod remote_overlay {
         }
     }
 
-    /// Call this when a remote connection is established
-    pub fn show_remote_indicator() {
+    /// `peer_ip`: 피원격지 입장에서 본 제어측(클라이언트) 소스 주소
+    pub fn show_remote_indicator(conn_id: i32, peer_ip: String) {
         ensure_overlay_thread();
-        let prev = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+        drop(peer_ip);
+        let normalized = normalize_peer_ip(&crate::common::client_local_ip_for_login_request());
+        let was_empty = {
+            let mut g = OVERLAY_PEER_IPS.lock().unwrap();
+            let was_empty = g.is_empty();
+            g.insert(conn_id, normalized);
+            rebuild_overlay_state_locked(&g);
+            was_empty
+        };
         log::info!(
             "Remote overlay: connection added (total: {})",
-            prev + 1
+            ACTIVE_CONNECTIONS.load(Ordering::SeqCst)
         );
-        // Give the thread time to create the window if it's the first call
-        if prev == 0 {
+        if was_empty {
             std::thread::sleep(Duration::from_millis(100));
         }
         update_overlay();
     }
 
-    /// Call this when a remote connection is closed
-    pub fn hide_remote_indicator() {
-        let prev = ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
-        if prev > 0 {
-            let new_count = ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst) - 1;
-            log::info!(
-                "Remote overlay: connection removed (total: {})",
-                new_count
-            );
+    pub fn hide_remote_indicator(conn_id: i32) {
+        {
+            let mut g = OVERLAY_PEER_IPS.lock().unwrap();
+            if g.remove(&conn_id).is_none() {
+                return;
+            }
+            rebuild_overlay_state_locked(&g);
         }
+        log::info!(
+            "Remote overlay: connection removed (total: {})",
+            ACTIVE_CONNECTIONS.load(Ordering::SeqCst)
+        );
         update_overlay();
     }
 

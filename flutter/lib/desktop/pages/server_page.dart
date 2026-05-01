@@ -111,11 +111,7 @@ class ConnectionManager extends StatefulWidget {
   State<StatefulWidget> createState() => ConnectionManagerState();
 }
 
-class ConnectionManagerState extends State<ConnectionManager>
-    with WidgetsBindingObserver {
-  final RxBool _controlPageBlock = false.obs;
-  final RxBool _sidePageBlock = false.obs;
-
+class ConnectionManagerState extends State<ConnectionManager> {
   ConnectionManagerState() {
     gFFI.serverModel.tabController.onSelected = (client_id_str) {
       final client_id = int.tryParse(client_id_str);
@@ -139,27 +135,9 @@ class ConnectionManagerState extends State<ConnectionManager>
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    super.didChangeAppLifecycleState(state);
-    if (state == AppLifecycleState.resumed) {
-      if (!allowRemoteCMModification()) {
-        shouldBeBlocked(_controlPageBlock, null);
-        shouldBeBlocked(_sidePageBlock, null);
-      }
-    }
-  }
-
-  @override
   void initState() {
     gFFI.serverModel.updateClientState();
-    WidgetsBinding.instance.addObserver(this);
     super.initState();
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
   }
 
   @override
@@ -237,24 +215,13 @@ class ConnectionManagerState extends State<ConnectionManager>
                       Consumer<ChatModel>(
                           builder: (_, model, child) => SizedBox(
                                 width: realChatPageWidth,
-                                child: allowRemoteCMModification()
-                                    ? buildSidePage()
-                                    : buildRemoteBlock(
-                                        child: buildSidePage(),
-                                        block: _sidePageBlock,
-                                        mask: true),
+                                child: buildSidePage(),
                               )),
                     SizedBox(
                         width: realClosedWidth,
                         child: SizedBox(
                             width: realClosedWidth,
-                            child: allowRemoteCMModification()
-                                ? pageView
-                                : buildRemoteBlock(
-                                    child: _buildKeyEventBlock(pageView),
-                                    block: _controlPageBlock,
-                                    mask: false,
-                                  ))),
+                            child: _buildKeyEventBlock(pageView))),
                   ]);
                   return Container(
                     color: Theme.of(context).scaffoldBackgroundColor,
@@ -777,22 +744,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                         },
                         translate('Enable recording session'),
                       ),
-                      // only windows support block input
-                      if (isWindows)
-                        buildPermissionIcon(
-                          client.blockInput,
-                          Icons.block,
-                          (enabled) {
-                            bind.cmSwitchPermission(
-                                connId: client.id,
-                                name: "block_input",
-                                enabled: enabled);
-                            setState(() {
-                              client.blockInput = enabled;
-                            });
-                          },
-                          translate('Enable blocking user input'),
-                        )
                     ],
             ),
           ),
@@ -813,31 +764,29 @@ class _CmControlPanel extends StatefulWidget {
   State<_CmControlPanel> createState() => _CmControlPanelState();
 }
 
-class _CmControlPanelState extends State<_CmControlPanel>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _neonController;
-  late Animation<double> _neonAnimation;
-  
+class _CmControlPanelState extends State<_CmControlPanel> {
   Client get client => widget.client;
 
   @override
   void initState() {
     super.initState();
-    // 네온사인 깜빡임 애니메이션 (0.8초 주기)
-    _neonController = AnimationController(
-      duration: const Duration(milliseconds: 800),
-      vsync: this,
-    )..repeat(reverse: true);
-    
-    _neonAnimation = Tween<double>(begin: 0.4, end: 1.0).animate(
-      CurvedAnimation(parent: _neonController, curve: Curves.easeInOut),
-    );
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => _tryAutoAcceptIncoming());
   }
 
-  @override
-  void dispose() {
-    _neonController.dispose();
-    super.dispose();
+  /// ['click'] 만 원격 측 클릭 승인만 요구 — 자동 승인해도 됨.
+  /// ['password'], ['password-click'], 빈값(→Rust Both) 등은 비밀번호·양쪽 승인 경로가 있어
+  /// 자동 승인 시 제어측 비밀번호 없이 바로 연결되는 문제가 생김.
+  void _tryAutoAcceptIncoming() {
+    if (!mounted) return;
+    if (client.authorized) return;
+    final model = Provider.of<ServerModel>(context, listen: false);
+    if (model.approveMode != 'click') return;
+    model.sendLoginResponse(client, true);
+    if (bind.cmCanElevate()) {
+      handleElevate(context);
+      windowManager.minimize();
+    }
   }
 
   @override
@@ -1039,60 +988,12 @@ class _CmControlPanelState extends State<_CmControlPanel>
   }
 
   buildUnAuthorized(BuildContext context) {
-    final model = Provider.of<ServerModel>(context);
-    final showAccept = model.approveMode != 'password';
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // 수락 버튼 (네온사인 깜빡임 효과)
-            if (showAccept)
-              Expanded(
-                child: AnimatedBuilder(
-                  animation: _neonAnimation,
-                  builder: (context, child) {
-                    return Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(10.0),
-                        boxShadow: [
-                          BoxShadow(
-                            color: MyTheme.accent.withOpacity(_neonAnimation.value * 0.8),
-                            blurRadius: 12 * _neonAnimation.value,
-                            spreadRadius: 2 * _neonAnimation.value,
-                          ),
-                          BoxShadow(
-                            color: Colors.white.withOpacity(_neonAnimation.value * 0.3),
-                            blurRadius: 6 * _neonAnimation.value,
-                            spreadRadius: 1,
-                          ),
-                        ],
-                      ),
-                      child: buildButton(context, 
-                        color: Color.lerp(
-                          MyTheme.accent.withOpacity(0.7),
-                          MyTheme.accent,
-                          _neonAnimation.value,
-                        ),
-                        onClick: () {
-                          handleAccept(context);
-                          handleElevate(context);
-                          windowManager.minimize();
-                        },
-                        text: 'Accept',
-                        icon: Icon(
-                          Icons.security_rounded,
-                          color: Colors.white,
-                          size: 14,
-                        ),
-                        textColor: Colors.white,
-                        tooltip: 'accept_and_elevate_btn_tooltip',
-                      ),
-                    );
-                  },
-                ),
-              ),
             Expanded(
               child: buildButton(
                 context,
@@ -1172,11 +1073,6 @@ class _CmControlPanelState extends State<_CmControlPanel>
 
   void handleDisconnect() {
     bind.cmCloseConnection(connId: client.id);
-  }
-
-  void handleAccept(BuildContext context) {
-    final model = Provider.of<ServerModel>(context, listen: false);
-    model.sendLoginResponse(client, true);
   }
 
   void handleElevate(BuildContext context) {

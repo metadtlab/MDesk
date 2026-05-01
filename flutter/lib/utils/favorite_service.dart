@@ -10,6 +10,7 @@ class FavoriteItem {
   final String? username;
   final String? hostname;
   final String? platform;
+  final String? memo;
 
   FavoriteItem({
     required this.peerId,
@@ -17,6 +18,7 @@ class FavoriteItem {
     this.username,
     this.hostname,
     this.platform,
+    this.memo,
   });
 
   factory FavoriteItem.fromJson(Map<String, dynamic> json) {
@@ -26,6 +28,7 @@ class FavoriteItem {
       username: json['username']?.toString(),
       hostname: json['hostname']?.toString(),
       platform: json['platform']?.toString(),
+      memo: json['memo']?.toString(),
     );
   }
 }
@@ -70,7 +73,7 @@ class FavoriteService {
       rdpUsername: '',
       loginName: '',
       device_group_name: '',
-      note: '',
+      note: fav.memo ?? '',
     );
   }
 

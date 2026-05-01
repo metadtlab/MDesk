@@ -23,6 +23,7 @@ use crate::{
 };
 
 static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
+pub const REMOTE_DROP_DOWNLOADS_PREFIX: &str = "mdesk-drop-downloads:";
 
 pub fn get_next_job_id() -> i32 {
     NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst)
@@ -138,6 +139,97 @@ pub fn get_path(path: &str) -> PathBuf {
 #[inline]
 pub fn get_home_as_string() -> String {
     get_string(&Config::get_home())
+}
+
+pub fn get_download_dir() -> PathBuf {
+    dirs_next::download_dir()
+        .or_else(|| {
+            let home = Config::get_home();
+            if home.as_os_str().is_empty() {
+                None
+            } else {
+                Some(home.join("Downloads"))
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+pub fn is_remote_drop_downloads_path(path: &str) -> bool {
+    path.starts_with(REMOTE_DROP_DOWNLOADS_PREFIX)
+}
+
+pub fn resolve_remote_drop_downloads_path(path: &str) -> Result<Option<PathBuf>, String> {
+    let Some(relative) = path.strip_prefix(REMOTE_DROP_DOWNLOADS_PREFIX) else {
+        return Ok(None);
+    };
+    if relative.is_empty() {
+        return Err("Invalid remote drop target".to_string());
+    }
+
+    let mut target = get_download_dir();
+    for encoded in relative.split('/') {
+        let decoded = decode_remote_drop_component(encoded)?;
+        validate_remote_drop_component(&decoded)?;
+        target.push(decoded);
+    }
+    Ok(Some(target))
+}
+
+fn decode_remote_drop_component(component: &str) -> Result<String, String> {
+    if component.is_empty() {
+        return Err("Invalid remote drop target".to_string());
+    }
+
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("Invalid remote drop target encoding".to_string());
+            }
+            let hi = hex_value(bytes[i + 1])
+                .ok_or_else(|| "Invalid remote drop target encoding".to_string())?;
+            let lo = hex_value(bytes[i + 2])
+                .ok_or_else(|| "Invalid remote drop target encoding".to_string())?;
+            decoded.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8(decoded).map_err(|_| "Invalid remote drop target encoding".to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn validate_remote_drop_component(component: &str) -> Result<(), String> {
+    if component.is_empty() || component == "." || component == ".." {
+        return Err("Invalid remote drop target".to_string());
+    }
+    if component
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0')
+    {
+        return Err("Invalid remote drop target".to_string());
+    }
+    #[cfg(windows)]
+    if component
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err("Invalid remote drop target".to_string());
+    }
+    Ok(())
 }
 
 fn read_dir_recursive(
@@ -413,6 +505,10 @@ pub struct TransferJob {
     file_is_waiting: bool,
     default_overwrite_strategy: Option<bool>,
     #[serde(skip_serializing)]
+    set_mtime_to_now: bool,
+    #[serde(skip_serializing)]
+    open_folder_on_done: bool,
+    #[serde(skip_serializing)]
     digest: FileDigest,
 }
 
@@ -549,6 +645,33 @@ impl TransferJob {
     }
 
     #[inline]
+    pub fn set_mtime_to_now(&mut self, enabled: bool) {
+        self.set_mtime_to_now = enabled;
+    }
+
+    #[inline]
+    pub fn set_open_folder_on_done(&mut self, enabled: bool) {
+        self.open_folder_on_done = enabled;
+    }
+
+    #[inline]
+    pub fn folder_to_open_on_done(&self) -> Option<PathBuf> {
+        if !self.open_folder_on_done {
+            return None;
+        }
+        match &self.data_source {
+            DataSource::FilePath(p) => {
+                if self.files.len() == 1 && self.files[0].name.is_empty() {
+                    Some(p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone()))
+                } else {
+                    Some(p.clone())
+                }
+            }
+            DataSource::MemoryCursor(_) => None,
+        }
+    }
+
+    #[inline]
     pub fn id(&self) -> i32 {
         self.id
     }
@@ -586,11 +709,12 @@ impl TransferJob {
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(digest_path).ok();
                 std::fs::rename(download_path, &path).ok();
-                filetime::set_file_mtime(
-                    &path,
-                    filetime::FileTime::from_unix_time(entry.modified_time as _, 0),
-                )
-                .ok();
+                let mtime = if self.set_mtime_to_now {
+                    filetime::FileTime::from_system_time(SystemTime::now())
+                } else {
+                    filetime::FileTime::from_unix_time(entry.modified_time as _, 0)
+                };
+                filetime::set_file_mtime(&path, mtime).ok();
             }
         }
     }

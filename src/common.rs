@@ -65,6 +65,36 @@ pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
 
+/// 표시용: IPv6 zone 접미사 등 제거
+pub fn normalize_ip_display(s: &str) -> String {
+    s.split('%').next().unwrap_or(s).trim().to_string()
+}
+
+/// 피원격지 오버레이 문구용 제어측 IP — 로그인 요청에 실린 LAN 주소 우선, 없으면 TCP 소스 주소
+pub fn overlay_remote_peer_ip(lr: &LoginRequest, socket_peer_ip: &str) -> String {
+    let from_lr = lr.client_local_ip.trim();
+    if !from_lr.is_empty() {
+        normalize_ip_display(from_lr)
+    } else {
+        normalize_ip_display(socket_peer_ip)
+    }
+}
+
+/// LoginRequest `client_local_ip` 채우기: 설정 `local-ip-addr` 우선, 아니면 기본 라우팅 인터페이스(UDP 소켝 트릭)
+pub fn client_local_ip_for_login_request() -> String {
+    let configured = Config::get_option("local-ip-addr");
+    if !configured.trim().is_empty() {
+        return configured.trim().to_owned();
+    }
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            let _ = socket.connect("8.8.8.8:80");
+            socket.local_addr()
+        })
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_default()
+}
+
 pub mod input {
     pub const MOUSE_TYPE_MOVE: i32 = 0;
     pub const MOUSE_TYPE_DOWN: i32 = 1;
@@ -115,7 +145,7 @@ pub fn global_init() -> bool {
             crate::server::wayland::init();
         }
     }
-    
+
     // 포터블 모드에서 시작 시 고정 비밀번호 삭제
     #[cfg(windows)]
     {
@@ -127,7 +157,7 @@ pub fn global_init() -> bool {
             crate::platform::windows::try_add_firewall_rule_on_first_run();
         }
     }
-    
+
     true
 }
 
@@ -159,7 +189,7 @@ pub fn is_running_portable() -> bool {
         Ok(p) => p.to_string_lossy().to_lowercase(),
         Err(_) => return true, // 경로를 알 수 없으면 포터블로 간주
     };
-    
+
     // 설치 경로 확인
     let install_path = {
         let mut pf = "c:\\program files".to_owned();
@@ -168,7 +198,7 @@ pub fn is_running_portable() -> bool {
         }
         format!("{}\\{}\\", pf, crate::get_app_name().to_lowercase())
     };
-    
+
     // 현재 실행 파일이 설치 경로에 있지 않으면 포터블 모드
     !current_exe.starts_with(&install_path)
 }
@@ -206,13 +236,13 @@ pub fn is_support_multi_ui_session_num(ver: i64) -> bool {
 }
 
 #[inline]
-#[cfg(feature = "unix-file-copy-paste")]
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 pub fn is_support_file_copy_paste(ver: &str) -> bool {
     is_support_file_copy_paste_num(hbb_common::get_version_number(ver))
 }
 
 #[inline]
-#[cfg(feature = "unix-file-copy-paste")]
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 pub fn is_support_file_copy_paste_num(ver: i64) -> bool {
     ver >= hbb_common::get_version_number("1.3.8")
 }
@@ -1277,28 +1307,43 @@ pub fn get_request_fire_and_forget(url: String) {
         let tls_url = get_url_for_tls(&url, &proxy_conf);
         let mut tls_type = get_cached_tls_type(tls_url.clone());
         let mut danger_accept = get_cached_tls_accept_invalid_cert(tls_url.clone());
-        
+
         // 최대 2번 재시도 (rustls 실패 시 native-tls, invalid cert 허용)
         for attempt in 0..2 {
             let client = create_http_client_async(
                 tls_type.unwrap_or(TlsType::Rustls),
                 danger_accept.unwrap_or(false),
             );
-            
-            match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+
+            match client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
                 Ok(resp) => {
-                    log::info!("[MDesk] agentclose API success: {} - status: {}", url, resp.status());
+                    log::info!(
+                        "[MDesk] agentclose API success: {} - status: {}",
+                        url,
+                        resp.status()
+                    );
                     return;
                 }
                 Err(e) => {
                     if attempt == 0 && e.is_request() {
                         // 첫 번째 시도 실패 시 invalid cert 허용으로 재시도
-                        log::debug!("[MDesk] GET request failed, retrying with invalid cert allowed: {}", e);
+                        log::debug!(
+                            "[MDesk] GET request failed, retrying with invalid cert allowed: {}",
+                            e
+                        );
                         danger_accept = Some(true);
                         continue;
                     } else if attempt == 0 {
                         // TLS 타입 문제일 수 있음
-                        log::debug!("[MDesk] GET request failed, retrying with native-tls: {}", e);
+                        log::debug!(
+                            "[MDesk] GET request failed, retrying with native-tls: {}",
+                            e
+                        );
                         tls_type = Some(TlsType::NativeTls);
                         continue;
                     } else {
@@ -1598,7 +1643,7 @@ pub async fn get_key(sync: bool) -> String {
     // 서버의 id_ed25519.pub 키와 일치해야 함
     let _ = sync;
     return config::RS_PUB_KEY.to_owned();
-    
+
     /*
     // 원래 로직 - 필요시 복원
     // 먼저 사용자가 명시적으로 설정한 키를 확인
@@ -1626,7 +1671,7 @@ pub async fn get_key(sync: bool) -> String {
         let key = options.remove("key").unwrap_or_default();
         (key, key_exists)
     };
-    
+
     #[cfg(not(target_os = "ios"))]
     {
         // 사용자가 명시적으로 키를 설정한 경우
@@ -1640,7 +1685,7 @@ pub async fn get_key(sync: bool) -> String {
         }
     }
     */
-    
+
     // 사용자가 키를 설정하지 않은 경우에만 실행 파일 이름에서 라이선스 키 확인
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
@@ -1648,7 +1693,7 @@ pub async fn get_key(sync: bool) -> String {
             return lic.key;
         }
     }
-    
+
     // 기본값 사용
     config::RS_PUB_KEY.to_owned()
 }

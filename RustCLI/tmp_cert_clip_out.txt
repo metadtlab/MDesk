@@ -1,0 +1,10 @@
+portable mode detected
+portable source=rustcli.exe + clipboard:portable-certno=true-certnum=00000000
+portable user_id=cert
+portable certno_mode=true certnum=00000000
+portable rendezvous_server=mdesk.imedixerp.co.kr:21116
+portable api_server=https://admin.787.kr
+portable custom_id=cert custom_agentid=-
+starting rustcli host server
+version=1.4.35
+id=5270854

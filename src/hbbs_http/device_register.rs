@@ -65,13 +65,13 @@ fn get_access_token() -> String {
 }
 
 /// 원격 기기를 API 서버에 등록
-/// 
+///
 /// # Arguments
 /// * `user_id` - 로그인된 유저 ID (username)
 /// * `user_pkid` - 유저 고유 번호
 /// * `remote_id` - 원격 ID (peer ID)
 /// * `alias` - 사용자 지정 별칭
-/// 
+///
 /// # Returns
 /// * `Ok(DeviceRegisterResponse)` - 등록 성공/실패 응답
 /// * `Err` - 네트워크 오류 등
@@ -111,11 +111,15 @@ pub fn register_device(
         version: crate::VERSION.to_string(),
     };
 
-    log::info!("Registering device: remote_id={}, alias={}", remote_id, alias);
+    log::info!(
+        "Registering device: remote_id={}, alias={}",
+        remote_id,
+        alias
+    );
     log::debug!("Device register request: {:?}", &request);
 
     let access_token = get_access_token();
-    
+
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -127,7 +131,7 @@ pub fn register_device(
         Ok(response) => {
             let status = response.status();
             log::info!("Device register response status: {}", status);
-            
+
             match response.json::<DeviceRegisterResponse>() {
                 Ok(result) => {
                     if result.success {
@@ -161,10 +165,7 @@ pub fn register_device(
 }
 
 /// 기기 등록 해제
-pub fn unregister_device(
-    user_pkid: &str,
-    remote_id: &str,
-) -> ResultType<DeviceRegisterResponse> {
+pub fn unregister_device(user_pkid: &str, remote_id: &str) -> ResultType<DeviceRegisterResponse> {
     let api_server = get_api_server();
     if api_server.is_empty() {
         log::error!("API server is not configured");
@@ -187,7 +188,7 @@ pub fn unregister_device(
     log::info!("Unregistering device: remote_id={}", remote_id);
 
     let access_token = get_access_token();
-    
+
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -196,27 +197,25 @@ pub fn unregister_device(
         .send();
 
     match resp {
-        Ok(response) => {
-            match response.json::<DeviceRegisterResponse>() {
-                Ok(result) => {
-                    if result.success {
-                        log::info!("Device unregistered successfully: {}", remote_id);
-                    } else {
-                        log::warn!("Device unregistration failed: {:?}", result.error);
-                    }
-                    Ok(result)
+        Ok(response) => match response.json::<DeviceRegisterResponse>() {
+            Ok(result) => {
+                if result.success {
+                    log::info!("Device unregistered successfully: {}", remote_id);
+                } else {
+                    log::warn!("Device unregistration failed: {:?}", result.error);
                 }
-                Err(e) => {
-                    log::error!("Failed to parse device unregister response: {}", e);
-                    Ok(DeviceRegisterResponse {
-                        success: false,
-                        message: format!("Failed to parse response: {}", e),
-                        error: Some("PARSE_ERROR".to_string()),
-                        data: None,
-                    })
-                }
+                Ok(result)
             }
-        }
+            Err(e) => {
+                log::error!("Failed to parse device unregister response: {}", e);
+                Ok(DeviceRegisterResponse {
+                    success: false,
+                    message: format!("Failed to parse response: {}", e),
+                    error: Some("PARSE_ERROR".to_string()),
+                    data: None,
+                })
+            }
+        },
         Err(e) => {
             log::error!("Device unregistration request failed: {}", e);
             Ok(DeviceRegisterResponse {
@@ -284,30 +283,28 @@ pub fn get_registered_devices(user_pkid: &str) -> ResultType<DeviceListResponse>
     log::info!("Getting registered devices for user_pkid={}", user_pkid);
 
     let access_token = get_access_token();
-    
+
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .send();
 
     match resp {
-        Ok(response) => {
-            match response.json::<DeviceListResponse>() {
-                Ok(result) => {
-                    log::info!("Got {} registered devices", result.data.len());
-                    Ok(result)
-                }
-                Err(e) => {
-                    log::error!("Failed to parse device list response: {}", e);
-                    Ok(DeviceListResponse {
-                        success: false,
-                        message: format!("Failed to parse response: {}", e),
-                        error: Some("PARSE_ERROR".to_string()),
-                        data: Vec::new(),
-                    })
-                }
+        Ok(response) => match response.json::<DeviceListResponse>() {
+            Ok(result) => {
+                log::info!("Got {} registered devices", result.data.len());
+                Ok(result)
             }
-        }
+            Err(e) => {
+                log::error!("Failed to parse device list response: {}", e);
+                Ok(DeviceListResponse {
+                    success: false,
+                    message: format!("Failed to parse response: {}", e),
+                    error: Some("PARSE_ERROR".to_string()),
+                    data: Vec::new(),
+                })
+            }
+        },
         Err(e) => {
             log::error!("Device list request failed: {}", e);
             Ok(DeviceListResponse {

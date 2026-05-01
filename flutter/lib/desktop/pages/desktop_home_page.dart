@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:auto_size_text/auto_size_text.dart';
 import 'package:flutter/material.dart';
@@ -25,7 +25,6 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:window_size/window_size.dart' as window_size;
-import '../widgets/button.dart';
 
 class DesktopHomePage extends StatefulWidget {
   const DesktopHomePage({Key? key}) : super(key: key);
@@ -37,7 +36,7 @@ class DesktopHomePage extends StatefulWidget {
 const borderColor = Color(0xFF2F65BA);
 
 class _DesktopHomePageState extends State<DesktopHomePage>
-    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
+    with AutomaticKeepAliveClientMixin {
   final _leftPaneScrollController = ScrollController();
 
   @override
@@ -53,7 +52,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   bool isCardClosed = false;
 
   final RxBool _editHover = false.obs;
-  final RxBool _block = false.obs;
 
   final GlobalKey _childKey = GlobalKey();
 
@@ -61,20 +59,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   Widget build(BuildContext context) {
     super.build(context);
     final isIncomingOnly = bind.isIncomingOnly();
-    return _buildBlock(
-        child: Row(
+    // 원격 진행 중에도 메인 MDesk UI 조작 가능하도록 차단 오버레이 비사용
+    return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         buildLeftPane(context),
         if (!isIncomingOnly) const VerticalDivider(width: 1),
         if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
       ],
-    ));
-  }
-
-  Widget _buildBlock({required Widget child}) {
-    return buildRemoteBlock(
-        block: _block, mask: true, use: canBeBlocked, child: child);
+    );
   }
 
   Widget buildLeftPane(BuildContext context) {
@@ -136,7 +129,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       value: gFFI.serverModel,
       child: Container(
         width: isIncomingOnly ? 280.0 : 200.0,
-        color: Theme.of(context).colorScheme.background,
+        color: Colors.transparent,
         child: Stack(
           children: [
             Column(
@@ -187,7 +180,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   buildRightPane(BuildContext context) {
     return Container(
-      color: Theme.of(context).scaffoldBackgroundColor,
+      color: Colors.transparent,
       child: ConnectionPage(),
     );
   }
@@ -243,6 +236,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                         readOnly: true,
                         decoration: InputDecoration(
                           border: InputBorder.none,
+                          filled: true,
+                          fillColor: Colors.transparent,
+                          hoverColor: Colors.transparent,
                           contentPadding: EdgeInsets.only(top: 10, bottom: 10),
                         ),
                         style: TextStyle(
@@ -274,7 +270,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 ? Theme.of(context).scaffoldBackgroundColor
                 : Theme.of(context).colorScheme.background,
             child: Icon(
-              Icons.more_vert_outlined,
+              Icons.settings_outlined,
               size: 20,
               color: hover.value ? textColor : textColor?.withOpacity(0.5),
             ),
@@ -299,6 +295,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     RxBool refreshHover = false.obs;
     RxBool editHover = false.obs;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    final iconIdle = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : Colors.black;
     final showOneTime = model.approveMode != 'click' &&
         model.verificationMethod != kUsePermanentPassword;
     return Container(
@@ -340,6 +339,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                             readOnly: true,
                             decoration: InputDecoration(
                               border: InputBorder.none,
+                              filled: true,
+                              fillColor: Colors.transparent,
+                              hoverColor: Colors.transparent,
                               contentPadding:
                                   EdgeInsets.only(top: 14, bottom: 10),
                             ),
@@ -356,9 +358,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                 quarterTurns: 2,
                                 child: Icon(
                                   Icons.refresh,
-                                  color: refreshHover.value
-                                      ? textColor
-                                      : Color(0xFFDDDDDD),
+                                  color:
+                                      refreshHover.value ? textColor : iconIdle,
                                   size: 22,
                                 ))),
                           ),
@@ -371,9 +372,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                             child: Obx(
                               () => Icon(
                                 Icons.edit,
-                                color: editHover.value
-                                    ? textColor
-                                    : Color(0xFFDDDDDD),
+                                color: editHover.value ? textColor : iconIdle,
                                 size: 22,
                               ).marginOnly(right: 8, top: 4),
                             ),
@@ -394,22 +393,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget _buildVersionLabel(BuildContext context) {
-    return FutureBuilder<String>(
-      future: bind.mainGetVersion(),
-      builder: (context, snapshot) {
-        if (!snapshot.hasData || snapshot.data!.isEmpty) return const SizedBox.shrink();
-        final textColor = Theme.of(context).textTheme.bodySmall?.color?.withOpacity(0.6);
-        return Padding(
-          padding: const EdgeInsets.only(left: 20, right: 16, top: 4, bottom: 0),
-          child: Text(
-            'v${snapshot.data}',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              fontSize: 11,
-              color: textColor,
-            ),
-          ),
-        );
-      },
+    return const Padding(
+      padding: EdgeInsets.only(left: 20, right: 16, top: 4, bottom: 0),
+      child: _VersionLabelWithRefresh(),
     );
   }
 
@@ -456,13 +442,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   /// 파일명에서 userId 파싱
   String _parseUserId() {
-    String filename = Platform.environment['MDESK_APPNAME'] ?? 
-                      Platform.environment['RUSTDESK_APPNAME'] ?? '';
-    
+    String filename = Platform.environment['MDESK_APPNAME'] ??
+        Platform.environment['RUSTDESK_APPNAME'] ??
+        '';
+
     if (filename.isEmpty) {
       filename = Platform.resolvedExecutable.split(Platform.pathSeparator).last;
     }
-    
+
     // id= 파싱
     final idMatch = RegExp(r'id=([^,\s]+)').firstMatch(filename);
     return idMatch?.group(1) ?? '';
@@ -474,27 +461,25 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final fileUserId = _parseUserId();
     final userId = loggedInUser.isNotEmpty ? loggedInUser : fileUserId;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
-    
+
     return Padding(
-      padding: const EdgeInsets.only(left: 20.0, right: 16, top: 10, bottom: 10),
+      padding:
+          const EdgeInsets.only(left: 20.0, right: 16, top: 10, bottom: 10),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Obx(() {
             final isLoggedIn = gFFI.userModel.userName.value.isNotEmpty;
             final userName = gFFI.userModel.userName.value;
-            final userPkid = gFFI.userModel.userPkid.value;
-            
-            // 로그인된 경우: username과 user_pkid 둘 다 표시
+
+            // 로그인된 경우: username 기준 접속 URL
             if (isLoggedIn) {
               final usernameUrl = 'https://787.kr/$userName';
-              final pkidUrl = userPkid.isNotEmpty ? 'https://787.kr/$userPkid' : '';
-              debugPrint('buildLinkSection: userName=$userName, userPkid=$userPkid, pkidUrl=$pkidUrl');
-              
+
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // username 링크 (접속URL 1)
+                  // username 링크 (표시: 베이스 URL, 이동/복사: 전체 URL)
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -503,12 +488,24 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                           await launchUrl(Uri.parse(usernameUrl));
                         },
                         child: Text(
-                          '접속URL 1',
+                          'https://787.kr',
                           style: TextStyle(
                             color: MyTheme.accent,
                             fontSize: 13,
+                            fontWeight: FontWeight.w600,
                             decoration: TextDecoration.underline,
                             decorationColor: MyTheme.accent,
+                            shadows: [
+                              Shadow(
+                                color: Colors.white.withOpacity(0.85),
+                                blurRadius: 2,
+                              ),
+                              const Shadow(
+                                color: Color(0x55000000),
+                                blurRadius: 3,
+                                offset: Offset(0, 1),
+                              ),
+                            ],
                           ),
                         ),
                       ),
@@ -526,48 +523,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       ),
                     ],
                   ),
-                  // user_pkid 링크 (접속URL 2, 있는 경우에만)
-                  if (pkidUrl.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        InkWell(
-                          onTap: () async {
-                            await launchUrl(Uri.parse(pkidUrl));
-                          },
-                          child: Text(
-                            '접속URL 2',
-                            style: TextStyle(
-                              color: MyTheme.accent,
-                              fontSize: 13,
-                              decoration: TextDecoration.underline,
-                              decorationColor: MyTheme.accent,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        InkWell(
-                          onTap: () {
-                            Clipboard.setData(ClipboardData(text: pkidUrl));
-                            showToast(translate("Copied"));
-                          },
-                          child: Icon(
-                            Icons.content_copy,
-                            size: 16,
-                            color: textColor?.withOpacity(0.5),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
                 ],
               );
             }
-            
+
             // 로그인 안된 경우: 파일명에서 파싱한 userId 사용
-            final url = fileUserId.isNotEmpty 
-                ? 'https://787.kr/$fileUserId' 
+            final url = fileUserId.isNotEmpty
+                ? 'https://787.kr/$fileUserId'
                 : 'https://787.kr';
             return Row(
               mainAxisSize: MainAxisSize.min,
@@ -577,12 +539,24 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                     await launchUrl(Uri.parse(url));
                   },
                   child: Text(
-                    '접속URL 1',
+                    'https://787.kr',
                     style: TextStyle(
                       color: MyTheme.accent,
                       fontSize: 13,
+                      fontWeight: FontWeight.w600,
                       decoration: TextDecoration.underline,
                       decorationColor: MyTheme.accent,
+                      shadows: [
+                        Shadow(
+                          color: Colors.white.withOpacity(0.85),
+                          blurRadius: 2,
+                        ),
+                        const Shadow(
+                          color: Color(0x55000000),
+                          blurRadius: 3,
+                          offset: Offset(0, 1),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -606,24 +580,192 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
+  /// Tinted “glass” button — blur 제거(밝은 배경에서 글자 안 보이는 문제 방지)
+  Widget _glassPrimaryButton({
+    required VoidCallback onPressed,
+    required Widget child,
+    required List<Color> gradientColors,
+  }) {
+    const radius = 14.0;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: Material(
+        type: MaterialType.transparency,
+        color: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(radius),
+          splashColor: Colors.white.withOpacity(0.28),
+          highlightColor: Colors.white.withOpacity(0.12),
+          hoverColor: Colors.white.withOpacity(0.16),
+          focusColor: Colors.white.withOpacity(0.10),
+          child: Ink(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(
+                color: Colors.white.withOpacity(0.55),
+                width: 1.2,
+              ),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: gradientColors,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.12),
+                  blurRadius: 14,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Center(child: child),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Outline glass (secondary) — blur 제거
+  Widget _glassSecondaryButton({
+    required VoidCallback onPressed,
+    required Widget child,
+    required Color accent,
+  }) {
+    const radius = 14.0;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: Material(
+        type: MaterialType.transparency,
+        color: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(radius),
+          splashColor: accent.withOpacity(0.18),
+          highlightColor: Colors.white.withOpacity(0.08),
+          hoverColor: accent.withOpacity(0.14),
+          focusColor: accent.withOpacity(0.08),
+          child: Ink(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(
+                color:
+                    Color.lerp(Colors.white, accent, 0.35)!.withOpacity(0.85),
+                width: 1.2,
+              ),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.white.withOpacity(0.72),
+                  Colors.white.withOpacity(0.42),
+                ],
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Center(child: child),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 설치/업데이트 알림 카드용 버튼 — 블러 없이 진한 틴트로 대비 확보
+  Widget _glassInstallCardActionButton({
+    required String labelKey,
+    required GestureTapCallback onTap,
+    double width = 150,
+  }) {
+    return SizedBox(
+      width: width,
+      child: Material(
+        type: MaterialType.transparency,
+        color: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.zero,
+          splashColor: Colors.white.withOpacity(0.22),
+          highlightColor: Colors.white.withOpacity(0.10),
+          hoverColor: Colors.white.withOpacity(0.18),
+          focusColor: Colors.white.withOpacity(0.10),
+          child: Ink(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.zero,
+              border: Border.all(
+                color: Colors.white.withOpacity(0.85),
+                width: 1.2,
+              ),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  const Color(0xCC1A5F8A),
+                  const Color(0xCC0D4A6E),
+                ],
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Flexible(
+                    child: AutoSizeText(
+                      translate(labelKey),
+                      maxLines: 1,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 20,
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                        shadows: [
+                          Shadow(
+                            color: Color(0x80000000),
+                            blurRadius: 3,
+                            offset: Offset(0, 1),
+                          ),
+                        ],
+                      ),
+                    ).marginSymmetric(horizontal: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget buildLoginSection(BuildContext context) {
+    final accent = MyTheme.accent;
     return Padding(
       padding: const EdgeInsets.only(left: 20.0, right: 16, top: 5, bottom: 10),
       child: Column(
         children: [
           Obx(() {
             final isLoggedIn = gFFI.userModel.userName.value.isNotEmpty;
+            final List<Color> gradientColors = isLoggedIn
+                ? [
+                    Colors.red.shade400.withOpacity(0.78),
+                    Colors.red.shade700.withOpacity(0.58),
+                  ]
+                : [
+                    accent.withOpacity(0.90),
+                    accent.withOpacity(0.72),
+                  ];
             return SizedBox(
               width: double.infinity,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: isLoggedIn ? Colors.red[400] : MyTheme.accent,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                ),
+              child: _glassPrimaryButton(
+                gradientColors: gradientColors,
                 onPressed: () {
                   if (isLoggedIn) {
                     logOutConfirmDialog();
@@ -632,10 +774,21 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                   }
                 },
                 child: Text(
-                  isLoggedIn 
+                  isLoggedIn
                       ? '${translate('Logout')} (${gFFI.userModel.userName.value})'
                       : translate('Login'),
-                  style: const TextStyle(fontSize: 14),
+                  style: const TextStyle(
+                    fontSize: 14,
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                    shadows: [
+                      Shadow(
+                        color: Color(0x40000000),
+                        blurRadius: 2,
+                        offset: Offset(0, 1),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             );
@@ -648,21 +801,26 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 const SizedBox(height: 8),
                 SizedBox(
                   width: double.infinity,
-                  child: OutlinedButton(
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: MyTheme.accent,
-                      side: BorderSide(color: MyTheme.accent),
-                      padding: const EdgeInsets.symmetric(vertical: 10),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
+                  child: _glassSecondaryButton(
+                    accent: accent,
                     onPressed: () async {
-                      await launchUrl(Uri.parse('https://admin.787.kr/api/user_action?action=register'));
+                      await launchUrl(Uri.parse(
+                          'https://admin.787.kr/api/user_action?action=register'));
                     },
                     child: Text(
                       translate('회원가입'),
-                      style: const TextStyle(fontSize: 14),
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: accent,
+                        shadows: [
+                          Shadow(
+                            color: Colors.white.withOpacity(0.5),
+                            blurRadius: 0,
+                            offset: Offset(0, 0.5),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -679,7 +837,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     if (updateUrl.isNotEmpty && !isCardClosed) {
       final latestVersion = stateGlobal.latestVersion.value;
       final appName = bind.mainGetAppNameSync();
-      
+
       return FutureBuilder<String>(
         future: bind.mainGetVersion(),
         builder: (context, snapshot) {
@@ -687,13 +845,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           return buildInstallCard(
               "새 버전 알림",
               "$appName $latestVersion 버전이 출시되었습니다.\n현재 버전: $currentVersion",
-              "다운로드",
-              () async {
-                // 다운로드 페이지로 이동
-                final Uri url = Uri.parse('https://admin.787.kr/executables/MDesk-install.exe');
-                await launchUrl(url);
-              },
-              closeButton: true);
+              "다운로드", () async {
+            if (isWindows) {
+              handleDirectDownloadUpdate(updateUrl);
+            } else {
+              await launchUrl(Uri.parse(updateUrl));
+            }
+          }, closeButton: true);
         },
       );
     }
@@ -851,8 +1009,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 begin: Alignment.centerLeft,
                 end: Alignment.centerRight,
                 colors: [
-                  Color.fromARGB(255, 41, 128, 185),
-                  Color.fromARGB(255, 74, 158, 255),
+                  const Color.fromARGB(248, 36, 115, 168),
+                  const Color.fromARGB(248, 55, 145, 230),
                 ],
               )),
               padding: EdgeInsets.all(20),
@@ -865,9 +1023,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   child: Text(
                                 translate(title),
                                 style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 15),
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                  shadows: [
+                                    Shadow(
+                                      color: Colors.black.withOpacity(0.45),
+                                      blurRadius: 4,
+                                      offset: const Offset(0, 1),
+                                    ),
+                                  ],
+                                ),
                               ).marginOnly(bottom: 6)),
                             ]
                           : <Widget>[]) +
@@ -876,10 +1042,18 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                           Text(
                             translate(content),
                             style: TextStyle(
-                                height: 1.5,
-                                color: Colors.white,
-                                fontWeight: FontWeight.normal,
-                                fontSize: 13),
+                              height: 1.5,
+                              color: Colors.white,
+                              fontWeight: FontWeight.normal,
+                              fontSize: 13,
+                              shadows: [
+                                Shadow(
+                                  color: Colors.black.withOpacity(0.4),
+                                  blurRadius: 3,
+                                  offset: const Offset(0, 1),
+                                ),
+                              ],
+                            ),
                           ).marginOnly(bottom: 20)
                       ] +
                       (btnText.isNotEmpty
@@ -887,17 +1061,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                               Row(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
-                                    FixedWidthButton(
-                                      width: 150,
-                                      padding: 8,
-                                      isOutline: true,
-                                      text: translate(btnText),
-                                      textColor: Colors.white,
-                                      borderColor: Colors.white,
-                                      textSize: 20,
-                                      radius: 10,
+                                    _glassInstallCardActionButton(
+                                      labelKey: btnText,
                                       onTap: onPressed,
-                                    )
+                                    ),
                                   ])
                             ]
                           : <Widget>[]) +
@@ -1008,7 +1175,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
     bool isChattyMethod(String methodName) {
       switch (methodName) {
-        case kWindowBumpMouse: return true;
+        case kWindowBumpMouse:
+          return true;
       }
 
       return false;
@@ -1017,7 +1185,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     rustDeskWinManager.setMethodHandler((call, fromWindowId) async {
       if (!isChattyMethod(call.method)) {
         debugPrint(
-          "[Main] call ${call.method} with args ${call.arguments} from window $fromWindowId");
+            "[Main] call ${call.method} with args ${call.arguments} from window $fromWindowId");
       }
       if (call.method == kWindowMainWindowOnTop) {
         windowOnTop(null);
@@ -1052,9 +1220,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           connToken: call.arguments['connToken'],
         );
       } else if (call.method == kWindowBumpMouse) {
-        return RdPlatformChannel.instance.bumpMouse(
-          dx: call.arguments['dx'],
-          dy: call.arguments['dy']);
+        return RdPlatformChannel.instance
+            .bumpMouse(dx: call.arguments['dx'], dy: call.arguments['dy']);
       } else if (call.method == kWindowEventMoveTabToNewWindow) {
         final args = call.arguments.split(',');
         int? windowId;
@@ -1098,7 +1265,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         _updateWindowSize();
       });
     }
-    WidgetsBinding.instance.addObserver(this);
   }
 
   _updateWindowSize() {
@@ -1120,16 +1286,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
-    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    super.didChangeAppLifecycleState(state);
-    if (state == AppLifecycleState.resumed) {
-      shouldBeBlocked(_block, canBeBlocked);
-    }
   }
 
   Widget buildPluginEntry() {
@@ -1144,6 +1301,85 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           })
         ],
       ),
+    );
+  }
+}
+
+/// 버전 문자열 옆에서 [checkMDeskUpdate]를 수동 실행하는 새로고침 버튼
+class _VersionLabelWithRefresh extends StatefulWidget {
+  const _VersionLabelWithRefresh();
+
+  @override
+  State<_VersionLabelWithRefresh> createState() =>
+      _VersionLabelWithRefreshState();
+}
+
+class _VersionLabelWithRefreshState extends State<_VersionLabelWithRefresh> {
+  bool _checking = false;
+
+  Future<void> _onRefresh() async {
+    if (_checking) return;
+    setState(() => _checking = true);
+    final result = await checkMDeskUpdate();
+    if (!mounted) return;
+    setState(() => _checking = false);
+
+    // 새 버전 알림은 상단 밴드/카드로만 안내 — 하단 스낵바는 쓰지 않음
+    if (result == null && mounted) {
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      messenger?.showSnackBar(
+        const SnackBar(content: Text('버전 확인에 실패했습니다. 네트워크를 확인해 주세요.')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<String>(
+      future: bind.mainGetVersion(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data!.isEmpty) {
+          return const SizedBox.shrink();
+        }
+        final textColor =
+            Theme.of(context).textTheme.bodySmall?.color?.withOpacity(0.6);
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'v${snapshot.data}',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    fontSize: 11,
+                    color: textColor,
+                  ),
+            ),
+            Tooltip(
+              message: '최신 버전 확인',
+              child: InkWell(
+                onTap: _checking ? null : _onRefresh,
+                borderRadius: BorderRadius.circular(12),
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: _checking
+                      ? SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: textColor,
+                          ),
+                        )
+                      : Icon(
+                          Icons.refresh,
+                          size: 14,
+                          color: textColor,
+                        ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

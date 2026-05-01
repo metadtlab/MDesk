@@ -96,6 +96,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Exit Fullscreen", "Exit fullscreen"),
         ("Mobile Actions", "Mobile actions"),
         ("Select Monitor", "Select monitor"),
+        ("Switch to next monitor", "Switch to next monitor"),
         ("Control Actions", "Control actions"),
         ("Display Settings", "Display settings"),
         ("Image Quality", "Image quality"),

@@ -49,6 +49,19 @@ lazy_static::lazy_static! {
     static ref GLOBAL_EVENT_STREAM: RwLock<HashMap<String, StreamSink<String>>> = Default::default(); // rust to dart event channel
 }
 
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+#[derive(Default)]
+struct FileClipboardRouteState {
+    owner_peer_id: String,
+    requester_peer_id: String,
+    pending_format_list_echoes: HashSet<String>,
+}
+
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+lazy_static::lazy_static! {
+    static ref FILE_CLIPBOARD_ROUTE_STATE: RwLock<FileClipboardRouteState> = Default::default();
+}
+
 #[cfg(target_os = "windows")]
 lazy_static::lazy_static! {
     pub static ref TEXTURE_RGBA_RENDERER_PLUGIN: Result<Library, LibError> = load_plugin_in_app_path("texture_rgba_renderer_plugin.dll");
@@ -694,7 +707,8 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     /// unused in flutter, use switch_display or set_peer_info
-    fn set_display(&self, _x: i32, _y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {}
+    fn set_display(&self, _x: i32, _y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {
+    }
 
     fn update_privacy_mode(&self) {
         self.push_event::<&str>("update_privacy_mode", &[], &[]);
@@ -1449,8 +1463,122 @@ pub fn update_file_clipboard_required() {
 
 #[cfg(not(target_os = "ios"))]
 pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
+    send_clipboard_msg_with_excluded_peer(msg, _is_file, None);
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn send_clipboard_msg_except_peer(source_peer_id: &str, msg: Message, _is_file: bool) {
+    send_clipboard_msg_with_excluded_peer(msg, _is_file, Some(source_peer_id));
+}
+
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+#[cfg(not(target_os = "ios"))]
+pub fn relay_file_clipboard_msg_from_peer(
+    source_peer_id: &str,
+    msg: Message,
+    is_format_list: bool,
+    is_try_empty: bool,
+) -> bool {
+    if is_try_empty {
+        let mut state = FILE_CLIPBOARD_ROUTE_STATE.write().unwrap();
+        state.owner_peer_id.clear();
+        state.requester_peer_id.clear();
+        state.pending_format_list_echoes.clear();
+        drop(state);
+        send_clipboard_msg_except_peer(source_peer_id, msg, true);
+        return false;
+    }
+
+    if is_format_list {
+        let mut relayed = false;
+        let mut state = FILE_CLIPBOARD_ROUTE_STATE.write().unwrap();
+        if state.owner_peer_id != source_peer_id
+            && state.pending_format_list_echoes.remove(source_peer_id)
+        {
+            log::debug!(
+                "Ignore echoed file clipboard FormatList from peer {}",
+                source_peer_id
+            );
+            return true;
+        }
+
+        state.owner_peer_id = source_peer_id.to_owned();
+        state.requester_peer_id.clear();
+        state.pending_format_list_echoes.clear();
+        for s in sessions::get_sessions() {
+            if s.get_id() == source_peer_id {
+                continue;
+            }
+            if crate::is_support_file_copy_paste_num(s.lc.read().unwrap().version)
+                && s.is_file_clipboard_required()
+            {
+                state.pending_format_list_echoes.insert(s.get_id());
+                s.send(Data::Message(msg.clone()));
+                relayed = true;
+            }
+        }
+        return relayed;
+    }
+
+    let (owner_peer_id, requester_peer_id) = {
+        let state = FILE_CLIPBOARD_ROUTE_STATE.read().unwrap();
+        (
+            state.owner_peer_id.clone(),
+            state.requester_peer_id.clone(),
+        )
+    };
+    if owner_peer_id.is_empty() {
+        return false;
+    }
+
+    if source_peer_id != owner_peer_id {
+        FILE_CLIPBOARD_ROUTE_STATE
+            .write()
+            .unwrap()
+            .pending_format_list_echoes
+            .remove(source_peer_id);
+        FILE_CLIPBOARD_ROUTE_STATE
+            .write()
+            .unwrap()
+            .requester_peer_id = source_peer_id.to_owned();
+        if let Some(owner) =
+            sessions::get_session_by_peer_id(owner_peer_id, ConnType::DEFAULT_CONN)
+        {
+            if owner.is_file_clipboard_required() {
+                owner.send(Data::Message(msg));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if !requester_peer_id.is_empty() {
+        if let Some(requester) =
+            sessions::get_session_by_peer_id(requester_peer_id, ConnType::DEFAULT_CONN)
+        {
+            if requester.is_file_clipboard_required() {
+                requester.send(Data::Message(msg));
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(not(target_os = "ios"))]
+fn send_clipboard_msg_with_excluded_peer(
+    msg: Message,
+    _is_file: bool,
+    excluded_peer_id: Option<&str>,
+) {
     for s in sessions::get_sessions() {
-        #[cfg(feature = "unix-file-copy-paste")]
+        if let Some(peer_id) = excluded_peer_id {
+            if s.get_id() == peer_id {
+                continue;
+            }
+        }
+        #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
         if _is_file {
             if crate::is_support_file_copy_paste_num(s.lc.read().unwrap().version)
                 && s.is_file_clipboard_required()

@@ -10,6 +10,7 @@ use crate::{
     },
     input::*,
     ui_interface::{self, *},
+    ui_session_interface::InvokeUiSession,
 };
 use flutter_rust_bridge::{StreamSink, SyncReturn};
 #[cfg(feature = "plugin_framework")]
@@ -26,15 +27,39 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicI32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub type SessionID = uuid::Uuid;
 
 lazy_static::lazy_static! {
     static ref TEXTURE_RENDER_KEY: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    static ref REMOTE_DROP_ACTION_GUARD: Mutex<HashMap<String, (SessionID, Instant)>> =
+        Mutex::new(HashMap::new());
+}
+
+const REMOTE_DROP_ACTION_DEDUP_MS: u64 = 1500;
+
+fn should_skip_recent_remote_drop_action(session_id: &SessionID, action_key: String) -> bool {
+    let now = Instant::now();
+    let dedup_window = Duration::from_millis(REMOTE_DROP_ACTION_DEDUP_MS);
+    let mut guard = REMOTE_DROP_ACTION_GUARD.lock().unwrap();
+    guard.retain(|_, (_, instant)| now.duration_since(*instant) <= dedup_window);
+    if let Some((accepted_session_id, accepted_at)) = guard.get(&action_key) {
+        if now.duration_since(*accepted_at) <= dedup_window {
+            log::debug!(
+                "skip duplicated remote drop action, current session: {}, accepted session: {}, key: {}",
+                session_id,
+                accepted_session_id,
+                action_key
+            );
+            return true;
+        }
+    }
+    guard.insert(action_key, (*session_id, now));
+    false
 }
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
@@ -50,6 +75,7 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     } else {
         crate::read_custom_client(custom_client_config);
     }
+    config::apply_product_default_settings();
     #[cfg(target_os = "android")]
     {
         // flexi_logger can't work when android_logger initialized.
@@ -722,6 +748,16 @@ pub fn session_send_files(
     _is_dir: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if !is_remote && fs::is_remote_drop_downloads_path(&to) {
+            let action_key = format!(
+                "send_files|{}|{}|{}|{}|{}",
+                path, to, file_num, include_hidden, _is_dir
+            );
+            if should_skip_recent_remote_drop_action(&session_id, action_key) {
+                session.ui_handler.job_done(act_id, file_num);
+                return;
+            }
+        }
         session.send_files(
             act_id,
             fs::JobType::Generic.into(),
@@ -790,6 +826,13 @@ pub fn session_cancel_job(session_id: SessionID, act_id: i32) {
 
 pub fn session_create_dir(session_id: SessionID, act_id: i32, path: String, is_remote: bool) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if is_remote && fs::is_remote_drop_downloads_path(&path) {
+            let action_key = format!("create_dir|{}|{}", path, is_remote);
+            if should_skip_recent_remote_drop_action(&session_id, action_key) {
+                session.ui_handler.job_done(act_id, -1);
+                return;
+            }
+        }
         session.create_dir(act_id, path, is_remote);
     }
 }
@@ -2703,11 +2746,7 @@ pub fn main_get_common(key: String) -> String {
         } else if key.starts_with("encrypt-conn-pwd:") {
             // 연결 암호를 XSalsa20-Poly1305로 암호화 (machine UUID 기반 키)
             let password = key.replacen("encrypt-conn-pwd:", "", 1);
-            hbb_common::password_security::encrypt_str_or_original(
-                &password,
-                "00",
-                128,
-            )
+            hbb_common::password_security::encrypt_str_or_original(&password, "00", 128)
         } else if key.starts_with("decrypt-conn-pwd:") {
             // 암호화된 연결 암호를 복호화
             let encrypted = key.replacen("decrypt-conn-pwd:", "", 1);
@@ -2844,13 +2883,13 @@ pub fn main_set_common(_key: String, _value: String) {
 }
 
 /// 원격 기기를 API 서버에 등록
-/// 
+///
 /// # Arguments
 /// * `user_id` - 로그인된 유저 ID (username)
 /// * `user_pkid` - 유저 고유 번호
 /// * `remote_id` - 원격 ID (peer ID)
 /// * `alias` - 사용자 지정 별칭
-/// 
+///
 /// # Returns
 /// * JSON 형식의 응답 문자열
 pub fn main_register_device(
@@ -2860,35 +2899,37 @@ pub fn main_register_device(
     alias: String,
 ) -> String {
     match crate::hbbs_http::device_register::register_device(
-        &user_id,
-        &user_pkid,
-        &remote_id,
-        &alias,
+        &user_id, &user_pkid, &remote_id, &alias,
     ) {
-        Ok(response) => {
-            serde_json::to_string(&response).unwrap_or_else(|e| {
-                format!(r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}"}}"#, e)
-            })
-        }
+        Ok(response) => serde_json::to_string(&response).unwrap_or_else(|e| {
+            format!(
+                r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}"}}"#,
+                e
+            )
+        }),
         Err(e) => {
-            format!(r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}"}}"#, e)
+            format!(
+                r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}"}}"#,
+                e
+            )
         }
     }
 }
 
 /// 기기 등록 해제
-pub fn main_unregister_device(
-    user_pkid: String,
-    remote_id: String,
-) -> String {
+pub fn main_unregister_device(user_pkid: String, remote_id: String) -> String {
     match crate::hbbs_http::device_register::unregister_device(&user_pkid, &remote_id) {
-        Ok(response) => {
-            serde_json::to_string(&response).unwrap_or_else(|e| {
-                format!(r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}"}}"#, e)
-            })
-        }
+        Ok(response) => serde_json::to_string(&response).unwrap_or_else(|e| {
+            format!(
+                r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}"}}"#,
+                e
+            )
+        }),
         Err(e) => {
-            format!(r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}"}}"#, e)
+            format!(
+                r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}"}}"#,
+                e
+            )
         }
     }
 }
@@ -2896,13 +2937,17 @@ pub fn main_unregister_device(
 /// 등록된 기기 목록 조회
 pub fn main_get_registered_devices(user_pkid: String) -> String {
     match crate::hbbs_http::device_register::get_registered_devices(&user_pkid) {
-        Ok(response) => {
-            serde_json::to_string(&response).unwrap_or_else(|e| {
-                format!(r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}","data":[]}}"#, e)
-            })
-        }
+        Ok(response) => serde_json::to_string(&response).unwrap_or_else(|e| {
+            format!(
+                r#"{{"success":false,"error":"SERIALIZE_ERROR","message":"{}","data":[]}}"#,
+                e
+            )
+        }),
         Err(e) => {
-            format!(r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}","data":[]}}"#, e)
+            format!(
+                r#"{{"success":false,"error":"INTERNAL_ERROR","message":"{}","data":[]}}"#,
+                e
+            )
         }
     }
 }

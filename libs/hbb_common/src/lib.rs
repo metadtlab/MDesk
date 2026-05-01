@@ -371,15 +371,25 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
     #[allow(unused_mut)]
     let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
     INIT.call_once(|| {
-        #[cfg(debug_assertions)]
+        // 데스크톱 디버그 빌드에서는 원래 env_logger만 켜져 파일에 한 줄도 안 남음(AccessAudit 등).
+        // 모바일(iOS/Android) 디버그만 env_logger 유지, 그 외(데스크톱·릴리스 전부)는 파일 로깅 사용.
+        #[cfg(all(
+            debug_assertions,
+            any(target_os = "android", target_os = "ios")
+        ))]
         {
             use env_logger::*;
             init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
         }
-        #[cfg(not(debug_assertions))]
+
+        // 릴리즈 포함: 데스크톱·Android·iOS(비-디버그)는 모두 아래에서 파일 로그 시도.
+        // (모바일 디버그만 위 env_logger 분기)
+        #[cfg(not(all(
+            debug_assertions,
+            any(target_os = "android", target_os = "ios")
+        )))]
         {
             // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
-            // though async logger more efficient, but it also causes more problems, disable it for now
             let mut path = config::Config::log_path();
             #[cfg(target_os = "android")]
             if !config::Config::get_home().exists() {
@@ -388,23 +398,56 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
             if !_name.is_empty() {
                 path.push(_name);
             }
+            // 디렉터리 미생성 시 flexi 시작 실패로 릴리즈에서도 로그가 안 쌓일 수 있음
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                eprintln!("[hbb_common] init_log: create_dir_all {:?}: {}", path, e);
+            }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
-                logger_holder = x
-                    .log_to_file(FileSpec::default().directory(path))
-                    .write_mode(if _is_async {
-                        WriteMode::Async
-                    } else {
-                        WriteMode::Direct
-                    })
-                    .format(opt_format)
-                    .rotate(
-                        Criterion::Age(Age::Day),
-                        Naming::Timestamps,
-                        Cleanup::KeepLogFiles(31),
-                    )
-                    .start()
-                    .ok();
+            if let Ok(x) = Logger::try_with_env_or_str(
+                "debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
+            ) {
+                let logger = {
+                    let l = x
+                        .log_to_file(FileSpec::default().directory(path))
+                        .write_mode(if _is_async {
+                            WriteMode::Async
+                        } else {
+                            WriteMode::Direct
+                        })
+                        .format(opt_format)
+                        .rotate(
+                            Criterion::Age(Age::Day),
+                            Naming::Timestamps,
+                            Cleanup::KeepLogFiles(31),
+                        );
+                    #[cfg(all(debug_assertions, not(any(target_os = "android", target_os = "ios"))))]
+                    {
+                        // 디버그 실행 시에도 콘솔에서 수준 이상 로그 확인
+                        l.duplicate_to_stderr(Duplicate::Info)
+                    }
+                    #[cfg(not(all(
+                        debug_assertions,
+                        not(any(target_os = "android", target_os = "ios"))
+                    )))]
+                    {
+                        l
+                    }
+                };
+                match logger.start() {
+                    Ok(handle) => {
+                        logger_holder = Some(handle);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[hbb_common] init_log: flexi_logger start failed (no file logs): {}",
+                            e
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[hbb_common] init_log: Logger::try_with_env_or_str failed (no file logs)"
+                );
             }
         }
     });

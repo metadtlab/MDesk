@@ -481,69 +481,333 @@ fn patch(path: PathBuf) -> PathBuf {
     path
 }
 
-/// Windows에서 현재 로그인한 사용자의 프로필 경로 가져오기
-/// 레지스트리에서 마지막으로 로그인한 사용자 정보를 읽음
+/// Windows에서 서비스(SYSTEM)가 사용할 “콘솔 사용자” 프로필 루트 경로
+/// (예: `C:\Users\OPD12`). Flutter/UI가 쓰는 `...\Roaming\<앱>\config`와 동일해야 함.
 #[cfg(windows)]
 fn get_console_user_profile_path() -> Option<String> {
-    use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, RegCloseKey};
-    use winapi::um::winnt::{REG_SZ, KEY_READ};
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
-    
-    unsafe {
+    use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS};
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::processenv::ExpandEnvironmentStringsW;
+    use winapi::um::winbase::{LocalFree, LookupAccountNameW};
+    use winapi::um::winnt::{PSID, REG_EXPAND_SZ, REG_SZ, SID_NAME_USE, SidTypeUser};
+    use winapi::um::winreg::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE,
+    };
+    use winapi::um::winnt::KEY_READ;
+    use winapi::shared::sddl::ConvertSidToStringSidW;
+
+    /// LogonUI 키에 있는 SZ 값 읽기
+    unsafe fn read_logon_ui_value(value_name: &str) -> Option<String> {
         let key_path: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI\0"
-            .encode_utf16().collect();
-        let value_name: Vec<u16> = "LastLoggedOnUser\0".encode_utf16().collect();
-        
+            .encode_utf16()
+            .collect();
+        let vn: Vec<u16> = OsStr::new(value_name).encode_wide().chain(std::iter::once(0)).collect();
         let mut hkey = null_mut();
         if RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
             return None;
         }
-        
         let mut data_type: u32 = 0;
-        let mut data_size: u32 = 512;
-        let mut data: Vec<u16> = vec![0; 256];
-        
-        let result = RegQueryValueExW(
+        let mut data_size: u32 = 0;
+        let r = RegQueryValueExW(
             hkey,
-            value_name.as_ptr(),
+            vn.as_ptr(),
             null_mut(),
             &mut data_type,
-            data.as_mut_ptr() as *mut u8,
+            null_mut(),
             &mut data_size,
         );
-        
-        RegCloseKey(hkey);
-        
-        if result != 0 || data_type != REG_SZ {
+        if r != 0 || (data_type != REG_SZ && data_type != REG_EXPAND_SZ) {
+            RegCloseKey(hkey);
             return None;
         }
-        
-        // UTF-16 문자열을 Rust 문자열로 변환
-        let len = (data_size / 2) as usize;
-        let username_full = String::from_utf16_lossy(&data[..len])
-            .trim_end_matches('\0')
-            .to_string();
-        
-        // "DOMAIN\\username" 또는 "username" 형식에서 사용자 이름만 추출
-        let username = if let Some(pos) = username_full.rfind('\\') {
-            &username_full[pos + 1..]
+        let mut buf = vec![0u8; data_size as usize];
+        let r2 = RegQueryValueExW(
+            hkey,
+            vn.as_ptr(),
+            null_mut(),
+            &mut data_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut data_size,
+        );
+        RegCloseKey(hkey);
+        if r2 != 0 {
+            return None;
+        }
+        let n_wchars = (data_size as usize / 2).saturating_sub(1);
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(
+            buf.as_ptr() as *const u16,
+            n_wchars,
+        ));
+        let s = s.trim_end_matches('\0').trim().to_string();
+        if s.is_empty() {
+            return None;
+        }
+        Some(s)
+    }
+
+    unsafe fn expand_reg_path(raw: &str) -> String {
+        let wide_in: Vec<u16> = OsStr::new(raw)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut out = vec![0u16; 32767];
+        let n = ExpandEnvironmentStringsW(wide_in.as_ptr(), out.as_mut_ptr(), out.len() as u32);
+        if n == 0 || (n as usize) > out.len() {
+            return raw.to_string();
+        }
+        String::from_utf16_lossy(&out[..(n as usize).saturating_sub(1)])
+    }
+
+    unsafe fn profile_path_from_sid(sid: &str) -> Option<String> {
+        let sid = sid.trim();
+        if sid.is_empty() {
+            return None;
+        }
+        let sub = format!(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{}",
+            sid
+        );
+        let sub_w: Vec<u16> = OsStr::new(&sub)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut hkey = null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_w.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return None;
+        }
+        let val: Vec<u16> = OsStr::new("ProfileImagePath")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dt = 0u32;
+        let mut sz = 0u32;
+        if RegQueryValueExW(
+            hkey,
+            val.as_ptr(),
+            null_mut(),
+            &mut dt,
+            null_mut(),
+            &mut sz,
+        ) != 0
+        {
+            RegCloseKey(hkey);
+            return None;
+        }
+        if dt != REG_SZ && dt != REG_EXPAND_SZ {
+            RegCloseKey(hkey);
+            return None;
+        }
+        let mut buf = vec![0u8; sz as usize];
+        if RegQueryValueExW(
+            hkey,
+            val.as_ptr(),
+            null_mut(),
+            &mut dt,
+            buf.as_mut_ptr() as *mut u8,
+            &mut sz,
+        ) != 0
+        {
+            RegCloseKey(hkey);
+            return None;
+        }
+        RegCloseKey(hkey);
+        let n_wchars = (sz as usize / 2).saturating_sub(1);
+        let raw = String::from_utf16_lossy(std::slice::from_raw_parts(
+            buf.as_ptr() as *const u16,
+            n_wchars,
+        ));
+        let raw = raw.trim_end_matches('\0').trim().to_string();
+        if raw.is_empty() {
+            return None;
+        }
+        let out = if dt == REG_EXPAND_SZ {
+            expand_reg_path(&raw)
         } else {
-            &username_full
+            raw
         };
-        
+        let path = std::path::Path::new(&out);
+        if path.exists() {
+            Some(out)
+        } else {
+            log::debug!("[Config] ProfileImagePath does not exist: {}", out);
+            None
+        }
+    }
+
+    unsafe fn lookup_sid_string(account: &str) -> Option<String> {
+        use winapi::um::winnt::LPWSTR;
+        let acc: Vec<u16> = OsStr::new(account)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sid = vec![0u8; 256];
+        let mut cb_sid = sid.len() as u32;
+        let mut domain = vec![0u16; 256];
+        let mut cch_domain = domain.len() as u32;
+        let mut sid_use: SID_NAME_USE = SidTypeUser;
+        let mut ok = LookupAccountNameW(
+            null_mut(),
+            acc.as_ptr(),
+            sid.as_mut_ptr() as PSID,
+            &mut cb_sid,
+            domain.as_mut_ptr(),
+            &mut cch_domain,
+            &mut sid_use,
+        );
+        if ok == 0 {
+            let e = GetLastError();
+            if e != ERROR_INSUFFICIENT_BUFFER {
+                return None;
+            }
+            sid.resize(cb_sid as usize, 0);
+            domain.resize(std::cmp::max(cch_domain as usize, 2), 0);
+            cb_sid = sid.len() as u32;
+            cch_domain = domain.len() as u32;
+            ok = LookupAccountNameW(
+                null_mut(),
+                acc.as_ptr(),
+                sid.as_mut_ptr() as PSID,
+                &mut cb_sid,
+                domain.as_mut_ptr(),
+                &mut cch_domain,
+                &mut sid_use,
+            );
+            if ok == 0 {
+                return None;
+            }
+        }
+        let mut str_sid: LPWSTR = null_mut();
+        if ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut str_sid) == 0 {
+            return None;
+        }
+        if str_sid.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *str_sid.add(len) != 0 {
+            len += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(str_sid, len));
+        LocalFree(str_sid as *mut _);
+        Some(s)
+    }
+
+    fn username_tail(full: &str) -> String {
+        if let Some(p) = full.rfind('\\') {
+            full[p + 1..].to_string()
+        } else {
+            full.to_string()
+        }
+    }
+
+    unsafe fn enumerate_profile_match_user(username: &str) -> Option<String> {
+        let u = username.trim();
+        if u.is_empty() {
+            return None;
+        }
+        let key_path: Vec<u16> =
+            OsStr::new(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+        let mut hkey = null_mut();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key_path.as_ptr(),
+            0,
+            KEY_READ,
+            &mut hkey,
+        ) != 0
+        {
+            return None;
+        }
+        let mut idx = 0u32;
+        loop {
+            let mut name_buf = vec![0u16; 128];
+            let mut name_len = name_buf.len() as u32;
+            let e = RegEnumKeyExW(
+                hkey,
+                idx,
+                name_buf.as_mut_ptr(),
+                &mut name_len,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            if e == ERROR_NO_MORE_ITEMS as i32 {
+                break;
+            }
+            if e != 0 {
+                break;
+            }
+            idx += 1;
+            let sid_str = String::from_utf16_lossy(&name_buf[..name_len as usize])
+                .trim()
+                .to_string();
+            if sid_str.is_empty() {
+                continue;
+            }
+            if sid_str == "S-1-5-18" || sid_str == "S-1-5-19" || sid_str == "S-1-5-20" {
+                continue;
+            }
+            if let Some(p) = profile_path_from_sid(&sid_str) {
+                if let Some(seg) = std::path::Path::new(&p).file_name().and_then(|x| x.to_str()) {
+                    if seg.eq_ignore_ascii_case(u) {
+                        RegCloseKey(hkey);
+                        log::debug!("[Config] ProfileList folder match: {} -> {}", u, p);
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        RegCloseKey(hkey);
+        None
+    }
+
+    unsafe {
+        for vname in &["LastLoggedOnUserSID", "SelectedUserSID"] {
+            if let Some(sid) = read_logon_ui_value(vname) {
+                if let Some(p) = profile_path_from_sid(&sid) {
+                    log::debug!("[Config] Profile path via {}: {}", vname, p);
+                    return Some(p);
+                }
+            }
+        }
+
+        let username_full = read_logon_ui_value("LastLoggedOnUser")?;
+        let username = username_tail(&username_full);
         if username.is_empty() {
             return None;
         }
-        
-        // 사용자 프로필 경로 구성
-        let profile_path = format!("C:\\Users\\{}", username);
-        if std::path::Path::new(&profile_path).exists() {
-            log::debug!("[Config] Found user profile path: {}", profile_path);
-            Some(profile_path)
-        } else {
-            log::debug!("[Config] User profile path not found: {}", profile_path);
-            None
+
+        let guess = format!("C:\\Users\\{}", username);
+        if std::path::Path::new(&guess).exists() {
+            log::debug!("[Config] Profile path (C:\\Users guess): {}", guess);
+            return Some(guess);
         }
+
+        for acc in [username_full.as_str(), username.as_str()] {
+            if let Some(sid) = lookup_sid_string(acc) {
+                if let Some(p) = profile_path_from_sid(&sid) {
+                    log::debug!("[Config] Profile path via LookupAccountName ({}): {}", acc, p);
+                    return Some(p);
+                }
+            }
+        }
+
+        if let Some(p) = enumerate_profile_match_user(&username) {
+            return Some(p);
+        }
+
+        log::debug!(
+            "[Config] User profile path not resolved: LastLoggedOnUser={}",
+            username_full
+        );
+        None
     }
 }
 
@@ -2679,6 +2943,16 @@ pub fn option2bool(option: &str, value: &str) -> bool {
     } else {
         value != "N"
     }
+}
+
+/// Product defaults merged into [`DEFAULT_SETTINGS`] when a key is not already set
+/// (for example by custom client). Call after [`load_custom_client`] / `read_custom_client`.
+pub fn apply_product_default_settings() {
+    DEFAULT_SETTINGS
+        .write()
+        .unwrap()
+        .entry(keys::OPTION_ALLOW_REMOVE_WALLPAPER.to_string())
+        .or_insert_with(|| "Y".to_string());
 }
 
 pub fn use_ws() -> bool {

@@ -1,7 +1,9 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 
@@ -82,6 +84,8 @@ class WhiteboardController extends GetxController {
   
   // 캔버스에서 원격 화면이 그려지는 영역 (오프셋 및 스케일 고려)
   Rect remoteDisplayRect = Rect.zero;
+  Rect currentDisplayDesktopRect = Rect.zero;
+  Rect virtualDesktopRect = Rect.zero;
   
   // 색상 팔레트
   final List<Color> colorPalette = [
@@ -122,6 +126,14 @@ class WhiteboardController extends GetxController {
       }
     }
     remoteDisplayRect = rect;
+  }
+
+  void setDesktopGeometry({
+    required Rect currentDisplayRect,
+    required Rect virtualRect,
+  }) {
+    currentDisplayDesktopRect = currentDisplayRect;
+    virtualDesktopRect = virtualRect;
   }
   
   /// 제어자 화면의 그림만 지우기 (피제어자에게 전송하지 않음)
@@ -271,7 +283,7 @@ class WhiteboardController extends GetxController {
     
     if (normalizedPoints.isEmpty) return;
     
-    final data = {
+    final data = <String, dynamic>{
       'type': 'stroke',
       'points': normalizedPoints,
       'color': stroke.color.value,
@@ -279,6 +291,14 @@ class WhiteboardController extends GetxController {
       'tool': stroke.tool.index,
       'isEraser': stroke.isEraser,
     };
+    if (currentDisplayDesktopRect.width > 0 &&
+        currentDisplayDesktopRect.height > 0 &&
+        virtualDesktopRect.width > 0 &&
+        virtualDesktopRect.height > 0) {
+      data['coordSpace'] = 'display-local-v1';
+      data['displayRect'] = _rectToJson(currentDisplayDesktopRect);
+      data['virtualRect'] = _rectToJson(virtualDesktopRect);
+    }
     _sendData(data);
   }
   
@@ -310,6 +330,15 @@ class WhiteboardController extends GetxController {
     } catch (e) {
       debugPrint('Whiteboard: Failed to send data: $e');
     }
+  }
+
+  Map<String, double> _rectToJson(Rect rect) {
+    return {
+      'x': rect.left,
+      'y': rect.top,
+      'w': rect.width,
+      'h': rect.height,
+    };
   }
 }
 
@@ -391,6 +420,15 @@ class WhiteboardReceiverController extends GetxController {
 }
 
 /// 화이트보드 오버레이 위젯
+class _DesktopGeometry {
+  final Rect currentDisplayRect;
+  final Rect virtualRect;
+  const _DesktopGeometry({
+    required this.currentDisplayRect,
+    required this.virtualRect,
+  });
+}
+
 class WhiteboardOverlay extends StatelessWidget {
   final WhiteboardController controller;
   final FFI? ffi;
@@ -407,13 +445,9 @@ class WhiteboardOverlay extends StatelessWidget {
     
     try {
       final canvasModel = ffi!.canvasModel;
-      final displays = ffi!.ffiModel.pi.getCurDisplays();
-      
-      if (displays.isEmpty) return Rect.zero;
-      
-      final display = displays[0];
-      final displayWidth = display.width.toDouble();
-      final displayHeight = display.height.toDouble();
+      final displayWidth = canvasModel.getDisplayWidth().toDouble();
+      final displayHeight = canvasModel.getDisplayHeight().toDouble();
+      if (displayWidth <= 0 || displayHeight <= 0) return Rect.zero;
       
       // 스케일과 오프셋 가져오기
       final scale = canvasModel.scale;
@@ -430,6 +464,55 @@ class WhiteboardOverlay extends StatelessWidget {
     } catch (e) {
       debugPrint('Whiteboard: Failed to calculate remote display rect: $e');
       return Rect.zero;
+    }
+  }
+
+  _DesktopGeometry? _calculateDesktopGeometry() {
+    if (ffi == null) return null;
+    try {
+      final pi = ffi!.ffiModel.pi;
+      final displays = pi.displays.toList();
+      if (displays.isEmpty) {
+        return null;
+      }
+
+      var minX = displays.first.x;
+      var minY = displays.first.y;
+      var maxX = displays.first.x + displays.first.width;
+      var maxY = displays.first.y + displays.first.height;
+      for (final d in displays.skip(1)) {
+        minX = min(minX, d.x);
+        minY = min(minY, d.y);
+        maxX = max(maxX, d.x + d.width);
+        maxY = max(maxY, d.y + d.height);
+      }
+      final virtualRect =
+          Rect.fromLTWH(minX, minY, maxX - minX, maxY - minY);
+
+      if (pi.currentDisplay == kAllDisplayValue) {
+        return _DesktopGeometry(
+          currentDisplayRect: virtualRect,
+          virtualRect: virtualRect,
+        );
+      }
+
+      final current = pi.tryGetDisplayIfNotAllDisplay(display: pi.currentDisplay) ??
+          pi.tryGetDisplay(display: pi.currentDisplay);
+      if (current == null) {
+        return null;
+      }
+      return _DesktopGeometry(
+        currentDisplayRect: Rect.fromLTWH(
+          current.x,
+          current.y,
+          current.width.toDouble(),
+          current.height.toDouble(),
+        ),
+        virtualRect: virtualRect,
+      );
+    } catch (e) {
+      debugPrint('Whiteboard: Failed to calculate desktop geometry: $e');
+      return null;
     }
   }
   
@@ -456,6 +539,13 @@ class WhiteboardOverlay extends StatelessWidget {
                   final remoteRect = _calculateRemoteDisplayRect(canvasSize);
                   if (remoteRect.width > 0 && remoteRect.height > 0) {
                     controller.setRemoteDisplayRect(remoteRect);
+                  }
+                  final desktopGeometry = _calculateDesktopGeometry();
+                  if (desktopGeometry != null) {
+                    controller.setDesktopGeometry(
+                      currentDisplayRect: desktopGeometry.currentDisplayRect,
+                      virtualRect: desktopGeometry.virtualRect,
+                    );
                   }
                 });
                 

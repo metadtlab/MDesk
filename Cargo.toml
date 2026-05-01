@@ -1,6 +1,6 @@
 [package]
 name = "MDesk"
-version = "1.4.26"
+version = "1.4.45"
 authors = ["MDesk <metadtlab@Gmail.com>"]
 edition = "2021"
 build= "build.rs"
@@ -23,6 +23,7 @@ path = "src/service.rs"
 [features]
 inline = []
 cli = []
+headless = []
 use_samplerate = ["samplerate"]
 use_rubato = ["rubato"]
 use_dasp = ["dasp"]

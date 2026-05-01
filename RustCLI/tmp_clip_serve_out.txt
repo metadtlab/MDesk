@@ -1,0 +1,13 @@
+portable mode detected
+portable source=MDESK_APPNAME=rustcli-id=imedix-api=https://admin.787.kr.exe
+portable user_id=imedix
+portable api_hint=https://admin.787.kr
+portable custom_config app_name=아이메딕스CRM title=카카오알림톡 원격지원! has_password=yes has_encrypted_password=yes has_logo=no
+portable custom_config description_loaded=yes
+portable login_password source=custom_config length=6 applied_length=6 verification_method=use-permanent-password approve_mode=password
+portable rendezvous_server=mdesk.imedixerp.co.kr:21116
+portable api_server=https://admin.787.kr
+portable custom_id=imedix custom_agentid=-
+starting rustcli host server
+version=1.4.35
+id=5270854

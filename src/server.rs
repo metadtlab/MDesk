@@ -554,10 +554,13 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
                 log::error!("Failed to start ipc: {}", err);
+                eprintln!("[diag] IPC start failed: {}", err);
                 if crate::is_server() {
                     log::error!("ipc is occupied by another process, try kill it");
+                    eprintln!("[diag] ipc is occupied by another process, try kill it");
                     std::thread::spawn(stop_main_window_process).join().ok();
                 }
+                eprintln!("[diag] exiting due to IPC failure");
                 std::process::exit(-1);
             }
         });
