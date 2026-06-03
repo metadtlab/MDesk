@@ -1499,7 +1499,8 @@ pub fn main_change_theme(dark: String) {
     send_to_cm(&crate::ipc::Data::Theme(dark));
 }
 
-pub fn main_change_language(lang: String) {
+pub fn main_change_language(_lang: String) {
+    let lang = "ko".to_owned();
     main_broadcast_message(&HashMap::from([("name", "language"), ("lang", &lang)]));
     #[cfg(not(any(target_os = "ios")))]
     send_to_cm(&crate::ipc::Data::Language(lang));

@@ -21,6 +21,18 @@ pub struct DeviceRegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRegisterResponse {
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_register: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_device: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<i64>,
     #[serde(default)]
     pub message: String,
     #[serde(default)]
@@ -45,6 +57,12 @@ impl Default for DeviceRegisterResponse {
     fn default() -> Self {
         Self {
             success: false,
+            code: None,
+            can_register: None,
+            existing_device: None,
+            limit: None,
+            used: None,
+            remaining: None,
             message: String::new(),
             error: None,
             data: None,
@@ -62,6 +80,94 @@ fn get_api_server() -> String {
 /// access_token을 가져옵니다
 fn get_access_token() -> String {
     hbb_common::config::LocalConfig::get_option("access_token")
+}
+
+fn register_limit_decision(response: &DeviceRegisterResponse) -> Option<bool> {
+    if response.existing_device == Some(true) {
+        return Some(true);
+    }
+    match (response.limit, response.used) {
+        (Some(limit), Some(used)) => return Some(used < limit),
+        _ => {}
+    }
+    if let Some(can_register) = response.can_register {
+        return Some(can_register);
+    }
+    None
+}
+
+pub fn check_device_register_limit(
+    user_id: &str,
+    user_pkid: &str,
+    remote_id: &str,
+) -> ResultType<DeviceRegisterResponse> {
+    let api_server = get_api_server();
+    if api_server.is_empty() {
+        log::error!("API server is not configured");
+        return Ok(DeviceRegisterResponse {
+            success: false,
+            message: "API server is not configured".to_string(),
+            error: Some("NO_API_SERVER".to_string()),
+            ..Default::default()
+        });
+    }
+
+    let url = format!("{}/api/device/register/check", api_server);
+    let client = create_http_client_with_url(&url);
+    let body = json!({
+        "remote_id": remote_id,
+        "user_id": user_id,
+        "user_pkid": user_pkid,
+    });
+    let access_token = get_access_token();
+
+    log::info!("Checking device register limit: remote_id={}", remote_id);
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .json(&body)
+        .send();
+
+    match resp {
+        Ok(response) => {
+            let status = response.status();
+            log::info!("Device register limit check response status: {}", status);
+
+            match response.json::<DeviceRegisterResponse>() {
+                Ok(result) => {
+                    if register_limit_decision(&result) == Some(false) {
+                        log::warn!(
+                            "Device register limit exceeded: remote_id={}, limit={:?}, used={:?}",
+                            remote_id,
+                            result.limit,
+                            result.used
+                        );
+                    }
+                    Ok(result)
+                }
+                Err(e) => {
+                    log::error!("Failed to parse device register limit response: {}", e);
+                    Ok(DeviceRegisterResponse {
+                        success: false,
+                        message: format!("Failed to parse response: {}", e),
+                        error: Some("PARSE_ERROR".to_string()),
+                        ..Default::default()
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Device register limit check request failed: {}", e);
+            Ok(DeviceRegisterResponse {
+                success: false,
+                message: format!("Request failed: {}", e),
+                error: Some("REQUEST_FAILED".to_string()),
+                ..Default::default()
+            })
+        }
+    }
 }
 
 /// 원격 기기를 API 서버에 등록
@@ -88,8 +194,38 @@ pub fn register_device(
             success: false,
             message: "API server is not configured".to_string(),
             error: Some("NO_API_SERVER".to_string()),
-            data: None,
+            ..Default::default()
         });
+    }
+
+    match check_device_register_limit(user_id, user_pkid, remote_id) {
+        Ok(limit_check) => {
+            if register_limit_decision(&limit_check) == Some(false) {
+                let mut blocked = limit_check;
+                blocked.success = false;
+                if blocked.code.is_none() {
+                    blocked.code = Some(0);
+                }
+                blocked.can_register = Some(false);
+                if blocked.error.is_none() {
+                    blocked.error = Some("DEVICE_LIMIT_EXCEEDED".to_string());
+                }
+                if blocked.message.is_empty() {
+                    if let (Some(limit), Some(used)) = (blocked.limit, blocked.used) {
+                        blocked.message = format!(
+                            "Device registration limit exceeded. limit={}, used={}",
+                            limit, used
+                        );
+                    } else {
+                        blocked.message = "Device registration limit exceeded.".to_string();
+                    }
+                }
+                return Ok(blocked);
+            }
+        }
+        Err(e) => {
+            log::warn!("Device register limit check failed before register: {}", e);
+        }
     }
 
     let url = format!("{}/api/device/register", api_server);
@@ -147,7 +283,7 @@ pub fn register_device(
                         success: false,
                         message: format!("Failed to parse response: {}", e),
                         error: Some("PARSE_ERROR".to_string()),
-                        data: None,
+                        ..Default::default()
                     })
                 }
             }
@@ -158,7 +294,7 @@ pub fn register_device(
                 success: false,
                 message: format!("Request failed: {}", e),
                 error: Some("REQUEST_FAILED".to_string()),
-                data: None,
+                ..Default::default()
             })
         }
     }
@@ -173,7 +309,7 @@ pub fn unregister_device(user_pkid: &str, remote_id: &str) -> ResultType<DeviceR
             success: false,
             message: "API server is not configured".to_string(),
             error: Some("NO_API_SERVER".to_string()),
-            data: None,
+            ..Default::default()
         });
     }
 
@@ -212,7 +348,7 @@ pub fn unregister_device(user_pkid: &str, remote_id: &str) -> ResultType<DeviceR
                     success: false,
                     message: format!("Failed to parse response: {}", e),
                     error: Some("PARSE_ERROR".to_string()),
-                    data: None,
+                    ..Default::default()
                 })
             }
         },
@@ -222,7 +358,7 @@ pub fn unregister_device(user_pkid: &str, remote_id: &str) -> ResultType<DeviceR
                 success: false,
                 message: format!("Request failed: {}", e),
                 error: Some("REQUEST_FAILED".to_string()),
-                data: None,
+                ..Default::default()
             })
         }
     }

@@ -5,14 +5,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/peer_card.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
-import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
-import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
     as mod_menu;
-import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_hbb/utils/device_register_service.dart';
@@ -660,45 +657,81 @@ class _PeerTreeViewState extends State<PeerTreeView> {
                 ),
                 Expanded(
                   child: isLoggedIn
-                      ? Row(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Expanded(
-                              flex: _selectedPeerId != null ? 13 : 1,
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  _buildColumnHeader(),
-                                  Expanded(
-                                    child: SingleChildScrollView(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          _buildRecentSessionsCategory(),
-                                          _buildFavoritesCategory(),
-                                          _buildMyDevicesCategory(),
-                                          _buildAddressBookCategory(),
-                                        ],
-                                      ),
+                      ? LayoutBuilder(
+                          builder: (context, constraints) {
+                            final hasSelection = _selectedPeerId != null &&
+                                _selectedSource != null;
+                            final useBottomDetail = hasSelection &&
+                                (isMobile || constraints.maxWidth < 560);
+
+                            final listPane = Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                _buildColumnHeader(),
+                                Expanded(
+                                  child: SingleChildScrollView(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        _buildRecentSessionsCategory(),
+                                        _buildFavoritesCategory(),
+                                        _buildMyDevicesCategory(),
+                                        _buildAddressBookCategory(),
+                                      ],
                                     ),
                                   ),
+                                ),
+                              ],
+                            );
+
+                            if (!hasSelection) {
+                              return listPane;
+                            }
+
+                            if (useBottomDetail) {
+                              final detailHeight =
+                                  constraints.maxHeight.isFinite
+                                      ? (constraints.maxHeight * 0.42)
+                                          .clamp(180.0, 300.0)
+                                          .toDouble()
+                                      : 240.0;
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Expanded(child: listPane),
+                                  Divider(
+                                    height: 1,
+                                    thickness: 1,
+                                    color: panelBorder,
+                                  ),
+                                  SizedBox(
+                                    height: detailHeight,
+                                    child: _buildDeviceDetailPanel(),
+                                  ),
                                 ],
-                              ),
-                            ),
-                            if (_selectedPeerId != null &&
-                                _selectedSource != null) ...[
-                              VerticalDivider(
-                                width: 1,
-                                thickness: 1,
-                                color: panelBorder,
-                              ),
-                              Expanded(
-                                flex: 11,
-                                child: _buildDeviceDetailPanel(),
-                              ),
-                            ],
-                          ],
+                              );
+                            }
+
+                            return Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Expanded(
+                                  flex: 13,
+                                  child: listPane,
+                                ),
+                                VerticalDivider(
+                                  width: 1,
+                                  thickness: 1,
+                                  color: panelBorder,
+                                ),
+                                Expanded(
+                                  flex: 11,
+                                  child: _buildDeviceDetailPanel(),
+                                ),
+                              ],
+                            );
+                          },
                         )
                       : _buildLoginRequiredMessage(),
                 ),
@@ -1555,36 +1588,6 @@ class _PeerTreeViewState extends State<PeerTreeView> {
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildRecentCategory() {
-    return ChangeNotifierProvider<Peers>.value(
-      value: gFFI.recentPeersModel,
-      child: Consumer<Peers>(
-        builder: (context, peers, child) {
-          final peerList = peers.peers;
-          final isExpanded = _expandedCategories['recent'] ?? true;
-
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildCategoryHeader(
-                title: translate('Recent sessions'),
-                categoryKey: 'recent',
-                itemCount: peerList.length,
-                icon: Icons.access_time,
-                iconColor: Colors.blue,
-              ),
-              if (isExpanded)
-                ...peerList
-                    .map(
-                        (peer) => _buildPeerItem(peer, TreeViewPeerType.recent))
-                    .toList(),
-            ],
-          );
-        },
       ),
     );
   }

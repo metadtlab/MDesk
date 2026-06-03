@@ -170,6 +170,7 @@ lazy_static::lazy_static! {
 }
 
 const PUBLIC_SERVER: &str = "public";
+const FAST_RELAY_FALLBACK_TIMEOUT: u64 = 3_000;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_key_state(key: enigo::Key) -> bool {
@@ -409,6 +410,7 @@ impl Client {
         let my_addr = socket.local_addr();
         let mut signed_id_pk = Vec::new();
         let mut relay_server = "".to_owned();
+        let fallback_relay_server = Self::fallback_relay_server(&rendezvous_server);
         let mut peer_addr = Config::get_any_listen_addr(true);
         let mut peer_nat_type = NatType::UNKNOWN_NAT;
         let my_nat_type = crate::get_nat_type(100).await;
@@ -595,6 +597,35 @@ impl Client {
                         log::error!("Unexpected protobuf msg received: {:?}", msg_in);
                     }
                 }
+            } else if i == 1
+                && Self::fast_relay_fallback_enabled(
+                    conn_type,
+                    &fallback_relay_server,
+                    false,
+                    interface.is_force_relay(),
+                )
+            {
+                log::info!(
+                    "fast relay fallback: no punch response after {} ms, requesting relay_server: {}",
+                    FAST_RELAY_FALLBACK_TIMEOUT,
+                    fallback_relay_server
+                );
+                let mut conn = Self::request_relay(
+                    &peer,
+                    fallback_relay_server.clone(),
+                    &rendezvous_server,
+                    false,
+                    &key,
+                    &token,
+                    conn_type,
+                )
+                .await?;
+                let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
+                return Ok((
+                    (conn, false, pk, None, "Relay"),
+                    (feedback, rendezvous_server),
+                    true,
+                ));
             }
         }
         drop(socket);
@@ -697,6 +728,20 @@ impl Client {
                 connect_timeout = MIN;
             }
         }
+        if Self::fast_relay_fallback_enabled(
+            conn_type,
+            relay_server,
+            is_local,
+            interface.is_force_relay(),
+        ) && connect_timeout > FAST_RELAY_FALLBACK_TIMEOUT
+        {
+            log::info!(
+                "fast relay fallback: cap direct timeout from {} to {} ms",
+                connect_timeout,
+                FAST_RELAY_FALLBACK_TIMEOUT
+            );
+            connect_timeout = FAST_RELAY_FALLBACK_TIMEOUT;
+        }
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
 
@@ -762,6 +807,28 @@ impl Client {
         };
         log::debug!("{} punch secure_connection ok", punch_type);
         Ok((conn, direct, pk, kcp, typ))
+    }
+
+    fn fast_relay_fallback_enabled(
+        conn_type: ConnType,
+        relay_server: &str,
+        is_local: bool,
+        force_relay: bool,
+    ) -> bool {
+        conn_type == ConnType::DEFAULT_CONN
+            && !relay_server.is_empty()
+            && !is_local
+            && !force_relay
+            && Config::get_bool_option(keys::OPTION_ALLOW_FAST_RELAY_FALLBACK)
+    }
+
+    fn fallback_relay_server(rendezvous_server: &str) -> String {
+        let relay_server = Config::get_option(keys::OPTION_RELAY_SERVER);
+        if relay_server.is_empty() {
+            crate::increase_port(rendezvous_server, 1)
+        } else {
+            check_port(relay_server, RELAY_PORT)
+        }
     }
 
     /// Establish secure connection with the server.

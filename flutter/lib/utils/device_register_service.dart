@@ -2,9 +2,35 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
 
+int? _jsonInt(dynamic value) {
+  if (value == null) return null;
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value);
+  return null;
+}
+
+bool? _jsonBool(dynamic value) {
+  if (value == null) return null;
+  if (value is bool) return value;
+  if (value is num) return value != 0;
+  if (value is String) {
+    final normalized = value.toLowerCase();
+    if (normalized == 'true' || normalized == '1') return true;
+    if (normalized == 'false' || normalized == '0') return false;
+  }
+  return null;
+}
+
 /// 기기 등록 응답 모델
 class DeviceRegisterResponse {
   final bool success;
+  final int? code;
+  final bool? canRegister;
+  final bool? existingDevice;
+  final int? limit;
+  final int? used;
+  final int? remaining;
   final String message;
   final String? error;
   final DeviceData? data;
@@ -12,6 +38,12 @@ class DeviceRegisterResponse {
 
   DeviceRegisterResponse({
     required this.success,
+    this.code,
+    this.canRegister,
+    this.existingDevice,
+    this.limit,
+    this.used,
+    this.remaining,
     required this.message,
     this.error,
     this.data,
@@ -21,17 +53,57 @@ class DeviceRegisterResponse {
   /// 401 Unauthorized 응답인지 확인
   bool get isUnauthorized => statusCode == 401 || error == 'UNAUTHORIZED';
 
-  factory DeviceRegisterResponse.fromJson(Map<String, dynamic> json) {
+  bool? get limitDecision {
+    if (existingDevice == true) return true;
+    if (limit != null && used != null) return used! < limit!;
+    if (canRegister != null) return canRegister;
+    return null;
+  }
+
+  bool get isLimitExceeded =>
+      limitDecision == false || error == 'DEVICE_LIMIT_EXCEEDED';
+
+  String get userMessage {
+    if (isLimitExceeded) {
+      if (limit != null && used != null) {
+        return '기기 등록 제한을 초과했습니다. 등록 가능 $limit대, 현재 $used대가 등록되어 더 이상 등록할 수 없습니다.';
+      }
+      return '기기 등록 제한을 초과했습니다. 더 이상 등록할 수 없습니다.';
+    }
+    if (message.isNotEmpty) return message;
+    if (error?.isNotEmpty == true) return error!;
+    return success
+        ? 'Device can be registered.'
+        : 'Device registration failed.';
+  }
+
+  factory DeviceRegisterResponse.fromJson(
+    Map<String, dynamic> json, {
+    int? statusCode,
+  }) {
     return DeviceRegisterResponse(
-      success: json['success'] ?? false,
+      success: json['success'] == true || _jsonInt(json['code']) == 1,
+      code: _jsonInt(json['code']),
+      canRegister: _jsonBool(json['can_register']),
+      existingDevice: _jsonBool(json['existing_device']),
+      limit: _jsonInt(json['limit']),
+      used: _jsonInt(json['used']),
+      remaining: _jsonInt(json['remaining']),
       message: json['message'] ?? '',
       error: json['error'],
       data: json['data'] != null ? DeviceData.fromJson(json['data']) : null,
+      statusCode: statusCode,
     );
   }
 
   Map<String, dynamic> toJson() => {
         'success': success,
+        'code': code,
+        'can_register': canRegister,
+        'existing_device': existingDevice,
+        'limit': limit,
+        'used': used,
+        'remaining': remaining,
         'message': message,
         'error': error,
         'data': data?.toJson(),
@@ -172,6 +244,102 @@ class DeviceRegisterService {
     return _instance!;
   }
 
+  DeviceRegisterResponse _parseRegisterResponse(dynamic response) {
+    try {
+      if ((response.body as String).isNotEmpty) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) {
+          return DeviceRegisterResponse.fromJson(
+            decoded,
+            statusCode: response.statusCode,
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('DeviceRegisterService: Failed to parse response - $e');
+    }
+
+    return DeviceRegisterResponse(
+      success: false,
+      message: 'HTTP Error: ${response.statusCode}',
+      error: 'HTTP_ERROR',
+      statusCode: response.statusCode,
+    );
+  }
+
+  DeviceRegisterResponse _blockedRegisterResponse(
+      DeviceRegisterResponse source) {
+    return DeviceRegisterResponse(
+      success: false,
+      code: source.code ?? 0,
+      canRegister: false,
+      existingDevice: source.existingDevice,
+      limit: source.limit,
+      used: source.used,
+      remaining: source.remaining,
+      message: source.userMessage,
+      error: source.error ?? 'DEVICE_LIMIT_EXCEEDED',
+      data: source.data,
+      statusCode: source.statusCode,
+    );
+  }
+
+  Future<DeviceRegisterResponse> checkRegisterLimit({
+    required String apiServer,
+    String? accessToken,
+    required String userId,
+    String? userPkid,
+    required String remoteId,
+  }) async {
+    try {
+      final url = Uri.parse('$apiServer/api/device/register/check');
+      final bodyMap = <String, dynamic>{
+        'remote_id': remoteId,
+        'user_id': userId,
+      };
+      if (userPkid != null && userPkid.isNotEmpty) {
+        bodyMap['user_pkid'] = userPkid;
+      }
+
+      final headers = <String, String>{
+        'Content-Type': 'application/json',
+      };
+      if (accessToken != null && accessToken.isNotEmpty) {
+        headers['Authorization'] = 'Bearer $accessToken';
+      }
+
+      debugPrint(
+          'DeviceRegisterService: Checking register limit - remoteId=$remoteId, userId=$userId');
+
+      final response = await http.post(
+        url,
+        headers: headers,
+        body: jsonEncode(bodyMap),
+      );
+
+      debugPrint(
+          'DeviceRegisterService: Limit check response - ${response.statusCode}, body=${response.body}');
+
+      if (response.statusCode == 401) {
+        return DeviceRegisterResponse(
+          success: false,
+          message: '인증이 만료되었습니다. 다시 로그인해주세요.',
+          error: 'UNAUTHORIZED',
+          statusCode: 401,
+        );
+      }
+
+      return _parseRegisterResponse(response);
+    } catch (e) {
+      debugPrint('DeviceRegisterService: Error checking register limit - $e');
+      return DeviceRegisterResponse(
+        success: false,
+        message: 'Failed to check device register limit: $e',
+        error: 'HTTP_ERROR',
+      );
+    }
+  }
+
   /// 원격 기기를 API 서버에 등록
   ///
   /// HTTP를 통해 기기 등록 요청을 보냅니다.
@@ -192,21 +360,48 @@ class DeviceRegisterService {
     required String alias,
     String? hostname,
     String? platform,
+    String? uuid,
+    String? version,
+    String? agentId,
   }) async {
     try {
       debugPrint(
           'DeviceRegisterService: Registering device - remoteId=$remoteId, alias=$alias');
 
+      final limitCheck = await checkRegisterLimit(
+        apiServer: apiServer,
+        accessToken: accessToken,
+        userId: userId,
+        userPkid: userPkid,
+        remoteId: remoteId,
+      );
+      if (limitCheck.limitDecision == false || limitCheck.isUnauthorized) {
+        return limitCheck.limitDecision == false
+            ? _blockedRegisterResponse(limitCheck)
+            : limitCheck;
+      }
+
       final url = Uri.parse('$apiServer/api/device/register');
 
-      final body = jsonEncode({
+      final bodyMap = <String, dynamic>{
         'user_id': userId,
         'user_pkid': userPkid,
         'remote_id': remoteId,
         'alias': alias,
         'hostname': hostname ?? '',
         'platform': platform ?? '',
-      });
+      };
+      if (uuid != null && uuid.isNotEmpty) {
+        bodyMap['uuid'] = uuid;
+      }
+      if (version != null && version.isNotEmpty) {
+        bodyMap['version'] = version;
+      }
+      if (agentId != null && agentId.isNotEmpty) {
+        bodyMap['agent_id'] = agentId;
+      }
+
+      final body = jsonEncode(bodyMap);
 
       final response = await http.post(
         url,
@@ -230,17 +425,7 @@ class DeviceRegisterService {
         );
       }
 
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final Map<String, dynamic> result = jsonDecode(response.body);
-        return DeviceRegisterResponse.fromJson(result);
-      } else {
-        return DeviceRegisterResponse(
-          success: false,
-          message: 'HTTP Error: ${response.statusCode}',
-          error: 'HTTP_ERROR',
-          statusCode: response.statusCode,
-        );
-      }
+      return _parseRegisterResponse(response);
     } catch (e) {
       debugPrint('DeviceRegisterService: Error registering device - $e');
       return DeviceRegisterResponse(
@@ -279,6 +464,18 @@ class DeviceRegisterService {
       if (server.startsWith('http://')) {
         server = server.replaceFirst('http://', 'https://');
       }
+
+      final limitCheck = await checkRegisterLimit(
+        apiServer: server,
+        userId: userId,
+        remoteId: remoteId,
+      );
+      if (limitCheck.limitDecision == false || limitCheck.isUnauthorized) {
+        return limitCheck.limitDecision == false
+            ? _blockedRegisterResponse(limitCheck)
+            : limitCheck;
+      }
+
       final url = Uri.parse('$server/api/device/register');
 
       final body = jsonEncode({
@@ -302,17 +499,7 @@ class DeviceRegisterService {
       debugPrint(
           'DeviceRegisterService: Register response - ${response.statusCode}, body=${response.body}');
 
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final Map<String, dynamic> result = jsonDecode(response.body);
-        return DeviceRegisterResponse.fromJson(result);
-      } else {
-        return DeviceRegisterResponse(
-          success: false,
-          message: 'HTTP Error: ${response.statusCode}',
-          error: 'HTTP_ERROR',
-          statusCode: response.statusCode,
-        );
-      }
+      return _parseRegisterResponse(response);
     } catch (e) {
       debugPrint(
           'DeviceRegisterService: Error registering device (simple) - $e');

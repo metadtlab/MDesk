@@ -32,18 +32,19 @@ if not exist "%BUILD_DIR%\MDesk.exe" (
 )
 echo [OK] Build directory: %BUILD_DIR%
 
-REM librustdesk.dll 확인
-if not exist "%BUILD_DIR%\librustdesk.dll" (
+REM libmdesk.dll 확인
+if exist "%BUILD_DIR%\librustdesk.dll" del /f /q "%BUILD_DIR%\librustdesk.dll" 2>nul
+if not exist "%BUILD_DIR%\libmdesk.dll" (
     if exist "target\release\librustdesk.dll" (
-        echo [COPY] librustdesk.dll 복사 중...
-        copy /y "target\release\librustdesk.dll" "%BUILD_DIR%\" >nul
+        echo [COPY] libmdesk.dll 복사 중...
+        copy /y "target\release\librustdesk.dll" "%BUILD_DIR%\libmdesk.dll" >nul
     ) else (
-        echo [WARN] librustdesk.dll 이 없습니다. 정상 동작하지 않을 수 있습니다.
+        echo [WARN] libmdesk.dll 이 없습니다. 정상 동작하지 않을 수 있습니다.
     )
 )
 
-REM is_portable 마커 파일 생성
-echo 1 > "%BUILD_DIR%\is_portable"
+REM 이전 빌드에서 남은 사용하지 않는 is_portable 마커 제거
+if exist "%BUILD_DIR%\is_portable" del /f /q "%BUILD_DIR%\is_portable" 2>nul
 
 echo.
 echo [PACK] Portable 패키징 시작...

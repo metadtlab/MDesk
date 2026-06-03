@@ -37,6 +37,7 @@ pub const READ_TIMEOUT: u64 = 18_000;
 // https://www.onsip.com/voip-resources/voip-fundamentals/what-is-nat-keepalive
 pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
+pub const FORCED_LANGUAGE: &str = "ko";
 const SERIAL: i32 = 3;
 const PASSWORD_ENC_VERSION: &str = "00";
 pub const ENCRYPT_MAX_LEN: usize = 128; // used for password, pin, etc, not for all
@@ -447,15 +448,21 @@ fn patch(path: PathBuf) -> PathBuf {
         {
             // SYSTEM 계정(서비스)에서 실행 중인지 확인
             // ServiceProfiles 또는 system32\config\systemprofile 경로가 포함되면 서비스 실행 중
-            let is_system_account = _tmp.to_lowercase().contains("system32\\config\\systemprofile")
+            let is_system_account = _tmp
+                .to_lowercase()
+                .contains("system32\\config\\systemprofile")
                 || _tmp.to_lowercase().contains("serviceprofiles");
-            
+
             if is_system_account {
                 // 현재 콘솔에 로그인한 사용자의 프로필 경로 가져오기
                 if let Some(user_profile) = get_console_user_profile_path() {
                     let app_name = APP_NAME.read().unwrap().clone();
-                    let user_config_path = format!("{}\\AppData\\Roaming\\{}\\config", user_profile, app_name);
-                    log::info!("[Config] SYSTEM 계정에서 사용자 config 경로 사용: {}", user_config_path);
+                    let user_config_path =
+                        format!("{}\\AppData\\Roaming\\{}\\config", user_profile, app_name);
+                    log::info!(
+                        "[Config] SYSTEM 계정에서 사용자 config 경로 사용: {}",
+                        user_config_path
+                    );
                     return user_config_path.into();
                 }
             }
@@ -488,25 +495,36 @@ fn get_console_user_profile_path() -> Option<String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
+    use winapi::shared::sddl::ConvertSidToStringSidW;
     use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS};
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::processenv::ExpandEnvironmentStringsW;
     use winapi::um::winbase::{LocalFree, LookupAccountNameW};
-    use winapi::um::winnt::{PSID, REG_EXPAND_SZ, REG_SZ, SID_NAME_USE, SidTypeUser};
+    use winapi::um::winnt::KEY_READ;
+    use winapi::um::winnt::{SidTypeUser, PSID, REG_EXPAND_SZ, REG_SZ, SID_NAME_USE};
     use winapi::um::winreg::{
         RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE,
     };
-    use winapi::um::winnt::KEY_READ;
-    use winapi::shared::sddl::ConvertSidToStringSidW;
 
     /// LogonUI 키에 있는 SZ 값 읽기
     unsafe fn read_logon_ui_value(value_name: &str) -> Option<String> {
-        let key_path: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI\0"
-            .encode_utf16()
+        let key_path: Vec<u16> =
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI\0"
+                .encode_utf16()
+                .collect();
+        let vn: Vec<u16> = OsStr::new(value_name)
+            .encode_wide()
+            .chain(std::iter::once(0))
             .collect();
-        let vn: Vec<u16> = OsStr::new(value_name).encode_wide().chain(std::iter::once(0)).collect();
         let mut hkey = null_mut();
-        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key_path.as_ptr(),
+            0,
+            KEY_READ,
+            &mut hkey,
+        ) != 0
+        {
             return None;
         }
         let mut data_type: u32 = 0;
@@ -584,15 +602,7 @@ fn get_console_user_profile_path() -> Option<String> {
             .collect();
         let mut dt = 0u32;
         let mut sz = 0u32;
-        if RegQueryValueExW(
-            hkey,
-            val.as_ptr(),
-            null_mut(),
-            &mut dt,
-            null_mut(),
-            &mut sz,
-        ) != 0
-        {
+        if RegQueryValueExW(hkey, val.as_ptr(), null_mut(), &mut dt, null_mut(), &mut sz) != 0 {
             RegCloseKey(hkey);
             return None;
         }
@@ -755,7 +765,10 @@ fn get_console_user_profile_path() -> Option<String> {
                 continue;
             }
             if let Some(p) = profile_path_from_sid(&sid_str) {
-                if let Some(seg) = std::path::Path::new(&p).file_name().and_then(|x| x.to_str()) {
+                if let Some(seg) = std::path::Path::new(&p)
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                {
                     if seg.eq_ignore_ascii_case(u) {
                         RegCloseKey(hkey);
                         log::debug!("[Config] ProfileList folder match: {} -> {}", u, p);
@@ -793,7 +806,11 @@ fn get_console_user_profile_path() -> Option<String> {
         for acc in [username_full.as_str(), username.as_str()] {
             if let Some(sid) = lookup_sid_string(acc) {
                 if let Some(p) = profile_path_from_sid(&sid) {
-                    log::debug!("[Config] Profile path via LookupAccountName ({}): {}", acc, p);
+                    log::debug!(
+                        "[Config] Profile path via LookupAccountName ({}): {}",
+                        acc,
+                        p
+                    );
                     return Some(p);
                 }
             }
@@ -927,20 +944,30 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
     log::info!("[Config] Loading config file: {}", file.display());
     let exists = file.exists();
     log::info!("[Config] File exists: {}", exists);
-    
+
     let cfg = match confy::load_path(&file) {
         Ok(config) => {
-            log::info!("[Config] Config loaded successfully from: {}", file.display());
+            log::info!(
+                "[Config] Config loaded successfully from: {}",
+                file.display()
+            );
             config
         }
         Err(err) => {
             if let confy::ConfyError::GeneralLoadError(err) = &err {
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    log::info!("[Config] Config file not found, using default: {}", file.display());
+                    log::info!(
+                        "[Config] Config file not found, using default: {}",
+                        file.display()
+                    );
                     return T::default();
                 }
             }
-            log::error!("[Config] Failed to load config '{}': {}", file.display(), err);
+            log::error!(
+                "[Config] Failed to load config '{}': {}",
+                file.display(),
+                err
+            );
             T::default()
         }
     };
@@ -1186,7 +1213,7 @@ impl Config {
     /// 모든 설정 파일 및 디렉토리 삭제 (포터블 모드 종료 시 사용)
     pub fn cleanup_config_files() {
         let app_name = APP_NAME.read().unwrap().clone();
-        
+
         // 설정 디렉토리 삭제 (AppData\Roaming\MDesk)
         if let Some(config_dir) = Self::config_dir() {
             if config_dir.exists() {
@@ -1196,7 +1223,7 @@ impl Config {
                 }
             }
         }
-        
+
         // AppData\Local\MDesk 삭제 (Windows)
         #[cfg(windows)]
         {
@@ -1209,7 +1236,7 @@ impl Config {
                     }
                 }
             }
-            
+
             // AppData\Roaming\MDesk 삭제 (Windows)
             if let Ok(roaming_app_data) = std::env::var("APPDATA") {
                 let roaming_dir = std::path::Path::new(&roaming_app_data).join(&app_name);
@@ -1221,7 +1248,7 @@ impl Config {
                 }
             }
         }
-        
+
         // 로그 디렉토리 삭제
         let log_dir = Self::log_path();
         if log_dir.exists() {
@@ -1230,7 +1257,7 @@ impl Config {
                 log::error!("Failed to remove log directory: {}", e);
             }
         }
-        
+
         log::info!("Config cleanup completed");
     }
 
@@ -1557,7 +1584,11 @@ impl Config {
             return;
         }
         let mut config = CONFIG2.write().unwrap();
-        let v2 = if v.is_empty() && !is_key_option { None } else { Some(&v) };
+        let v2 = if v.is_empty() && !is_key_option {
+            None
+        } else {
+            Some(&v)
+        };
         if v2 != config.options.get(&k) {
             if v2.is_none() {
                 config.options.remove(&k);
@@ -2308,6 +2339,9 @@ impl LocalConfig {
     }
 
     pub fn get_option(k: &str) -> String {
+        if k == keys::OPTION_LANGUAGE {
+            return FORCED_LANGUAGE.to_owned();
+        }
         get_or(
             &OVERWRITE_LOCAL_SETTINGS,
             &LOCAL_CONFIG.read().unwrap().options,
@@ -2319,6 +2353,9 @@ impl LocalConfig {
 
     // Usually get_option should be used.
     pub fn get_option_from_file(k: &str) -> String {
+        if k == keys::OPTION_LANGUAGE {
+            return FORCED_LANGUAGE.to_owned();
+        }
         get_or(
             &OVERWRITE_LOCAL_SETTINGS,
             &Self::load().options,
@@ -2333,6 +2370,11 @@ impl LocalConfig {
     }
 
     pub fn set_option(k: String, v: String) {
+        let v = if k == keys::OPTION_LANGUAGE {
+            FORCED_LANGUAGE.to_owned()
+        } else {
+            v
+        };
         if !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &k, &DEFAULT_LOCAL_SETTINGS, &v) {
             let mut config = LOCAL_CONFIG.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -2360,6 +2402,9 @@ impl LocalConfig {
     }
 
     pub fn get_flutter_option(k: &str) -> String {
+        if k == keys::OPTION_LANGUAGE {
+            return FORCED_LANGUAGE.to_owned();
+        }
         get_or(
             &OVERWRITE_LOCAL_SETTINGS,
             &LOCAL_CONFIG.read().unwrap().ui_flutter,
@@ -2370,6 +2415,11 @@ impl LocalConfig {
     }
 
     pub fn set_flutter_option(k: String, v: String) {
+        let v = if k == keys::OPTION_LANGUAGE {
+            FORCED_LANGUAGE.to_owned()
+        } else {
+            v
+        };
         let mut config = LOCAL_CONFIG.write().unwrap();
         let v2 = if v.is_empty() { None } else { Some(&v) };
         if v2 != config.ui_flutter.get(&k) {
@@ -2953,6 +3003,11 @@ pub fn apply_product_default_settings() {
         .unwrap()
         .entry(keys::OPTION_ALLOW_REMOVE_WALLPAPER.to_string())
         .or_insert_with(|| "Y".to_string());
+    DEFAULT_SETTINGS
+        .write()
+        .unwrap()
+        .entry(keys::OPTION_ALLOW_FAST_RELAY_FALLBACK.to_string())
+        .or_insert_with(|| "Y".to_string());
 }
 
 pub fn use_ws() -> bool {
@@ -3036,6 +3091,7 @@ pub mod keys {
     pub const OPTION_VIDEO_SAVE_DIRECTORY: &str = "video-save-directory";
     pub const OPTION_ENABLE_ABR: &str = "enable-abr";
     pub const OPTION_ALLOW_REMOVE_WALLPAPER: &str = "allow-remove-wallpaper";
+    pub const OPTION_ALLOW_FAST_RELAY_FALLBACK: &str = "allow-fast-relay-fallback";
     pub const OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER: &str = "allow-always-software-render";
     pub const OPTION_ALLOW_LINUX_HEADLESS: &str = "allow-linux-headless";
     pub const OPTION_ENABLE_HWCODEC: &str = "enable-hwcodec";
@@ -3244,6 +3300,7 @@ pub mod keys {
         OPTION_ALLOW_AUTO_RECORD_INCOMING,
         OPTION_ENABLE_ABR,
         OPTION_ALLOW_REMOVE_WALLPAPER,
+        OPTION_ALLOW_FAST_RELAY_FALLBACK,
         OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER,
         OPTION_ALLOW_LINUX_HEADLESS,
         OPTION_ENABLE_HWCODEC,

@@ -280,6 +280,11 @@ pub struct Connection {
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
     file_transferred: bool,
+    // 드래그앤드롭으로 받은(client→host) 파일 transfer가 발생한 마지막 시점.
+    // 직후 일정 시간 동안 호스트→클라이언트 방향 cliprdr file 메시지 송신을 잠시 미뤄
+    // connection drop을 방지한다.
+    #[cfg(target_os = "windows")]
+    last_remote_drop_recv_at: Option<Instant>,
     #[cfg(windows)]
     portable: PortableState,
     from_switch: bool,
@@ -451,6 +456,8 @@ impl Connection {
             session_last_recv_time: None,
             chat_unanswered: false,
             file_transferred: false,
+            #[cfg(target_os = "windows")]
+            last_remote_drop_recv_at: None,
             #[cfg(windows)]
             portable: Default::default(),
             from_switch: false,
@@ -674,6 +681,34 @@ impl Connection {
                         #[cfg(target_os = "windows")]
                         ipc::Data::ClipboardFile(clip) => {
                             if !conn.is_remote() {
+                                continue;
+                            }
+                            // 드래그앤드롭으로 호스트가 막 파일을 받은 직후에는, 호스트 탐색기에서
+                            // 임의 파일을 잘라내기/복사/붙여넣기 할 때 cliprdr 메시지가 stream을
+                            // 깨뜨리며 connection drop을 유발하는 사례가 있다.
+                            // grace period(기본 60초) 안에 흘러나가는 file 관련 cliprdr 메시지는
+                            // 모두 skip 하여 connection 안정성을 우선한다. (텍스트/이미지 클립보드는
+                            // 별도 채널이므로 이 가드의 영향을 받지 않는다.)
+                            const REMOTE_DROP_CLIPRDR_GRACE_MS: u64 = 60_000;
+                            let in_drop_grace =
+                                conn.last_remote_drop_recv_at.map_or(false, |t| {
+                                    t.elapsed()
+                                        < Duration::from_millis(REMOTE_DROP_CLIPRDR_GRACE_MS)
+                                });
+                            let is_file_related_clip = matches!(
+                                &clip,
+                                clipboard::ClipboardFile::Files { .. }
+                                    | clipboard::ClipboardFile::FormatList { .. }
+                                    | clipboard::ClipboardFile::FormatDataRequest { .. }
+                                    | clipboard::ClipboardFile::FormatDataResponse { .. }
+                                    | clipboard::ClipboardFile::FileContentsRequest { .. }
+                                    | clipboard::ClipboardFile::FileContentsResponse { .. }
+                            );
+                            if in_drop_grace && is_file_related_clip {
+                                log::info!(
+                                    "Skip outbound cliprdr message within remote-drop grace period to avoid connection drop: {:?}",
+                                    std::mem::discriminant(&clip)
+                                );
                                 continue;
                             }
                             match &clip {
@@ -1802,6 +1837,8 @@ impl Connection {
                 s.try_add_primay_video_service();
                 s.add_connection(self.inner.clone(), &noperms);
             }
+            #[cfg(windows)]
+            self.auto_refresh_login_screen_if_needed();
         }
     }
 
@@ -1851,8 +1888,6 @@ impl Connection {
                 }
             }
         }
-        #[cfg(windows)]
-        self.auto_refresh_login_screen_if_needed();
     }
 
     #[cfg(windows)]
@@ -1867,14 +1902,14 @@ impl Connection {
         }
 
         log::info!(
-            "[Display] Windows 로그인/잠금 화면 접속 감지 - 초기 검정 화면 방지를 위해 비디오 새로 고침을 자동 실행합니다"
+            "[Display] Windows logon/locked screen detected; refreshing video after subscription"
         );
         self.refresh_video_display(None);
 
         let server = self.server.clone();
         tokio::spawn(async move {
             time::sleep(Duration::from_millis(1200)).await;
-            log::info!("[Display] Windows 로그인/잠금 화면 자동 2차 새로 고침 실행");
+            log::info!("[Display] Retry refresh for Windows logon/locked screen");
             video_service::refresh();
             server.upgrade().map(|s| {
                 s.read().unwrap().set_video_service_opt(
@@ -3156,6 +3191,25 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 Some(message::Union::Cliprdr(clip)) => {
+                    // 드래그앤드롭으로 호스트가 막 파일을 받은 직후의 grace 기간 동안에는
+                    // 클라이언트→호스트 방향으로 들어오는 cliprdr 메시지도 무시해 connection
+                    // 안정성을 보장한다. (호스트 paste 시 OS가 wf_cliprdr를 통해 발생시키는
+                    // 응답 메시지가 stream을 흔드는 사례가 있다.)
+                    #[cfg(target_os = "windows")]
+                    {
+                        const REMOTE_DROP_CLIPRDR_GRACE_MS: u64 = 60_000;
+                        let in_drop_grace =
+                            self.last_remote_drop_recv_at.map_or(false, |t| {
+                                t.elapsed()
+                                    < Duration::from_millis(REMOTE_DROP_CLIPRDR_GRACE_MS)
+                            });
+                        if in_drop_grace {
+                            log::info!(
+                                "Skip inbound cliprdr message within remote-drop grace period to avoid connection drop"
+                            );
+                            return true;
+                        }
+                    }
                     // Windows 클립보드 파일 전송 감지: FormatList에 파일 형식이 있으면 audit 기록
                     #[cfg(target_os = "windows")]
                     if let Some(cliprdr::Union::FormatList(format_list)) = &clip.union {
@@ -3407,6 +3461,9 @@ impl Connection {
                                 let od = can_enable_overwrite_detection(get_version_number(
                                     &self.lr.version,
                                 ));
+                                #[cfg(target_os = "windows")]
+                                let _is_remote_drop_recv =
+                                    fs::is_remote_drop_downloads_path(&r.path);
                                 self.send_fs(ipc::FS::NewWrite {
                                     path: r.path.clone(),
                                     id: r.id,
@@ -3428,6 +3485,10 @@ impl Connection {
                                     json!({}),
                                 );
                                 self.file_transferred = true;
+                                #[cfg(target_os = "windows")]
+                                if _is_remote_drop_recv {
+                                    self.last_remote_drop_recv_at = Some(Instant::now());
+                                }
                             }
                             Some(file_action::Union::RemoveDir(d)) => {
                                 self.send_fs(ipc::FS::RemoveDir {
@@ -3446,6 +3507,9 @@ impl Connection {
                                 self.file_remove_log_control.on_remove_file(f);
                             }
                             Some(file_action::Union::Create(c)) => {
+                                #[cfg(target_os = "windows")]
+                                let _is_remote_drop_create =
+                                    fs::is_remote_drop_downloads_path(&c.path);
                                 self.send_fs(ipc::FS::CreateDir {
                                     path: c.path.clone(),
                                     id: c.id,
@@ -3460,6 +3524,10 @@ impl Connection {
                                     })
                                     .unwrap_or_default(),
                                 )));
+                                #[cfg(target_os = "windows")]
+                                if _is_remote_drop_create {
+                                    self.last_remote_drop_recv_at = Some(Instant::now());
+                                }
                             }
                             Some(file_action::Union::Cancel(c)) => {
                                 self.send_fs(ipc::FS::CancelWrite { id: c.id });
@@ -5689,7 +5757,9 @@ mod raii {
             #[cfg(target_os = "windows")]
             {
                 if conn_type == AuthConnType::Remote {
-                    crate::platform::windows::remote_overlay::show_remote_indicator(conn_id, peer_ip);
+                    crate::platform::windows::remote_overlay::show_remote_indicator(
+                        conn_id, peer_ip,
+                    );
                 } else {
                     drop(peer_ip);
                 }

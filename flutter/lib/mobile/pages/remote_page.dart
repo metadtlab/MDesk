@@ -223,104 +223,73 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     setState(() {});
   }
 
-  void _handleIOSSoftKeyboardInput(String newValue) {
-    var oldValue = _value;
-    _value = newValue;
-    var i = newValue.length - 1;
-    for (; i >= 0 && newValue[i] != '1'; --i) {}
-    var j = oldValue.length - 1;
-    for (; j >= 0 && oldValue[j] != '1'; --j) {}
-    if (i < j) j = i;
-    var subNewValue = newValue.substring(j + 1);
-    var subOldValue = oldValue.substring(j + 1);
+  // A non-ASCII single character cannot be sent through `inputModel.inputKey`
+  // because the remote interprets it as `Key::_Raw(codepoint)` (a virtual key
+  // code), which never produces the intended text. Text characters such as
+  // Korean Hangul, Japanese kana/kanji, Chinese hanzi, accented latin or
+  // emoji must go through `sessionInputString`, which sends a `KeyEvent::Seq`
+  // message that the server inputs as text.
+  bool _isAsciiPrintable(String s) {
+    if (s.length != 1) return false;
+    final c = s.codeUnitAt(0);
+    return c >= 0x20 && c < 0x7F;
+  }
 
-    // get common prefix of subNewValue and subOldValue
-    var common = 0;
-    for (;
-        common < subOldValue.length &&
-            common < subNewValue.length &&
-            subNewValue[common] == subOldValue[common];
-        ++common) {}
-
-    // get newStr from subNewValue
-    var newStr = "";
-    if (subNewValue.length > common) {
-      newStr = subNewValue.substring(common);
-    }
-
-    // Set the value to the old value and early return if is still composing. (1 && 2)
-    // 1. The composing range is valid
-    // 2. The new string is shorter than the composing range.
-    if (_textController.value.isComposingRangeValid) {
-      final composingLength = _textController.value.composing.end -
-          _textController.value.composing.start;
-      if (composingLength > newStr.length) {
-        _value = oldValue;
-        return;
-      }
-    }
-
-    // Delete the different part in the old value.
-    for (i = 0; i < subOldValue.length - common; ++i) {
-      inputModel.inputKey('VK_BACK');
-    }
-
-    // Input the new string.
-    if (newStr.length > 1) {
+  void _sendInputText(String newStr) {
+    if (newStr.isEmpty) return;
+    if (newStr.length > 1 || !_isAsciiPrintable(newStr)) {
       bind.sessionInputString(sessionId: sessionId, value: newStr);
     } else {
       inputChar(newStr);
     }
   }
 
-  void _handleNonIOSSoftKeyboardInput(String newValue) {
+  // Soft keyboard input diff used for both Android and iOS.
+  //
+  // The hidden TextFormField is pre-filled with `initText` ('1' * 1024).
+  // We compare the previous text (`_value`) and the new text from `onChanged`
+  // and emit the minimal sequence of VK_BACK presses + text input that
+  // transforms one into the other.
+  //
+  // Why a *plain* common-prefix diff (no `composing` range check):
+  //   * Korean/Japanese/Chinese IMEs replace characters in place during
+  //     composition (e.g. "ㅇ" -> "아" -> "안"). A naive length comparison
+  //     would drop these because the length stays the same.
+  //   * Android keyboards (Gboard, Samsung Keyboard, ...) also extend the
+  //     `composing` range while the user types an English word for autocorrect
+  //     suggestions. The previous iOS-style "skip while composingLength is
+  //     bigger than the new chars" guard caused every English letter after the
+  //     first to be silently dropped on Android. Diffing on text content alone
+  //     handles all of these uniformly.
+  void handleSoftKeyboardInput(String newValue) {
     var oldValue = _value;
     _value = newValue;
+
+    // Clipboard paste or other external replacement wiped the leading padding.
+    // Treat the previous state as empty so we don't issue stray backspaces.
     if (oldValue.isNotEmpty &&
         newValue.isNotEmpty &&
         oldValue[0] == '1' &&
         newValue[0] != '1') {
-      // clipboard
       oldValue = '';
     }
-    if (newValue.length == oldValue.length) {
-      // ?
-    } else if (newValue.length < oldValue.length) {
-      final char = 'VK_BACK';
-      inputModel.inputKey(char);
-    } else {
-      final content = newValue.substring(oldValue.length);
-      if (content.length > 1) {
-        if (oldValue != '' &&
-            content.length == 2 &&
-            (content == '""' ||
-                content == '()' ||
-                content == '[]' ||
-                content == '<>' ||
-                content == "{}" ||
-                content == '”“' ||
-                content == '《》' ||
-                content == '（）' ||
-                content == '【】')) {
-          // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
-          bind.sessionInputString(sessionId: sessionId, value: content);
-          openKeyboard();
-          return;
-        }
-        bind.sessionInputString(sessionId: sessionId, value: content);
-      } else {
-        inputChar(content);
-      }
-    }
-  }
 
-  // handle mobile virtual keyboard
-  void handleSoftKeyboardInput(String newValue) {
-    if (isIOS) {
-      _handleIOSSoftKeyboardInput(newValue);
-    } else {
-      _handleNonIOSSoftKeyboardInput(newValue);
+    if (newValue == oldValue) return;
+
+    final maxLen = newValue.length < oldValue.length
+        ? newValue.length
+        : oldValue.length;
+    var common = 0;
+    while (common < maxLen && newValue[common] == oldValue[common]) {
+      common++;
     }
+
+    final deleteCount = oldValue.length - common;
+    for (var k = 0; k < deleteCount; k++) {
+      inputModel.inputKey('VK_BACK');
+    }
+
+    _sendInputText(newValue.substring(common));
   }
 
   void inputChar(String char) {

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "MDesk"
-version = "1.4.44"
+version = "1.4.48"
 dependencies = [
  "android-wakelock",
  "android_logger",

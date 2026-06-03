@@ -58,9 +58,9 @@ pub use uuid;
 pub mod fingerprint;
 pub use flexi_logger;
 pub mod stream;
-pub mod websocket;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
+pub mod websocket;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use rustls_platform_verifier;
 pub use stream::Stream;
@@ -373,21 +373,18 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
     INIT.call_once(|| {
         // 데스크톱 디버그 빌드에서는 원래 env_logger만 켜져 파일에 한 줄도 안 남음(AccessAudit 등).
         // 모바일(iOS/Android) 디버그만 env_logger 유지, 그 외(데스크톱·릴리스 전부)는 파일 로깅 사용.
-        #[cfg(all(
-            debug_assertions,
-            any(target_os = "android", target_os = "ios")
-        ))]
+        #[cfg(all(debug_assertions, any(target_os = "android", target_os = "ios")))]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
+            init_from_env(Env::default().filter_or(
+                DEFAULT_FILTER_ENV,
+                "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
+            ));
         }
 
         // 릴리즈 포함: 데스크톱·Android·iOS(비-디버그)는 모두 아래에서 파일 로그 시도.
         // (모바일 디버그만 위 env_logger 분기)
-        #[cfg(not(all(
-            debug_assertions,
-            any(target_os = "android", target_os = "ios")
-        )))]
+        #[cfg(not(all(debug_assertions, any(target_os = "android", target_os = "ios"))))]
         {
             // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
             let mut path = config::Config::log_path();
@@ -420,7 +417,10 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                             Naming::Timestamps,
                             Cleanup::KeepLogFiles(31),
                         );
-                    #[cfg(all(debug_assertions, not(any(target_os = "android", target_os = "ios"))))]
+                    #[cfg(all(
+                        debug_assertions,
+                        not(any(target_os = "android", target_os = "ios"))
+                    ))]
                     {
                         // 디버그 실행 시에도 콘솔에서 수준 이상 로그 확인
                         l.duplicate_to_stderr(Duplicate::Info)

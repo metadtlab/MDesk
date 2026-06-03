@@ -324,7 +324,7 @@ def generate_control_file(version):
     control_file_path = "../res/DEBIAN/control"
     system2('/bin/rm -rf %s' % control_file_path)
 
-    content = """Package: rustdesk
+    content = """Package: mdesk
 Section: net
 Priority: optional
 Version: %s
@@ -333,6 +333,9 @@ Maintainer: metadatalab <metadtlab@gmail.com>
 Homepage: https://www.mdesk.co.kr
 Depends: libgtk-3-0, libxcb-randr0, libxdo3, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s
 Recommends: libayatana-appindicator3-1
+Provides: rustdesk
+Conflicts: rustdesk
+Replaces: rustdesk
 Description: A remote control software.
 
 """ % (version, get_deb_arch(), get_deb_extra_depends())
@@ -368,13 +371,13 @@ def build_flutter_deb(version, features):
     system2(
         'cp ../res/rustdesk.service tmpdeb/usr/share/rustdesk/files/systemd/')
     system2(
-        'cp ../res/128x128@2x.png tmpdeb/usr/share/icons/hicolor/256x256/apps/rustdesk.png')
+        'cp ../res/mdesk.png tmpdeb/usr/share/icons/hicolor/256x256/apps/mdesk.png')
     system2(
-        'cp ../res/scalable.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/rustdesk.svg')
+        'cp ../res/mdesk.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/mdesk.svg')
     system2(
-        'cp ../res/rustdesk.desktop tmpdeb/usr/share/applications/rustdesk.desktop')
+        'cp ../res/mdesk.desktop tmpdeb/usr/share/applications/mdesk.desktop')
     system2(
-        'cp ../res/rustdesk-link.desktop tmpdeb/usr/share/applications/rustdesk-link.desktop')
+        'cp ../res/mdesk-link.desktop tmpdeb/usr/share/applications/mdesk-link.desktop')
     system2(
         'cp ../res/startwm.sh tmpdeb/etc/rustdesk/')
     system2(
@@ -387,12 +390,14 @@ def build_flutter_deb(version, features):
     system2('mkdir -p tmpdeb/DEBIAN')
     generate_control_file(version)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
+    system2("find tmpdeb/DEBIAN -type f -exec sed -i 's/\\r$//' {} +")
     md5_file_folder("tmpdeb/")
-    system2('dpkg-deb -b tmpdeb rustdesk.deb;')
+    system2('chmod -R 755 tmpdeb/DEBIAN')
+    system2('dpkg-deb -b tmpdeb mdesk.deb;')
 
     system2('/bin/rm -rf tmpdeb/')
     system2('/bin/rm -rf ../res/DEBIAN/control')
-    os.rename('rustdesk.deb', '../rustdesk-%s.deb' % version)
+    os.rename('mdesk.deb', '../mdesk-%s.deb' % version)
     os.chdir("..")
 
 
@@ -411,25 +416,27 @@ def build_deb_from_folder(version, binary_folder):
     system2(
         'cp ../res/rustdesk.service tmpdeb/usr/share/rustdesk/files/systemd/')
     system2(
-        'cp ../res/128x128@2x.png tmpdeb/usr/share/icons/hicolor/256x256/apps/rustdesk.png')
+        'cp ../res/mdesk.png tmpdeb/usr/share/icons/hicolor/256x256/apps/mdesk.png')
     system2(
-        'cp ../res/scalable.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/rustdesk.svg')
+        'cp ../res/mdesk.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/mdesk.svg')
     system2(
-        'cp ../res/rustdesk.desktop tmpdeb/usr/share/applications/rustdesk.desktop')
+        'cp ../res/mdesk.desktop tmpdeb/usr/share/applications/mdesk.desktop')
     system2(
-        'cp ../res/rustdesk-link.desktop tmpdeb/usr/share/applications/rustdesk-link.desktop')
+        'cp ../res/mdesk-link.desktop tmpdeb/usr/share/applications/mdesk-link.desktop')
     system2(
         "echo \"#!/bin/sh\" >> tmpdeb/usr/share/rustdesk/files/polkit && chmod a+x tmpdeb/usr/share/rustdesk/files/polkit")
 
     system2('mkdir -p tmpdeb/DEBIAN')
     generate_control_file(version)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
+    system2("find tmpdeb/DEBIAN -type f -exec sed -i 's/\\r$//' {} +")
     md5_file_folder("tmpdeb/")
-    system2('dpkg-deb -b tmpdeb rustdesk.deb;')
+    system2('chmod -R 755 tmpdeb/DEBIAN')
+    system2('dpkg-deb -b tmpdeb mdesk.deb;')
 
     system2('/bin/rm -rf tmpdeb/')
     system2('/bin/rm -rf ../res/DEBIAN/control')
-    os.rename('rustdesk.deb', '../rustdesk-%s.deb' % version)
+    os.rename('mdesk.deb', '../mdesk-%s.deb' % version)
     os.chdir("..")
 
 
@@ -717,6 +724,9 @@ def build_flutter_windows(version, features, skip_portable_pack):
         os.chdir('flutter')
         system2('flutter build windows --release')
         os.chdir('..')
+        old_dll = os.path.join(flutter_build_dir_2, 'librustdesk.dll')
+        if os.path.exists(old_dll):
+            os.remove(old_dll)
     finally:
         # Runner.rc 복원
         if rc_backup:
@@ -752,12 +762,10 @@ def build_flutter_windows(version, features, skip_portable_pack):
     if skip_portable_pack:
         return
     
-    # 포터블 전용 마커 파일 생성 (패커가 압축할 폴더에 생성)
-    # 일반 설치 빌드 완료 후, 포터블 패키징 직전에만 생성함
-    if os.path.exists(flutter_build_dir_2):
-        with open(os.path.join(flutter_build_dir_2, 'is_portable'), 'w') as f:
-            f.write('1')
-        print(f"Created portable marker: {os.path.join(flutter_build_dir_2, 'is_portable')}")
+    # Remove stale marker from older builds. Runtime portable detection does not read this file.
+    portable_marker = os.path.join(flutter_build_dir_2, 'is_portable')
+    if os.path.exists(portable_marker):
+        os.remove(portable_marker)
 
     # 포터블 빌드를 위한 Cargo.toml 임시 수정
     portable_cargo_backup = modify_portable_cargo_toml_for_mdesk()
@@ -982,13 +990,13 @@ def main():
                 system2(
                     'cp res/rustdesk.service tmpdeb/usr/share/rustdesk/files/systemd/')
                 system2(
-                    'cp res/128x128@2x.png tmpdeb/usr/share/icons/hicolor/256x256/apps/rustdesk.png')
+                    'cp res/mdesk.png tmpdeb/usr/share/icons/hicolor/256x256/apps/mdesk.png')
                 system2(
-                    'cp res/scalable.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/rustdesk.svg')
+                    'cp res/mdesk.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/mdesk.svg')
                 system2(
-                    'cp res/rustdesk.desktop tmpdeb/usr/share/applications/rustdesk.desktop')
+                    'cp res/mdesk.desktop tmpdeb/usr/share/applications/mdesk.desktop')
                 system2(
-                    'cp res/rustdesk-link.desktop tmpdeb/usr/share/applications/rustdesk-link.desktop')
+                    'cp res/mdesk-link.desktop tmpdeb/usr/share/applications/mdesk-link.desktop')
                 os.system('mkdir -p tmpdeb/etc/rustdesk/')
                 os.system('cp -a res/startwm.sh tmpdeb/etc/rustdesk/')
                 os.system('mkdir -p tmpdeb/etc/X11/rustdesk/')
@@ -1001,8 +1009,8 @@ def main():
                 system2('mv tmpdeb/usr/bin/rustdesk tmpdeb/usr/share/rustdesk/')
                 system2('cp libsciter-gtk.so tmpdeb/usr/share/rustdesk/')
                 md5_file_folder("tmpdeb/")
-                system2('dpkg-deb -b tmpdeb rustdesk.deb; /bin/rm -rf tmpdeb/')
-                os.rename('rustdesk.deb', 'rustdesk-%s.deb' % version)
+                system2('dpkg-deb -b tmpdeb mdesk.deb; /bin/rm -rf tmpdeb/')
+                os.rename('mdesk.deb', 'mdesk-%s.deb' % version)
 
 
 def md5_file(fn):

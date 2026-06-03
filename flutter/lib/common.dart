@@ -40,6 +40,7 @@ import 'desktop/pages/view_camera_page.dart' as desktop_view_camera;
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'models/model.dart';
 import 'models/platform_model.dart';
+import 'common/korean_translations.dart';
 
 import 'package:flutter_hbb/native/win32.dart'
     if (dart.library.html) 'package:flutter_hbb/web/win32.dart';
@@ -650,51 +651,9 @@ final ButtonStyle flatButtonStyle = TextButton.styleFrom(
   ),
 );
 
-List<Locale> supportedLocales = const [
-  Locale('en', 'US'),
-  Locale('zh', 'CN'),
-  Locale('zh', 'TW'),
-  Locale('zh', 'SG'),
-  Locale('fr'),
-  Locale('de'),
-  Locale('it'),
-  Locale('ja'),
-  Locale('cs'),
-  Locale('pl'),
-  Locale('ko'),
-  Locale('hu'),
-  Locale('pt'),
-  Locale('ru'),
-  Locale('sk'),
-  Locale('id'),
-  Locale('da'),
-  Locale('eo'),
-  Locale('tr'),
-  Locale('kz'),
-  Locale('es'),
-  Locale('nl'),
-  Locale('nb'),
-  Locale('et'),
-  Locale('eu'),
-  Locale('bg'),
-  Locale('be'),
-  Locale('vn'),
-  Locale('uk'),
-  Locale('fa'),
-  Locale('ca'),
-  Locale('el'),
-  Locale('sv'),
-  Locale('sq'),
-  Locale('sr'),
-  Locale('th'),
-  Locale('sl'),
-  Locale('ro'),
-  Locale('lt'),
-  Locale('lv'),
-  Locale('ar'),
-  Locale('he'),
-  Locale('hr'),
-];
+const Locale forcedAppLocale = Locale('ko');
+
+List<Locale> supportedLocales = const [forcedAppLocale];
 
 String formatDurationToTime(Duration duration) {
   var totalTime = duration.inSeconds;
@@ -1576,7 +1535,31 @@ String translate(String name) {
   if (name.startsWith('Failed to') && name.contains(': ')) {
     return name.split(': ').map((x) => translate(x)).join(': ');
   }
-  return platformFFI.translate(name, localeName);
+
+  final placeholder = RegExp(r'\{(.*?)\}').firstMatch(name);
+  final lookupName = placeholder == null
+      ? name
+      : name.replaceRange(placeholder.start, placeholder.end, '{}');
+  final placeholderValue = placeholder?.group(1);
+
+  String applyKorean(String value) {
+    var translated = value;
+    if (placeholderValue != null) {
+      translated = translated.replaceFirst('{}', placeholderValue);
+    }
+    return translated.replaceAll('RustDesk', 'MDesk');
+  }
+
+  final korean = koreanTranslations[lookupName];
+  if (korean != null && korean.isNotEmpty) {
+    return applyKorean(korean);
+  }
+
+  final nativeTranslated = platformFFI.translate(name, 'ko');
+  if (nativeTranslated.isNotEmpty && nativeTranslated != name) {
+    return applyKorean(nativeTranslated);
+  }
+  return applyKorean(name);
 }
 
 // This function must be kept the same as the one in rust and sciter code.

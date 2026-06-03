@@ -39,12 +39,11 @@ int? kWindowId;
 WindowType? kWindowType;
 late List<String> kBootArgs;
 
-const Locale _forcedAndroidLocale = Locale('ko');
+const Locale _forcedLocale = forcedAppLocale;
 
-Locale? get _appLocale => isAndroid ? _forcedAndroidLocale : null;
+Locale? get _appLocale => _forcedLocale;
 
-List<Locale> get _appSupportedLocales =>
-    isAndroid ? const [_forcedAndroidLocale] : supportedLocales;
+List<Locale> get _appSupportedLocales => supportedLocales;
 
 /// 파일명에서 포터블 모드 인자가 있는지 확인
 /// agentid=, id=, certno= 파라미터가 있어야 포터블 모드로 인식

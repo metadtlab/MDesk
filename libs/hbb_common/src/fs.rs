@@ -662,7 +662,11 @@ impl TransferJob {
         match &self.data_source {
             DataSource::FilePath(p) => {
                 if self.files.len() == 1 && self.files[0].name.is_empty() {
-                    Some(p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone()))
+                    Some(
+                        p.parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| p.clone()),
+                    )
                 } else {
                     Some(p.clone())
                 }

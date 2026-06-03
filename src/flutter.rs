@@ -1522,10 +1522,7 @@ pub fn relay_file_clipboard_msg_from_peer(
 
     let (owner_peer_id, requester_peer_id) = {
         let state = FILE_CLIPBOARD_ROUTE_STATE.read().unwrap();
-        (
-            state.owner_peer_id.clone(),
-            state.requester_peer_id.clone(),
-        )
+        (state.owner_peer_id.clone(), state.requester_peer_id.clone())
     };
     if owner_peer_id.is_empty() {
         return false;
@@ -1541,8 +1538,7 @@ pub fn relay_file_clipboard_msg_from_peer(
             .write()
             .unwrap()
             .requester_peer_id = source_peer_id.to_owned();
-        if let Some(owner) =
-            sessions::get_session_by_peer_id(owner_peer_id, ConnType::DEFAULT_CONN)
+        if let Some(owner) = sessions::get_session_by_peer_id(owner_peer_id, ConnType::DEFAULT_CONN)
         {
             if owner.is_file_clipboard_required() {
                 owner.send(Data::Message(msg));

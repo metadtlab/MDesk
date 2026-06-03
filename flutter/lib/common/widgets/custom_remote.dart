@@ -362,7 +362,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
             _certExpireTime = data['expires_at']?.toString() ?? '';
             _message = '인증번호 생성 완료!';
           });
-          showToast('인증번호: $_certCode');
+          showToast('인증번호: ${_formatCertCode(_certCode)}');
         } else {
           setState(() {
             _message = data['message'] ?? '인증번호 생성 실패';
@@ -594,6 +594,14 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     return agent['mdesk_id']?.toString() ?? '';
   }
 
+  // 인증번호 표시용 포맷: 마지막 3자리 앞에 공백 추가 (예: 3439 → "3 439", 110123 → "110 123")
+  String _formatCertCode(String code) {
+    if (code.length <= 3) return code;
+    final prefix = code.substring(0, code.length - 3);
+    final lastThree = code.substring(code.length - 3);
+    return '$prefix $lastThree';
+  }
+
   // 기기 등록 다이얼로그 표시
   Future<void> _showRegisterDeviceDialog() async {
     final remoteIdController = TextEditingController();
@@ -726,71 +734,40 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         debugPrint('Error getting agent_id: $e');
       }
 
-      // HTTP 직접 호출 방식 사용
-      final url = 'https://admin.787.kr/api/device/register';
-
-      // 요청 본문 구성 - alias는 사용자가 입력한 값 그대로 사용
-      final bodyMap = <String, dynamic>{
-        'user_id': username,
-        'user_pkid': userPkid,
-        'remote_id': remoteId,
-        'alias': alias, // 사용자가 입력한 별칭 그대로 사용
-        'hostname': hostname,
-        'platform': platform,
-        'uuid': uuid,
-        'version': version,
-      };
-
-      // agent_id가 있으면 추가
-      if (agentId != null && agentId.isNotEmpty) {
-        bodyMap['agent_id'] = agentId;
-      }
-
-      final body = jsonEncode(bodyMap);
-
-      debugPrint('Register Device URL: $url');
-      debugPrint('Register Device Body: $body');
       debugPrint('Register Device - alias: $alias');
 
-      final response = await http
-          .post(
-            Uri.parse(url),
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer $token',
-            },
-            body: body,
-          )
-          .timeout(const Duration(seconds: 10));
+      final response = await deviceRegisterService.registerDevice(
+        apiServer: 'https://admin.787.kr',
+        accessToken: token,
+        userId: username,
+        userPkid: userPkid,
+        remoteId: remoteId,
+        alias: alias,
+        hostname: hostname,
+        platform: platform,
+        uuid: uuid,
+        version: version,
+        agentId: agentId,
+      );
 
-      debugPrint(
-          'Register Device Response: ${response.statusCode} - ${response.body}');
-
-      // 401 응답 처리 (토큰 무효화)
-      if (response.statusCode == 401) {
+      if (response.isUnauthorized) {
         await _handleUnauthorized();
         return;
       }
 
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final responseData = jsonDecode(response.body);
-        if (responseData['success'] == true || responseData['code'] == 1) {
-          // 별칭은 서버에서만 관리 (로컬 저장하지 않음)
-          setState(() {
-            _message = translate('Device registered successfully');
-          });
-          showToast('기기가 등록되었습니다: $remoteId');
-          // 등록 후 목록 새로고침 (서버에서 최신 별칭 가져옴)
-          await _fetchDevices();
-        } else {
-          setState(() {
-            _message = responseData['message'] ?? '등록 실패';
-          });
-        }
+      if (response.success) {
+        // 별칭은 서버에서만 관리 (로컬 저장하지 않음)
+        setState(() {
+          _message = translate('Device registered successfully');
+        });
+        showToast('기기가 등록되었습니다: $remoteId');
+        // 등록 후 목록 새로고침 (서버에서 최신 별칭 가져옴)
+        await _fetchDevices();
       } else {
         setState(() {
-          _message = '등록 오류: ${response.statusCode}';
+          _message = response.userMessage;
         });
+        showToast(response.userMessage);
       }
     } catch (e) {
       debugPrint('Register Device Error: $e');
@@ -1014,7 +991,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                     const Icon(Icons.pin, color: Colors.white, size: 20),
                     const SizedBox(width: 8),
                     Text(
-                      _certCode,
+                      _formatCertCode(_certCode),
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 24,
@@ -1428,8 +1405,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
             ),
             child: InkWell(
               onTap: () {
-                debugPrint('Direct Remote: Connecting to $mdeskIdClean');
-                connect(context, mdeskIdClean);
+                debugPrint(
+                    'Direct Remote: Connecting to $mdeskIdClean via relay');
+                connect(context, mdeskIdClean, forceRelay: true);
               },
               borderRadius: BorderRadius.circular(16),
               child: Row(

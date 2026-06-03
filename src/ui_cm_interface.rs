@@ -27,13 +27,14 @@ use hbb_common::{config::keys::*, tokio::sync::Mutex as TokioMutex, ResultType};
 use serde_derive::Serialize;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 use std::iter::FromIterator;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::Arc;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
     path::PathBuf,
-    process::Command,
     sync::{
         atomic::{AtomicI64, Ordering},
         RwLock,
@@ -487,8 +488,8 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 Data::Theme(dark) => {
                                     self.cm.change_theme(dark);
                                 }
-                                Data::Language(lang) => {
-                                    LocalConfig::set_option("lang".to_owned(), lang);
+                                Data::Language(_lang) => {
+                                    LocalConfig::set_option("lang".to_owned(), "ko".to_owned());
                                     self.cm.change_language();
                                 }
                                 Data::DataPortableService(ipc::DataPortableService::CmShowElevation(show)) => {
@@ -749,6 +750,8 @@ fn open_remote_drop_download_folder(folder: PathBuf) {
         log::warn!("Remote drop download folder does not exist: {:?}", folder);
         return;
     }
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     std::thread::spawn(move || {
         #[cfg(target_os = "windows")]
         let result = Command::new("explorer.exe").arg(&folder).spawn();
@@ -765,6 +768,12 @@ fn open_remote_drop_download_folder(folder: PathBuf) {
             );
         }
     });
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    log::debug!(
+        "Opening remote drop download folder is not supported on this platform: {:?}",
+        folder
+    );
 }
 
 #[cfg(not(any(target_os = "ios")))]

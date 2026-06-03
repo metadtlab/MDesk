@@ -48,6 +48,9 @@ mod tw;
 mod uk;
 mod vi;
 
+const FORCED_LANG: &str = "ko";
+
+#[allow(dead_code)]
 pub const LANGS: &[(&str, &str)] = &[
     ("en", "English"),
     ("it", "Italiano"),
@@ -99,34 +102,12 @@ pub const LANGS: &[(&str, &str)] = &[
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn translate(name: String) -> String {
-    let locale = sys_locale::get_locale().unwrap_or_default();
-    translate_locale(name, &locale)
+    translate_locale(name, FORCED_LANG)
 }
 
-pub fn translate_locale(name: String, locale: &str) -> String {
-    let locale = locale.to_lowercase();
-    let mut lang = hbb_common::config::LocalConfig::get_option("lang").to_lowercase();
-    if lang.is_empty() {
-        // zh_CN on Linux, zh-Hans-CN on mac, zh_CN_#Hans on Android
-        if locale.starts_with("zh") {
-            lang = (if locale.contains("tw") {
-                "zh-tw"
-            } else {
-                "zh-cn"
-            })
-            .to_owned();
-        }
-    }
-    if lang.is_empty() {
-        lang = locale
-            .split("-")
-            .next()
-            .map(|x| x.split("_").next().unwrap_or_default())
-            .unwrap_or_default()
-            .to_owned();
-    }
-    let lang = lang.to_lowercase();
-    let m = match lang.as_str() {
+pub fn translate_locale(name: String, _locale: &str) -> String {
+    let lang = FORCED_LANG;
+    let m = match lang {
         "fr" => fr::T.deref(),
         "zh-cn" => cn::T.deref(),
         "it" => it::T.deref(),

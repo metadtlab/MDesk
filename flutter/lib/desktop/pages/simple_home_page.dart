@@ -15,6 +15,7 @@ import 'package:window_manager/window_manager.dart';
 import 'package:http/http.dart' as http;
 import '../../common.dart';
 import '../../models/model.dart';
+import '../../utils/device_register_service.dart';
 
 // Windows API를 위한 구조체 정의
 final class LASTINPUTINFO extends Struct {
@@ -718,6 +719,20 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
       debugPrint('MDesk Device Register: Calling API: $url');
       debugPrint('MDesk Device Register: Body: ${jsonEncode(body)}');
 
+      final limitCheck = await deviceRegisterService.checkRegisterLimit(
+        apiServer: 'https://admin.787.kr',
+        userId: _userId,
+        remoteId: mdeskId,
+      );
+      if (limitCheck.limitDecision == false) {
+        debugPrint(
+            'MDesk Device Register: blocked by limit - limit=${limitCheck.limit}, used=${limitCheck.used}');
+        if (mounted) {
+          showToast(limitCheck.userMessage);
+        }
+        return;
+      }
+
       final response = await http
           .post(
             Uri.parse(url),
@@ -729,8 +744,27 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
       debugPrint(
           'MDesk Device Register: Response: ${response.statusCode} - ${response.body}');
 
-      if (mounted && response.statusCode == 200) {
+      DeviceRegisterResponse? registerResult;
+      if (response.body.isNotEmpty) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) {
+          registerResult = DeviceRegisterResponse.fromJson(
+            decoded,
+            statusCode: response.statusCode,
+          );
+        }
+      }
+
+      if (mounted &&
+          (response.statusCode == 200 || response.statusCode == 201) &&
+          (registerResult?.success ?? false)) {
         debugPrint('MDesk Device Register: 디바이스 등록 성공!');
+      } else if (registerResult?.isLimitExceeded == true) {
+        debugPrint(
+            'MDesk Device Register: blocked by register response - limit=${registerResult?.limit}, used=${registerResult?.used}');
+        if (mounted) {
+          showToast(registerResult!.userMessage);
+        }
       } else {
         debugPrint(
             'MDesk Device Register: 응답 코드가 200이 아님 - ${response.statusCode}');

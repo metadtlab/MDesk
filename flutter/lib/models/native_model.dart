@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:ffi';
-import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:ffi/ffi.dart';
@@ -43,7 +42,7 @@ class PlatformFFI {
   RustdeskImpl get ffiBind => _ffiBind;
   F3? _session_get_rgba;
 
-  static get localeName => Platform.localeName;
+  static get localeName => 'ko';
 
   static get isMain => instance._appType == kAppTypeMain;
 
@@ -121,7 +120,7 @@ class PlatformFFI {
         : isLinux
             ? DynamicLibrary.open('librustdesk.so')
             : isWindows
-                ? DynamicLibrary.open('librustdesk.dll')
+                ? DynamicLibrary.open('libmdesk.dll')
                 :
                 // Use executable itself as the dynamic library for MacOS.
                 // Multiple dylib instances will cause some global instances to be invalid.

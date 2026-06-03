@@ -21,13 +21,15 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::process::Command;
 #[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicIsize, Ordering};
+#[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    GetStockObject, GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, DEFAULT_GUI_FONT, HDC, TRANSPARENT,
+    CreateSolidBrush, GetStockObject, GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_GUI_FONT, HDC, TRANSPARENT,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -43,7 +45,7 @@ use windows::Win32::UI::Shell::{
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, IsWindow,
-    LoadCursorW, LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    LoadCursorW, LoadIconW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, IDC_ARROW, IDI_APPLICATION, IDYES,
     MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG, SM_CXSCREEN,
     SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_CTLCOLORSTATIC,
@@ -59,15 +61,31 @@ const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
 const WAITING_WINDOW_WIDTH: i32 = 360;
 #[cfg(target_os = "windows")]
-const WAITING_WINDOW_HEIGHT: i32 = 140;
+const WAITING_WINDOW_HEIGHT: i32 = 132;
 #[cfg(target_os = "windows")]
 const STATIC_STYLE_CENTER: u32 = 0x0000_0001;
+#[cfg(target_os = "windows")]
+const PROGRESS_X: i32 = 20;
+#[cfg(target_os = "windows")]
+const PROGRESS_Y: i32 = 82;
+#[cfg(target_os = "windows")]
+const PROGRESS_WIDTH: i32 = 320;
+#[cfg(target_os = "windows")]
+const PROGRESS_HEIGHT: i32 = 10;
 #[cfg(target_os = "windows")]
 const REMOTE_EXIT_IDLE_TICKS: u32 = 20;
 #[cfg(target_os = "windows")]
 const TRAY_ICON_ID: u32 = 1;
 #[cfg(target_os = "windows")]
 const APP_ICON_RESOURCE_ID: usize = 1;
+#[cfg(target_os = "windows")]
+static PROGRESS_TRACK_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static PROGRESS_FILL_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static PROGRESS_TRACK_BRUSH: AtomicIsize = AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static PROGRESS_FILL_BRUSH: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Parser)]
 #[command(name = "mdeskmini", about = "Minimal host runtime with accept popup")]
@@ -241,29 +259,6 @@ fn run_id() {
 }
 
 fn run_serve(options: ServeOptions) {
-    if !init_runtime_for_serve() {
-        std::process::exit(1);
-    }
-
-    apply_host_policy(&options);
-    if let Err(err) = apply_clipboard_cert_bootstrap(&options) {
-        #[cfg(target_os = "windows")]
-        show_error_popup(
-            "\u{C778}\u{C99D} \u{C2E4}\u{D328}",
-            "\u{C778}\u{C99D}\u{BC88}\u{D638}\u{AC00} \u{C62C}\u{BC14}\u{B974}\u{C9C0} \u{C54A}\u{C2B5}\u{B2C8}\u{B2E4}.",
-        );
-        eprintln!("cert bootstrap failed: {err}");
-        common::global_clean();
-        std::process::exit(1);
-    }
-    ensure_host_accepting_mode();
-
-    println!("starting mdeskmini host server");
-    println!("version={VERSION}");
-    println!("id={}", Config::get_id());
-
-    flutter_ffi::cm_init();
-
     #[cfg(target_os = "windows")]
     let mut waiting_window = if options.headless {
         None
@@ -271,11 +266,96 @@ fn run_serve(options: ServeOptions) {
         WaitingWindow::spawn()
     };
     #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        5,
+        "MDesk 준비중",
+        "프로그램을 초기화하고 있습니다.",
+    );
+
+    if !init_runtime_for_serve() {
+        #[cfg(target_os = "windows")]
+        update_startup_progress(
+            waiting_window.as_ref(),
+            100,
+            "MDesk 준비 실패",
+            "초기화에 실패했습니다.",
+        );
+        std::process::exit(1);
+    }
+
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        30,
+        "MDesk 준비중",
+        "원격 접속 정책을 적용하고 있습니다.",
+    );
+    apply_host_policy(&options);
+
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        45,
+        "MDesk 준비중",
+        "인증번호를 확인하고 있습니다.",
+    );
+    if let Err(err) = apply_clipboard_cert_bootstrap(&options) {
+        // 인증 실패 메시지박스는 사용자에게 노출하지 않고 로그만 남긴다.
+        // verify 자체는 Flutter UI / 후속 인스턴스에서 다시 시도되므로 그대로 진행한다.
+        eprintln!("cert bootstrap failed (ignored): {err}");
+    }
+
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        60,
+        "MDesk 준비중",
+        "원격 연결 허용 상태를 준비하고 있습니다.",
+    );
+    ensure_host_accepting_mode();
+
+    println!("starting mdeskmini host server");
+    println!("version={VERSION}");
+    println!("id={}", Config::get_id());
+
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        72,
+        "MDesk 준비중",
+        "연결 관리자를 시작하고 있습니다.",
+    );
+    flutter_ffi::cm_init();
+
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        82,
+        "MDesk 준비중",
+        "작업 표시줄 아이콘을 준비하고 있습니다.",
+    );
+    #[cfg(target_os = "windows")]
     let tray_icon = TrayIcon::spawn();
 
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        92,
+        "MDesk 준비중",
+        "원격 서버를 시작하고 있습니다.",
+    );
     let server_thread = thread::spawn(|| {
         start_server(true, false);
     });
+
+    #[cfg(target_os = "windows")]
+    update_startup_progress(
+        waiting_window.as_ref(),
+        100,
+        "MDesk 원격대기중",
+        "원격 연결 요청을 기다리는 중입니다.",
+    );
 
     if !options.headless {
         monitor_pending_connections(&server_thread, waiting_window.as_ref());
@@ -291,6 +371,18 @@ fn run_serve(options: ServeOptions) {
         tray_icon.close();
     }
     common::global_clean();
+}
+
+#[cfg(target_os = "windows")]
+fn update_startup_progress(
+    waiting_window: Option<&WaitingWindow>,
+    percent: u8,
+    title: &str,
+    body: &str,
+) {
+    if let Some(window) = waiting_window {
+        window.set_progress(title, body, percent);
+    }
 }
 
 fn init_runtime() -> bool {
@@ -828,20 +920,21 @@ extern "system" fn tray_window_proc(
 struct WaitingWindow {
     hwnd: HWND,
     label_hwnd: Option<HWND>,
-    ip_label_hwnd: Option<HWND>,
+    progress_fill_hwnd: Option<HWND>,
     ui_thread: Option<thread::JoinHandle<()>>,
 }
 
 #[cfg(target_os = "windows")]
 impl WaitingWindow {
     fn spawn() -> Option<Self> {
-        let (tx, rx) = std::sync::mpsc::channel::<Option<(usize, usize, usize)>>();
+        PROGRESS_TRACK_HWND.store(0, Ordering::Relaxed);
+        PROGRESS_FILL_HWND.store(0, Ordering::Relaxed);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Option<(usize, usize, usize, usize)>>();
         let ui_thread = thread::spawn(move || {
             let class_name = to_wide("MDeskMiniWaitingClass");
             let title = to_wide("MDesk 원격대기중");
             let body = to_wide("원격 연결 요청을 기다리는 중입니다.");
-            let ip_text = format_controlled_host_ip("");
-            let ip_body = to_wide(&ip_text);
             let static_cls = to_wide("STATIC");
 
             let wnd_class = WNDCLASSW {
@@ -901,16 +994,35 @@ impl WaitingWindow {
                 .ok()
             };
 
-            let ip_label_hwnd = unsafe {
+            let empty_text = to_wide("");
+            let progress_track_hwnd = unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     PCWSTR(static_cls.as_ptr()),
-                    PCWSTR(ip_body.as_ptr()),
-                    WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | STATIC_STYLE_CENTER),
-                    20,
-                    88,
-                    320,
-                    22,
+                    PCWSTR(empty_text.as_ptr()),
+                    WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
+                    PROGRESS_X,
+                    PROGRESS_Y,
+                    PROGRESS_WIDTH,
+                    PROGRESS_HEIGHT,
+                    Some(hwnd),
+                    None,
+                    None,
+                    None,
+                )
+                .ok()
+            };
+
+            let progress_fill_hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    PCWSTR(static_cls.as_ptr()),
+                    PCWSTR(empty_text.as_ptr()),
+                    WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
+                    PROGRESS_X,
+                    PROGRESS_Y,
+                    1,
+                    PROGRESS_HEIGHT,
                     Some(hwnd),
                     None,
                     None,
@@ -930,16 +1042,12 @@ impl WaitingWindow {
                     );
                 }
             }
-            if let Some(label) = ip_label_hwnd {
-                let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
-                unsafe {
-                    let _ = SendMessageW(
-                        label,
-                        WM_SETFONT,
-                        Some(WPARAM(font.0 as usize)),
-                        Some(LPARAM(1)),
-                    );
-                }
+
+            if let Some(track) = progress_track_hwnd {
+                PROGRESS_TRACK_HWND.store(track.0 as isize, Ordering::Relaxed);
+            }
+            if let Some(fill) = progress_fill_hwnd {
+                PROGRESS_FILL_HWND.store(fill.0 as isize, Ordering::Relaxed);
             }
 
             unsafe {
@@ -947,8 +1055,9 @@ impl WaitingWindow {
             }
 
             let label_ptr = label_hwnd.map(|h| h.0 as usize).unwrap_or(0);
-            let ip_label_ptr = ip_label_hwnd.map(|h| h.0 as usize).unwrap_or(0);
-            let _ = tx.send(Some((hwnd.0 as usize, label_ptr, ip_label_ptr)));
+            let track_ptr = progress_track_hwnd.map(|h| h.0 as usize).unwrap_or(0);
+            let fill_ptr = progress_fill_hwnd.map(|h| h.0 as usize).unwrap_or(0);
+            let _ = tx.send(Some((hwnd.0 as usize, label_ptr, track_ptr, fill_ptr)));
 
             let mut msg = MSG::default();
             loop {
@@ -964,17 +1073,17 @@ impl WaitingWindow {
         });
 
         match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Some((hwnd, label_hwnd, ip_label_hwnd))) => Some(Self {
+            Ok(Some((hwnd, label_hwnd, _progress_track_hwnd, progress_fill_hwnd))) => Some(Self {
                 hwnd: HWND(hwnd as *mut c_void),
                 label_hwnd: if label_hwnd == 0 {
                     None
                 } else {
                     Some(HWND(label_hwnd as *mut c_void))
                 },
-                ip_label_hwnd: if ip_label_hwnd == 0 {
+                progress_fill_hwnd: if progress_fill_hwnd == 0 {
                     None
                 } else {
-                    Some(HWND(ip_label_hwnd as *mut c_void))
+                    Some(HWND(progress_fill_hwnd as *mut c_void))
                 },
                 ui_thread: Some(ui_thread),
             }),
@@ -985,21 +1094,37 @@ impl WaitingWindow {
         }
     }
 
-    fn set_status(&self, title: &str, body: &str, ip_body: &str) {
+    fn set_status(&self, title: &str, body: &str) {
         if self.is_closed() {
             return;
         }
         let title_w = to_wide(title);
         let body_w = to_wide(body);
-        let ip_body_w = to_wide(ip_body);
         unsafe {
             let _ = SetWindowTextW(self.hwnd, PCWSTR(title_w.as_ptr()));
             if let Some(label) = self.label_hwnd {
                 let _ = SetWindowTextW(label, PCWSTR(body_w.as_ptr()));
             }
-            if let Some(label) = self.ip_label_hwnd {
-                let _ = SetWindowTextW(label, PCWSTR(ip_body_w.as_ptr()));
-            }
+        }
+    }
+
+    fn set_progress(&self, title: &str, body: &str, percent: u8) {
+        self.set_status(title, body);
+        self.set_progress_value(percent);
+    }
+
+    fn set_progress_value(&self, percent: u8) {
+        let Some(fill) = self.progress_fill_hwnd else {
+            return;
+        };
+        if self.is_closed() {
+            return;
+        }
+
+        let percent = i32::from(percent.min(100));
+        let width = (PROGRESS_WIDTH * percent / 100).max(1);
+        unsafe {
+            let _ = MoveWindow(fill, PROGRESS_X, PROGRESS_Y, width, PROGRESS_HEIGHT, true);
         }
     }
 
@@ -1041,6 +1166,21 @@ fn center_window_origin(width: i32, height: i32) -> (i32, i32) {
 }
 
 #[cfg(target_os = "windows")]
+fn progress_brush(slot: &AtomicIsize, color: COLORREF) -> isize {
+    let existing = slot.load(Ordering::Relaxed);
+    if existing != 0 {
+        return existing;
+    }
+
+    let brush = unsafe { CreateSolidBrush(color) };
+    let raw = brush.0 as isize;
+    match slot.compare_exchange(0, raw, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => raw,
+        Err(existing) => existing,
+    }
+}
+
+#[cfg(target_os = "windows")]
 extern "system" fn waiting_window_proc(
     hwnd: HWND,
     msg: u32,
@@ -1050,6 +1190,13 @@ extern "system" fn waiting_window_proc(
     match msg {
         WM_CTLCOLORSTATIC => {
             let hdc = HDC(wparam.0 as *mut c_void);
+            let child_hwnd = lparam.0;
+            if child_hwnd == PROGRESS_FILL_HWND.load(Ordering::Relaxed) {
+                return LRESULT(progress_brush(&PROGRESS_FILL_BRUSH, COLORREF(0x0060AE27)));
+            }
+            if child_hwnd == PROGRESS_TRACK_HWND.load(Ordering::Relaxed) {
+                return LRESULT(progress_brush(&PROGRESS_TRACK_BRUSH, COLORREF(0x00EBE7E5)));
+            }
             unsafe {
                 let _ = SetBkMode(hdc, TRANSPARENT);
                 let _ = SetTextColor(hdc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
@@ -1065,37 +1212,6 @@ extern "system" fn waiting_window_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
-}
-
-#[cfg(target_os = "windows")]
-fn format_controlled_host_ip(fallback_ip: &str) -> String {
-    let local_ip = local_host_ip();
-    let trimmed = if local_ip.trim().is_empty() {
-        fallback_ip.trim()
-    } else {
-        local_ip.trim()
-    };
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        format!("피원격자의 IP : {trimmed}")
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn local_host_ip() -> String {
-    let configured = Config::get_option("local-ip-addr");
-    if !configured.trim().is_empty() {
-        return configured.trim().to_owned();
-    }
-
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| {
-            let _ = socket.connect("8.8.8.8:80");
-            socket.local_addr()
-        })
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_default()
 }
 
 fn monitor_pending_connections(
@@ -1117,7 +1233,6 @@ fn monitor_pending_connections(
         let mut idle_ticks_after_disconnect = 0u32;
         let mut last_status_title = String::new();
         let mut last_status_body = String::new();
-        let mut last_status_ip = String::new();
         let mut connected_since: Option<Instant> = None;
         let mut minimized_after_connected = false;
 
@@ -1175,7 +1290,7 @@ fn monitor_pending_connections(
                     .find(|client| !client.authorized && !client.disconnected);
                 let connected_now = connected.is_some();
 
-                let (status_title, status_body, status_ip) = if let Some(client) = connected {
+                let (status_title, status_body) = if let Some(client) = connected {
                     let peer = if client.name.trim().is_empty() {
                         if client.peer_id.trim().is_empty() {
                             "알 수 없는 사용자".to_owned()
@@ -1188,30 +1303,23 @@ fn monitor_pending_connections(
                     (
                         "MDesk 원격중".to_owned(),
                         format!("{peer} 님과 원격 연결이 유지되고 있습니다."),
-                        format_controlled_host_ip(&client.ip),
                     )
-                } else if let Some(client) = pending {
+                } else if pending.is_some() {
                     (
                         "MDesk 원격요청".to_owned(),
                         "원격 연결 요청이 도착했습니다. 승인 대기 중입니다.".to_owned(),
-                        format_controlled_host_ip(&client.ip),
                     )
                 } else {
                     (
                         "MDesk 원격대기중".to_owned(),
                         "원격 연결 요청을 기다리는 중입니다.".to_owned(),
-                        format_controlled_host_ip(""),
                     )
                 };
 
-                if status_title != last_status_title
-                    || status_body != last_status_body
-                    || status_ip != last_status_ip
-                {
-                    window.set_status(&status_title, &status_body, &status_ip);
+                if status_title != last_status_title || status_body != last_status_body {
+                    window.set_status(&status_title, &status_body);
                     last_status_title = status_title;
                     last_status_body = status_body;
-                    last_status_ip = status_ip;
                 }
 
                 if connected_now {
@@ -1288,6 +1396,7 @@ fn prompt_approval(client: &CmClient) -> bool {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn show_error_popup(title: &str, body: &str) {
     let title_w = to_wide(title);
     let body_w = to_wide(body);

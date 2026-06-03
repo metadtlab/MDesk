@@ -77,3 +77,13 @@ out/
 *.exp
 # GitHub workflows (workflow 스코프 필요)
 .github/src.7z
+
+# Git / 원격 푸시용 배치 (토큰·SSH 설정 등 로컬 전용, 저장소에 올리지 않음)
+push_as_metadtlab.bat
+git_push.bat
+push_without_workflows.bat
+reset_git_auth.bat
+push_with_token.bat
+push_to_github_force.bat
+push_to_github.bat
+setup_github_ssh.bat

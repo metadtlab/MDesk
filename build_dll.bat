@@ -24,9 +24,10 @@ if "%choice%"=="1" (
     if %ERRORLEVEL% NEQ 0 goto error
     
     echo.
-    echo [복사] target\release\librustdesk.dll 파일을 플러터 빌드 폴더로 복사합니다...
+    echo [복사] target\release\librustdesk.dll 파일을 libmdesk.dll 이름으로 플러터 빌드 폴더에 복사합니다...
     if exist "%RELEASE_DEST%" (
-        copy /y "target\release\librustdesk.dll" "%RELEASE_DEST%\librustdesk.dll"
+        copy /y "target\release\librustdesk.dll" "%RELEASE_DEST%\libmdesk.dll"
+        if exist "%RELEASE_DEST%\librustdesk.dll" del /f /q "%RELEASE_DEST%\librustdesk.dll" 2>nul
         echo Release 폴더로 복사 완료.
     ) else (
         echo [알림] Release 빌드 폴더가 없어 복사를 건너뜁니다.
@@ -39,9 +40,10 @@ if "%choice%"=="1" (
     if %ERRORLEVEL% NEQ 0 goto error
     
     echo.
-    echo [복사] target\debug\librustdesk.dll 파일을 플러터 빌드 폴더로 복사합니다...
+    echo [복사] target\debug\librustdesk.dll 파일을 libmdesk.dll 이름으로 플러터 빌드 폴더에 복사합니다...
     if exist "%DEBUG_DEST%" (
-        copy /y "target\debug\librustdesk.dll" "%DEBUG_DEST%\librustdesk.dll"
+        copy /y "target\debug\librustdesk.dll" "%DEBUG_DEST%\libmdesk.dll"
+        if exist "%DEBUG_DEST%\librustdesk.dll" del /f /q "%DEBUG_DEST%\librustdesk.dll" 2>nul
         echo Debug 폴더로 복사 완료.
     ) else (
         echo [알림] Debug 빌드 폴더가 없어 복사를 건너뜁니다.

@@ -379,6 +379,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     if (!isWebDesktop) {
       toolbarItems.add(_MobileActionMenu(ffi: widget.ffi));
     }
+    toolbarItems.add(_RefreshVideoButton(ffi: widget.ffi));
 
     toolbarItems.add(Obx(() {
       if (PrivacyModeState.find(widget.id).isEmpty &&
@@ -493,6 +494,22 @@ class _PinMenu extends StatelessWidget {
             ? _ToolbarTheme.hoverBlueColor
             : _ToolbarTheme.hoverInactiveColor,
       ),
+    );
+  }
+}
+
+class _RefreshVideoButton extends StatelessWidget {
+  final FFI ffi;
+  const _RefreshVideoButton({Key? key, required this.ffi}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return _IconMenuButton(
+      icon: const Icon(Icons.refresh, size: 32, color: Colors.white),
+      tooltip: 'Refresh',
+      onPressed: () => sessionRefreshVideo(ffi.sessionId, ffi.ffiModel.pi),
+      color: _ToolbarTheme.blueColor,
+      hoverColor: _ToolbarTheme.hoverBlueColor,
     );
   }
 }

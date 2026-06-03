@@ -107,7 +107,7 @@ set(RUSTDESK_LIB_BUILD_TYPE $<IF:$<CONFIG:Debug>,debug,release>)
 message(STATUS "rustdesk lib build type: ${RUSTDESK_LIB_BUILD_TYPE}")
 set(RUSTDESK_LIB "../../target/${RUSTDESK_LIB_BUILD_TYPE}/librustdesk.dll")
 install(FILES "${RUSTDESK_LIB}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-COMPONENT Runtime RENAME librustdesk.dll)
+COMPONENT Runtime RENAME libmdesk.dll)
 
 # res/windows_install_extra/tools/*.exe → 설치 루트/tools (예: DeviceRemote.exe)
 set(WINDOWS_EXTRA_TOOLS "${CMAKE_CURRENT_SOURCE_DIR}/../../res/windows_install_extra/tools")

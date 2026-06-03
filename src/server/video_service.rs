@@ -80,6 +80,16 @@ lazy_static::lazy_static! {
     static ref SCREENSHOTS: Mutex<HashMap<usize, Screenshot>> = Default::default();
 }
 
+#[inline]
+fn take_refresh_option(sp: &GenericService) -> bool {
+    if sp.is_option_true(OPTION_REFRESH) {
+        sp.set_option_bool(OPTION_REFRESH, false);
+        true
+    } else {
+        false
+    }
+}
+
 struct Screenshot {
     sid: String,
     tx: Sender,
@@ -625,8 +635,9 @@ fn run(vs: VideoService) -> ResultType<()> {
         .set_support_changing_quality(&sp.name(), encoder.support_changing_quality());
     log::info!("initial quality: {quality:?}");
 
-    if sp.is_option_true(OPTION_REFRESH) {
-        sp.set_option_bool(OPTION_REFRESH, false);
+    if take_refresh_option(&sp) {
+        log::info!("switch to refresh requested during video startup");
+        bail!("SWITCH");
     }
 
     let mut frame_controller = VideoFrameController::new(display_idx);
@@ -664,7 +675,7 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut second_instant,
             &sp.name(),
         )?;
-        if sp.is_option_true(OPTION_REFRESH) {
+        if take_refresh_option(&sp) {
             if vs.source.is_monitor() {
                 let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
             }

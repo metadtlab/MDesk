@@ -191,8 +191,9 @@ fn main() {
         .unwrap_or(arg_exe.clone());
     let current_exe_lower = current_exe.to_lowercase();
     let no_real_args = !args.iter().any(|a| a.starts_with("--"));
-    let click_setup =
-        no_real_args && current_exe_lower.ends_with(".exe") && current_exe_lower.contains("-install");
+    let click_setup = no_real_args
+        && current_exe_lower.ends_with(".exe")
+        && current_exe_lower.contains("-install");
     let quick_support = no_real_args && current_exe_lower.ends_with("qs.exe");
 
     let mut ui = false;

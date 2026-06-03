@@ -850,12 +850,7 @@ pub fn get_async_job_status() -> String {
 #[inline]
 pub fn get_langs() -> String {
     use serde_json::json;
-    let mut x: Vec<(&str, String)> = crate::lang::LANGS
-        .iter()
-        .map(|a| (a.0, format!("{} ({})", a.1, a.0)))
-        .collect();
-    x.sort_by(|a, b| a.0.cmp(b.0));
-    json!(x).to_string()
+    json!([["ko", "\u{D55C}\u{AD6D}\u{C5B4} (ko)"]]).to_string()
 }
 
 #[inline]

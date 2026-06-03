@@ -83,7 +83,7 @@ if errorlevel 1 (
     exit /b 1
 )
 if not exist "target\release\librustdesk.dll" (
-    echo [ERROR] librustdesk.dll not created!
+    echo [ERROR] Rust DLL source target\release\librustdesk.dll not created!
     pause
     exit /b 1
 )
@@ -111,7 +111,8 @@ echo [OK] Flutter built successfully
 
 REM Copy DLLs
 echo [COPY] Copying DLLs...
-copy /y "target\release\librustdesk.dll" "%BUILD_DIR%\" >nul
+copy /y "target\release\librustdesk.dll" "%BUILD_DIR%\libmdesk.dll" >nul
+if exist "%BUILD_DIR%\librustdesk.dll" del /f /q "%BUILD_DIR%\librustdesk.dll" 2>nul
 if exist "target\release\deps\dylib_virtual_display.dll" (
     copy /y "target\release\deps\dylib_virtual_display.dll" "%BUILD_DIR%\" >nul
 )
@@ -130,7 +131,7 @@ pause
 
 echo.
 echo [5/5] Creating portable package...
-echo 1 > "%BUILD_DIR%\is_portable"
+if exist "%BUILD_DIR%\is_portable" del /f /q "%BUILD_DIR%\is_portable" 2>nul
 
 cd libs\portable
 pip install -r requirements.txt >nul 2>&1
@@ -162,7 +163,7 @@ echo BUILD COMPLETE!
 echo ========================================
 echo.
 echo Output:
-echo   - DLL: target\release\librustdesk.dll
+echo   - DLL: %BUILD_DIR%\libmdesk.dll
 echo   - EXE: %BUILD_DIR%\MDesk.exe
 if exist "MDesk_portable.exe" echo   - Portable: MDesk_portable.exe
 for %%f in (MDesk-*-install.exe) do echo   - Installer: %%f

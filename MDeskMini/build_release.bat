@@ -27,4 +27,5 @@ if not exist "%OUTPUT%" (
 echo.
 echo Build complete.
 echo EXE: %OUTPUT%
+upx_max.bat
 exit /b 0

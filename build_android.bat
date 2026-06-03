@@ -1,6 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
+set "REPO_ROOT=%~dp0"
+:: strip trailing backslash for cleaner copy-paste
+if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
+
 set "MSYS2_ROOT=C:\msys64"
 set "MSYS2_USR_BIN=%MSYS2_ROOT%\usr\bin"
 set "MSYS2_PERL=%MSYS2_USR_BIN%\perl.exe"
@@ -117,10 +121,13 @@ if not defined ANDROID_NDK_HOME (
     echo [ERROR] ANDROID_NDK_HOME is not set.
     echo.
     echo Please install Android NDK and set the environment variable:
-    echo   set ANDROID_NDK_HOME=C:\Android\ndk\25.2.9519653
+    echo   set "ANDROID_NDK_HOME=C:\Android\ndk\25.2.9519653"
     echo.
     goto :error
 )
+
+:: Trailing spaces in ANDROID_NDK_HOME break vcpkg android.cmake NDK EXISTS ^(also fix User env if needed^)
+for %%I in ("%ANDROID_NDK_HOME%") do set "ANDROID_NDK_HOME=%%~fI"
 
 set "NDK_PREBUILT=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64"
 set "NDK_TOOLCHAIN_BIN=%NDK_PREBUILT%\bin"
@@ -216,6 +223,24 @@ if "%BUILD_X86%"=="1" (
 )
 echo.
 
+:: Android vcpkg triplets (magnum-opus, scrap, etc. use %%VCPKG_ROOT%%\installed\<triplet>)
+set "DO_VCPKG_ARM64="
+if "%BUILD_ARM64%"=="1" if defined VCPKG_ROOT set "DO_VCPKG_ARM64=1"
+if defined DO_VCPKG_ARM64 call :vcpkg_require_arm64
+if defined DO_VCPKG_ARM64 if errorlevel 1 goto :error
+set "DO_VCPKG_ARM32="
+if "%BUILD_ARM%"=="1" if defined VCPKG_ROOT set "DO_VCPKG_ARM32=1"
+if defined DO_VCPKG_ARM32 call :vcpkg_require_arm32
+if defined DO_VCPKG_ARM32 if errorlevel 1 goto :error
+set "DO_VCPKG_X64A="
+if "%BUILD_X64%"=="1" if defined VCPKG_ROOT set "DO_VCPKG_X64A=1"
+if defined DO_VCPKG_X64A call :vcpkg_require_x64_android
+if defined DO_VCPKG_X64A if errorlevel 1 goto :error
+set "DO_VCPKG_X86A="
+if "%BUILD_X86%"=="1" if defined VCPKG_ROOT set "DO_VCPKG_X86A=1"
+if defined DO_VCPKG_X86A call :vcpkg_require_x86_android
+if defined DO_VCPKG_X86A if errorlevel 1 goto :error
+
 :: Create jniLibs directory
 echo [4/6] Building Rust libraries...
 echo.
@@ -250,29 +275,41 @@ if "%BUILD_ARM64%"=="1" (
         set "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--target=aarch64-linux-android21"
         cargo ndk -t aarch64-linux-android -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
     )
-    if errorlevel 1 (
-        echo   [ARM64] Build failed
-        goto :error
+    set "ARM64_FAIL="
+    if errorlevel 1 set "ARM64_FAIL=1"
+    if not defined ARM64_FAIL (
+        if exist "%LIBCXX_ARM64%" copy /Y "%LIBCXX_ARM64%" "%JNILIBS_DIR%\arm64-v8a\libc++_shared.so" >nul
+        echo   [ARM64] Done
+        echo.
     )
-    if exist "%LIBCXX_ARM64%" copy /Y "%LIBCXX_ARM64%" "%JNILIBS_DIR%\arm64-v8a\libc++_shared.so" >nul
-    echo   [ARM64] Done
-    echo.
+)
+if "%BUILD_ARM64%"=="1" if defined ARM64_FAIL (
+    echo   [ARM64] Build failed
+    goto :error
 )
 
 :: ARM32 build
 if "%BUILD_ARM%"=="1" (
     echo   Building armeabi-v7a ^(armv7-linux-androideabi^)
-    set "PATH=%NDK_TOOLCHAIN_BIN%;%PATH%"
-    set "CLANG_PATH=%NDK_TOOLCHAIN_BIN%\clang.exe"
-    set "BINDGEN_EXTRA_CLANG_ARGS_armv7_linux_androideabi=--target=armv7-linux-androideabi21"
-    cargo ndk -t armv7-linux-androideabi -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
-    if errorlevel 1 (
-        echo   [ARM32] Build failed
-        goto :error
+    if /i "%PERL_PROVIDER%"=="MSYS2" (
+        "%MSYS2_BASH%" -c "NDK_DIR=$(cygpath -u \"$WIN_ANDROID_NDK_HOME\"); REPO_DIR=$(cygpath -u \"$WIN_REPO_DIR\"); JNILIBS_DIR=$(cygpath -u \"$WIN_JNILIBS_DIR\"); CARGO_BIN=$(cygpath -u \"$WIN_CARGO_BIN\"); TOOLCHAIN_BIN=\"$NDK_DIR/toolchains/llvm/prebuilt/windows-x86_64/bin\"; ARM32_CC=\"$TOOLCHAIN_BIN/clang.exe\"; ARM32_CXX=\"$TOOLCHAIN_BIN/clang++.exe\"; ARM32_LINKER=$(cygpath -w \"$TOOLCHAIN_BIN/armv7a-linux-androideabi21-clang.cmd\"); ARM32_AR=\"$TOOLCHAIN_BIN/llvm-ar.exe\"; ARM32_RANLIB=\"$TOOLCHAIN_BIN/llvm-ranlib.exe\"; ARM32_CLANG_PATH=$(cygpath -w \"$TOOLCHAIN_BIN/clang.exe\"); ARM32_TARGET_FLAG=\"--target=armv7a-linux-androideabi21\"; export ANDROID_NDK_HOME=\"$NDK_DIR\"; export ANDROID_NDK_ROOT=\"$NDK_DIR\"; export CLANG_PATH=\"$ARM32_CLANG_PATH\"; export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=\"$ARM32_LINKER\"; export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_AR=\"$ARM32_AR\"; export BINDGEN_EXTRA_CLANG_ARGS_armv7_linux_androideabi=\"$ARM32_TARGET_FLAG\"; export PATH=\"$CARGO_BIN:$TOOLCHAIN_BIN:$PATH\"; cd \"$REPO_DIR\"; env 'CC_armv7-linux-androideabi'=\"$ARM32_CC\" 'CXX_armv7-linux-androideabi'=\"$ARM32_CXX\" 'AR_armv7-linux-androideabi'=\"$ARM32_AR\" 'RANLIB_armv7-linux-androideabi'=\"$ARM32_RANLIB\" 'CFLAGS_armv7-linux-androideabi'=\"$ARM32_TARGET_FLAG\" 'CXXFLAGS_armv7-linux-androideabi'=\"$ARM32_TARGET_FLAG\" cargo build --target armv7-linux-androideabi %CARGO_BUILD_FLAG% --features flutter && cp \"target/armv7-linux-androideabi/%BUILD_MODE%/liblibrustdesk.so\" \"$JNILIBS_DIR/armeabi-v7a/librustdesk.so\""
+    ) else (
+        set "PATH=%NDK_TOOLCHAIN_BIN%;%PATH%"
+        set "CLANG_PATH=%NDK_TOOLCHAIN_BIN%\clang.exe"
+        set "BINDGEN_EXTRA_CLANG_ARGS_armv7_linux_androideabi=--target=armv7a-linux-androideabi21"
+        cargo ndk -t armv7-linux-androideabi -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
     )
-    if exist "%LIBCXX_ARM%" copy /Y "%LIBCXX_ARM%" "%JNILIBS_DIR%\armeabi-v7a\libc++_shared.so" >nul
-    echo   [ARM32] Done
-    echo.
+    set "ARM32_FAIL="
+    if errorlevel 1 set "ARM32_FAIL=1"
+    if not defined ARM32_FAIL (
+        if exist "%LIBCXX_ARM%" copy /Y "%LIBCXX_ARM%" "%JNILIBS_DIR%\armeabi-v7a\libc++_shared.so" >nul
+        echo   [ARM32] Done
+        echo.
+    )
+)
+if "%BUILD_ARM%"=="1" if defined ARM32_FAIL (
+    echo   [ARM32] Build failed
+    goto :error
 )
 
 :: x86_64 build
@@ -283,13 +320,17 @@ if "%BUILD_X64%"=="1" (
     ) else (
         cargo ndk -t x86_64-linux-android -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
     )
-    if errorlevel 1 (
-        echo   [x86_64] Build failed
-        goto :error
+    set "X64_FAIL="
+    if errorlevel 1 set "X64_FAIL=1"
+    if not defined X64_FAIL (
+        if exist "%LIBCXX_X64%" copy /Y "%LIBCXX_X64%" "%JNILIBS_DIR%\x86_64\libc++_shared.so" >nul
+        echo   [x86_64] Done
+        echo.
     )
-    if exist "%LIBCXX_X64%" copy /Y "%LIBCXX_X64%" "%JNILIBS_DIR%\x86_64\libc++_shared.so" >nul
-    echo   [x86_64] Done
-    echo.
+)
+if "%BUILD_X64%"=="1" if defined X64_FAIL (
+    echo   [x86_64] Build failed
+    goto :error
 )
 
 :: x86 build
@@ -300,13 +341,17 @@ if "%BUILD_X86%"=="1" (
     ) else (
         cargo ndk -t i686-linux-android -P 21 -o "%JNILIBS_DIR%" -- build %CARGO_BUILD_FLAG% --features flutter
     )
-    if errorlevel 1 (
-        echo   [x86] Build failed
-        goto :error
+    set "X86_FAIL="
+    if errorlevel 1 set "X86_FAIL=1"
+    if not defined X86_FAIL (
+        if exist "%LIBCXX_X86%" copy /Y "%LIBCXX_X86%" "%JNILIBS_DIR%\x86\libc++_shared.so" >nul
+        echo   [x86] Done
+        echo.
     )
-    if exist "%LIBCXX_X86%" copy /Y "%LIBCXX_X86%" "%JNILIBS_DIR%\x86\libc++_shared.so" >nul
-    echo   [x86] Done
-    echo.
+)
+if "%BUILD_X86%"=="1" if defined X86_FAIL (
+    echo   [x86] Build failed
+    goto :error
 )
 
 :: Flutter build
@@ -337,25 +382,36 @@ echo   Target platforms: %TARGET_PLATFORMS%
 echo.
 
 :: Flutter pub get
-flutter pub get
-if errorlevel 1 (
+call flutter pub get
+set "FLUTTER_PUB_FAIL="
+if errorlevel 1 set "FLUTTER_PUB_FAIL=1"
+if defined FLUTTER_PUB_FAIL (
     echo [ERROR] flutter pub get failed
     cd ..
-    goto :error
 )
+if defined FLUTTER_PUB_FAIL goto :error
 
 :: Build APK
 echo   Building APK...
-flutter build apk --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
-if errorlevel 1 (
+call flutter build apk --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
+set "FLUTTER_APK_FAIL="
+if errorlevel 1 set "FLUTTER_APK_FAIL=1"
+if defined FLUTTER_APK_FAIL (
     echo [ERROR] Flutter APK build failed
     cd ..
-    goto :error
 )
+if defined FLUTTER_APK_FAIL goto :error
 
 :: Build split APKs
 echo   Building split APKs...
-flutter build apk --split-per-abi --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
+call flutter build apk --split-per-abi --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
+set "FLUTTER_SPLIT_APK_FAIL="
+if errorlevel 1 set "FLUTTER_SPLIT_APK_FAIL=1"
+if defined FLUTTER_SPLIT_APK_FAIL (
+    echo [ERROR] Flutter split APK build failed
+    cd ..
+)
+if defined FLUTTER_SPLIT_APK_FAIL goto :error
 
 cd ..
 
@@ -385,6 +441,52 @@ if exist "%APK_DIR%\app-x86_64-%BUILD_MODE%.apk" (
 echo.
 echo Build Success!
 goto :eof
+
+:vcpkg_require_arm64
+if exist "%VCPKG_ROOT%\installed\arm64-android\include\opus\opus_multistream.h" exit /b 0
+echo [ERROR] Missing vcpkg arm64-android ^(opus headers^). Run this once from CMD ^(manifest: vcpkg.json^):
+echo.
+echo   cd /d "%REPO_ROOT%"
+if defined ANDROID_NDK_HOME (
+    echo   set "ANDROID_NDK_HOME=%ANDROID_NDK_HOME%"
+) else (
+    echo   set "ANDROID_NDK_HOME=C:\path\to\Android\Sdk\ndk\^<version^>"
+)
+echo   "%VCPKG_ROOT%\vcpkg.exe" install --triplet arm64-android --x-install-root="%VCPKG_ROOT%\installed"
+echo.
+echo First install can take a long time ^(ffmpeg/opus/etc.^).
+exit /b 1
+
+:vcpkg_require_arm32
+if exist "%VCPKG_ROOT%\installed\arm-android\include\opus\opus_multistream.h" exit /b 0
+echo [ERROR] Missing vcpkg arm-android. Build arm-neon-android then rename the folder to arm-android:
+echo.
+echo   cd /d "%REPO_ROOT%"
+if defined ANDROID_NDK_HOME (
+    echo   set "ANDROID_NDK_HOME=%ANDROID_NDK_HOME%"
+) else (
+    echo   set "ANDROID_NDK_HOME=C:\path\to\Android\Sdk\ndk\^<version^>"
+)
+echo   "%VCPKG_ROOT%\vcpkg.exe" install --triplet arm-neon-android --x-install-root="%VCPKG_ROOT%\installed"
+echo   cd /d "%VCPKG_ROOT%\installed"
+echo   ren arm-neon-android arm-android
+echo See also flutter\build_android_deps.sh
+echo.
+exit /b 1
+
+:vcpkg_require_x64_android
+if exist "%VCPKG_ROOT%\installed\x64-android\include\opus\opus_multistream.h" exit /b 0
+echo [ERROR] Missing vcpkg x64-android ^(opus^).
+echo   "%VCPKG_ROOT%\vcpkg.exe" install --triplet x64-android --x-install-root="%VCPKG_ROOT%\installed"
+echo.
+exit /b 1
+
+:vcpkg_require_x86_android
+if exist "%VCPKG_ROOT%\installed\x86-android\include\opus\opus_multistream.h" exit /b 0
+echo [ERROR] Missing vcpkg x86-android ^(opus^).
+echo   "%VCPKG_ROOT%\vcpkg.exe" install --triplet x86-android --x-install-root="%VCPKG_ROOT%\installed"
+echo.
+exit /b 1
 
 :error
 echo.
