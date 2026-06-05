@@ -15,6 +15,9 @@ src/version.rs
 cert.pfx
 *.bak
 *png
+!flutter/assets/peer_tab_tree_view.png
+!flutter/assets/peer_tab_discovered.png
+!flutter/assets/peer_tab_custom_remote.png
 *svg
 sciter.dll
 **pdb
