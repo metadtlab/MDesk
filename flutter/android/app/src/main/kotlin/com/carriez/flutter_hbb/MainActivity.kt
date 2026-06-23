@@ -47,13 +47,15 @@ class MainActivity : FlutterActivity() {
     private val channelTag = "mChannel"
     private val logTag = "mMainActivity"
     private var mainService: MainService? = null
+    private val isHostRole: Boolean
+        get() = BuildConfig.APP_ROLE == "host"
 
     private var isAudioStart = false
     private val audioRecordHandle = AudioRecordHandle(this, { false }, { isAudioStart })
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        if (MainService.isReady) {
+        if (isHostRole && MainService.isReady) {
             Intent(activity, MainService::class.java).also {
                 bindService(it, serviceConnection, Context.BIND_AUTO_CREATE)
             }
@@ -74,7 +76,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
-        val inputPer = InputService.isOpen
+        val inputPer = isHostRole && InputService.isOpen
         activity.runOnUiThread {
             flutterMethodChannel?.invokeMethod(
                 "on_state_changed",
@@ -84,6 +86,9 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun requestMediaProjection() {
+        if (!isHostRole) {
+            return
+        }
         val intent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {
             action = ACT_REQUEST_MEDIA_PROJECTION
         }
@@ -131,7 +136,14 @@ class MainActivity : FlutterActivity() {
         flutterMethodChannel.setMethodCallHandler { call, result ->
             // make sure result will be invoked, otherwise flutter will await forever
             when (call.method) {
+                "get_app_role" -> {
+                    result.success(BuildConfig.APP_ROLE)
+                }
                 "init_service" -> {
+                    if (!isHostRole) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
                     Intent(activity, MainService::class.java).also {
                         bindService(it, serviceConnection, Context.BIND_AUTO_CREATE)
                     }
@@ -191,11 +203,11 @@ class MainActivity : FlutterActivity() {
                 "check_service" -> {
                     Companion.flutterMethodChannel?.invokeMethod(
                         "on_state_changed",
-                        mapOf("name" to "input", "value" to InputService.isOpen.toString())
+                        mapOf("name" to "input", "value" to (isHostRole && InputService.isOpen).toString())
                     )
                     Companion.flutterMethodChannel?.invokeMethod(
                         "on_state_changed",
-                        mapOf("name" to "media", "value" to MainService.isReady.toString())
+                        mapOf("name" to "media", "value" to (isHostRole && MainService.isReady).toString())
                     )
                     result.success(true)
                 }

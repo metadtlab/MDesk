@@ -29,6 +29,7 @@ import 'package:flutter_hbb/plugin/event.dart';
 import 'package:flutter_hbb/plugin/manager.dart';
 import 'package:flutter_hbb/plugin/widgets/desc_ui.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
+import 'package:flutter_hbb/common/widgets/screenshot_editor.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
 import 'package:tuple/tuple.dart';
@@ -463,8 +464,8 @@ class FfiModel with ChangeNotifier {
     };
   }
 
-  _handleScreenshot(
-      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+  Future<void> _handleScreenshot(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
     timerScreenshot?.cancel();
     timerScreenshot = null;
     final msg = evt['msg'] ?? '';
@@ -474,57 +475,59 @@ class FfiModel with ChangeNotifier {
     if (msg.isNotEmpty) {
       msgBox(sessionId, msgBoxType, msgBoxTitle, msg, '', dialogManager);
     } else {
-      final msgBoxText = 'screenshot-action-tip';
-
-      close() {
-        dialogManager.dismissAll();
+      final encoded =
+          await bind.sessionTakeScreenshotData(sessionId: sessionId);
+      if (encoded.startsWith('ERR:')) {
+        msgBox(sessionId, 'custom-nook-nocancel-hasclose-error',
+            'Take screenshot', encoded.substring(4), '', dialogManager);
+        return;
       }
 
-      saveAs() {
-        close();
-        Future.delayed(Duration.zero, () async {
-          final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-          String? outputFile = await FilePicker.platform.saveFile(
-            dialogTitle: '${translate('Save as')}...',
-            fileName: 'screenshot_$ts.png',
-            allowedExtensions: ['png'],
-            type: FileType.custom,
-          );
-          if (outputFile == null) {
-            bind.sessionHandleScreenshot(sessionId: sessionId, action: '2');
-          } else {
-            final res = await bind.sessionHandleScreenshot(
-                sessionId: sessionId, action: '0:$outputFile');
-            if (res.isNotEmpty) {
-              msgBox(sessionId, 'custom-nook-nocancel-hasclose-error',
-                  'Take screenshot', res, '', dialogManager);
-            }
-          }
-        });
+      late final Uint8List screenshotPng;
+      try {
+        screenshotPng = base64Decode(encoded);
+      } catch (e) {
+        msgBox(sessionId, 'custom-nook-nocancel-hasclose-error',
+            'Take screenshot', e.toString(), '', dialogManager);
+        return;
       }
 
-      copyToClipboard() {
-        bind.sessionHandleScreenshot(sessionId: sessionId, action: '1');
-        close();
+      Future<void> savePng(Uint8List png) async {
+        final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final outputFile = await FilePicker.platform.saveFile(
+          dialogTitle: '${translate('Save as')}...',
+          fileName: 'screenshot_$ts.png',
+          allowedExtensions: ['png'],
+          type: FileType.custom,
+        );
+        if (outputFile == null) return;
+        final res = await bind.mainSavePngFile(path: outputFile, data: png);
+        if (res.isNotEmpty) throw Exception(res);
+        BotToast.showText(text: translate('Saved'));
       }
 
-      cancel() {
-        bind.sessionHandleScreenshot(sessionId: sessionId, action: '2');
-        close();
+      Future<void> copyRgba(ScreenshotRgba image) async {
+        final res = await bind.mainSetRgbaClipboard(
+          width: image.width,
+          height: image.height,
+          data: image.rgba,
+        );
+        if (res.isNotEmpty) throw Exception(res);
+        BotToast.showText(text: translate('Copied'));
       }
 
-      final List<Widget> buttons = [
-        dialogButton('${translate('Save as')}...', onPressed: saveAs),
-        dialogButton('Copy to clipboard', onPressed: copyToClipboard),
-        dialogButton('Cancel', onPressed: cancel),
-      ];
       dialogManager.dismissAll();
       dialogManager.show(
         (setState, close, context) => CustomAlertDialog(
-          title: null,
-          content: SelectionArea(
-              child: msgboxContent(msgBoxType, msgBoxTitle, msgBoxText)),
-          actions: buttons,
+          title: Text(translate(msgBoxTitle)),
+          contentBoxConstraints:
+              const BoxConstraints(maxWidth: 1100, maxHeight: 820),
+          content: ScreenshotEditor(
+            initialPng: screenshotPng,
+            onSave: savePng,
+            onCopy: copyRgba,
+            onClose: close,
+          ),
         ),
         tag: '$msgBoxType-$msgBoxTitle-$msgBoxTitle',
       );

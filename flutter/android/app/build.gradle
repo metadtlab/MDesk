@@ -102,6 +102,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_11
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId "com.carriez.flutter_hbb"
@@ -109,6 +113,20 @@ android {
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
+    }
+
+    flavorDimensions "role"
+    productFlavors {
+        remote {
+            dimension "role"
+            applicationIdSuffix ".remote"
+            buildConfigField "String", "APP_ROLE", "\"remote\""
+        }
+        host {
+            dimension "role"
+            applicationIdSuffix ".host"
+            buildConfigField "String", "APP_ROLE", "\"host\""
+        }
     }
 
     signingConfigs {

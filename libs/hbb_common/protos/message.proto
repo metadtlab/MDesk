@@ -350,9 +350,17 @@ message Clipboard {
   ClipboardFormat format = 5;
   // Special format name, only used when format is Special.
   string special_name = 6;
+  // True when this clipboard was relayed by a controller to other open
+  // sessions (multi-session clipboard sync), not a direct/intended transfer.
+  // Used to skip audit logging on the receiving host to avoid phantom records.
+  bool relayed = 7;
 }
 
-message MultiClipboards { repeated Clipboard clipboards = 1; }
+message MultiClipboards {
+  repeated Clipboard clipboards = 1;
+  // See Clipboard.relayed.
+  bool relayed = 2;
+}
 
 enum FileType {
   Dir = 0;

@@ -17,6 +17,7 @@ import android.app.PendingIntent.FLAG_UPDATE_CURRENT
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.content.res.Configuration.ORIENTATION_LANDSCAPE
 import android.graphics.Color
@@ -46,7 +47,7 @@ import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
 
-const val DEFAULT_NOTIFY_TITLE = "RustDesk"
+const val DEFAULT_NOTIFY_TITLE = "MDesk Host"
 const val DEFAULT_NOTIFY_TEXT = "Service is running"
 const val DEFAULT_NOTIFY_ID = 1
 const val NOTIFY_ID_OFFSET = 100
@@ -219,6 +220,28 @@ class MainService : Service() {
     private var videoEncoder: MediaCodec? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
+    private var videoFrameCount = 0
+    private var imageReaderErrorLogged = false
+
+    private val mediaProjectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.d(logTag, "MediaProjection stopped")
+            serviceHandler?.post {
+                _isReady = false
+                stopCapture()
+                virtualDisplay?.release()
+                virtualDisplay = null
+                clearMediaProjection()
+                checkMediaPermission()
+            } ?: run {
+                _isReady = false
+                virtualDisplay?.release()
+                virtualDisplay = null
+                clearMediaProjection()
+                checkMediaPermission()
+            }
+        }
+    }
 
     // audio
     private val audioRecordHandle = AudioRecordHandle(this, { isStart }, { isAudioStart })
@@ -337,10 +360,15 @@ class MainService : Service() {
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
             intent.getParcelableExtra<Intent>(EXT_MEDIA_PROJECTION_RES_INTENT)?.let {
-                mediaProjection =
-                    mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
+                val projection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
+                if (projection == null) {
+                    _isReady = false
+                    requestMediaProjection()
+                } else {
+                    setMediaProjection(projection)
+                    _isReady = true
+                }
                 checkMediaPermission()
-                _isReady = true
             } ?: let {
                 Log.d(logTag, "getParcelableExtra intent null, invoke requestMediaProjection")
                 requestMediaProjection()
@@ -385,8 +413,16 @@ class MainService : Service() {
                                 val buffer = planes[0].buffer
                                 buffer.rewind()
                                 FFI.onVideoFrameUpdate(buffer)
+                                videoFrameCount += 1
+                                if (videoFrameCount == 1) {
+                                    Log.d(logTag, "First video frame received, bytes:${buffer.capacity()}")
+                                }
                             }
-                        } catch (ignored: java.lang.Exception) {
+                        } catch (e: java.lang.Exception) {
+                            if (!imageReaderErrorLogged) {
+                                imageReaderErrorLogged = true
+                                Log.w(logTag, "ImageReader frame handling failed", e)
+                            }
                         }
                     }, serviceHandler)
                 }
@@ -411,15 +447,30 @@ class MainService : Service() {
             Log.w(logTag, "startCapture fail,mediaProjection is null")
             return false
         }
-        
+
         updateScreenInfo(resources.configuration.orientation)
         Log.d(logTag, "Start Capture")
+        _isStart = true
+        videoFrameCount = 0
+        imageReaderErrorLogged = false
+        FFI.setFrameRawEnable("video", true)
         surface = createSurface()
+        if (surface == null) {
+            Log.w(logTag, "startCapture fail,surface is null")
+            _isStart = false
+            FFI.setFrameRawEnable("video", false)
+            return false
+        }
 
-        if (useVP9) {
+        val recorderStarted = if (useVP9) {
             startVP9VideoRecorder(mediaProjection!!)
         } else {
             startRawVideoRecorder(mediaProjection!!)
+        }
+        if (!recorderStarted) {
+            Log.w(logTag, "startCapture fail, recorder did not start")
+            stopCapture()
+            return false
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -431,8 +482,6 @@ class MainService : Service() {
             }
         }
         checkMediaPermission()
-        _isStart = true
-        FFI.setFrameRawEnable("video",true)
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         return true
     }
@@ -468,6 +517,7 @@ class MainService : Service() {
         // suface needs to be release after `imageReader.close()` to imageReader access released surface
         // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
         surface?.release()
+        surface = null
 
         // release audio
         _isAudioStart = false
@@ -486,7 +536,7 @@ class MainService : Service() {
             virtualDisplay = null
         }
 
-        mediaProjection = null
+        clearMediaProjection()
         checkMediaPermission()
         stopForeground(true)
         stopService(Intent(this, FloatingWindowService::class.java))
@@ -509,18 +559,18 @@ class MainService : Service() {
         return isReady
     }
 
-    private fun startRawVideoRecorder(mp: MediaProjection) {
+    private fun startRawVideoRecorder(mp: MediaProjection): Boolean {
         Log.d(logTag, "startRawVideoRecorder,screen info:$SCREEN_INFO")
         if (surface == null) {
             Log.d(logTag, "startRawVideoRecorder failed,surface is null")
-            return
+            return false
         }
-        createOrSetVirtualDisplay(mp, surface!!)
+        return createOrSetVirtualDisplay(mp, surface!!)
     }
 
-    private fun startVP9VideoRecorder(mp: MediaProjection) {
+    private fun startVP9VideoRecorder(mp: MediaProjection): Boolean {
         createMediaCodec()
-        videoEncoder?.let {
+        return videoEncoder?.let {
             surface = it.createInputSurface()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 surface!!.setFrameRate(1F, FRAME_RATE_COMPATIBILITY_DEFAULT)
@@ -528,12 +578,12 @@ class MainService : Service() {
             it.setCallback(cb)
             it.start()
             createOrSetVirtualDisplay(mp, surface!!)
-        }
+        } ?: false
     }
 
     // https://github.com/bk138/droidVNC-NG/blob/b79af62db5a1c08ed94e6a91464859ffed6f4e97/app/src/main/java/net/christianbeier/droidvnc_ng/MediaProjectionService.java#L250
     // Reuse virtualDisplay if it exists, to avoid media projection confirmation dialog every connection.
-    private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface) {
+    private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface): Boolean {
         try {
             virtualDisplay?.let {
                 it.resize(SCREEN_INFO.width, SCREEN_INFO.height, SCREEN_INFO.dpi)
@@ -545,11 +595,34 @@ class MainService : Service() {
                     s, null, null
                 )
             }
+            return true
         } catch (e: SecurityException) {
-            Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation");
+            Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation", e);
+            // This initiates a prompt dialog for the user to confirm screen projection.
+            requestMediaProjection()
+        } catch (e: IllegalStateException) {
+            Log.w(logTag, "createOrSetVirtualDisplay: got IllegalStateException, re-requesting confirmation", e);
             // This initiates a prompt dialog for the user to confirm screen projection.
             requestMediaProjection()
         }
+        return false
+    }
+
+    private fun setMediaProjection(mp: MediaProjection) {
+        clearMediaProjection()
+        mediaProjection = mp
+        mp.registerCallback(mediaProjectionCallback, serviceHandler ?: Handler(Looper.getMainLooper()))
+    }
+
+    private fun clearMediaProjection() {
+        mediaProjection?.let {
+            try {
+                it.unregisterCallback(mediaProjectionCallback)
+            } catch (e: Exception) {
+                Log.d(logTag, "unregister MediaProjection callback ignored", e)
+            }
+        }
+        mediaProjection = null
     }
 
     private val cb: MediaCodec.Callback = object : MediaCodec.Callback() {
@@ -598,13 +671,13 @@ class MainService : Service() {
     private fun initNotification() {
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationChannel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channelId = "RustDesk"
-            val channelName = "RustDesk Service"
+            val channelId = "MDeskHost"
+            val channelName = "MDesk Host Service"
             val channel = NotificationChannel(
                 channelId,
                 channelName, NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "RustDesk Service Channel"
+                description = "MDesk Host Service Channel"
             }
             channel.lightColor = Color.BLUE
             channel.lockscreenVisibility = Notification.VISIBILITY_PRIVATE
@@ -642,7 +715,15 @@ class MainService : Service() {
             .setColor(ContextCompat.getColor(this, R.color.primary))
             .setWhen(System.currentTimeMillis())
             .build()
-        startForeground(DEFAULT_NOTIFY_ID, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                DEFAULT_NOTIFY_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(DEFAULT_NOTIFY_ID, notification)
+        }
     }
 
     private fun loginRequestNotification(

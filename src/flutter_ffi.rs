@@ -62,6 +62,24 @@ fn should_skip_recent_remote_drop_action(session_id: &SessionID, action_key: Str
     false
 }
 
+#[cfg(target_os = "android")]
+fn parse_android_app_role_config(config: &str) -> Option<(&'static str, &'static str)> {
+    match config.strip_prefix("android-app-role=")? {
+        "host" => Some(("incoming", "MDesk Host")),
+        "remote" => Some(("outgoing", "MDesk Remote")),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn apply_android_app_role_config(conn_type: &str, app_name: &str) {
+    config::HARD_SETTINGS
+        .write()
+        .unwrap()
+        .insert("conn-type".to_owned(), conn_type.to_owned());
+    *config::APP_NAME.write().unwrap() = app_name.to_owned();
+}
+
 fn initialize(app_dir: &str, custom_client_config: &str) {
     flutter::async_tasks::start_flutter_async_runner();
     // `APP_DIR` is set in `main_get_data_dir_ios()` on iOS.
@@ -69,11 +87,23 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     {
         *config::APP_DIR.write().unwrap() = app_dir.to_owned();
     }
+    #[cfg(target_os = "android")]
+    let android_app_role_config = parse_android_app_role_config(custom_client_config);
+    #[cfg(target_os = "android")]
+    let use_custom_client_file =
+        custom_client_config.is_empty() || android_app_role_config.is_some();
+    #[cfg(not(target_os = "android"))]
+    let use_custom_client_file = custom_client_config.is_empty();
+
     // core_main's load_custom_client does not work for flutter since it is only applied to its load_library in main.c
-    if custom_client_config.is_empty() {
+    if use_custom_client_file {
         crate::load_custom_client();
     } else {
         crate::read_custom_client(custom_client_config);
+    }
+    #[cfg(target_os = "android")]
+    if let Some((conn_type, app_name)) = android_app_role_config {
+        apply_android_app_role_config(conn_type, app_name);
     }
     config::apply_product_default_settings();
     #[cfg(target_os = "android")]
@@ -314,6 +344,34 @@ pub fn session_handle_screenshot(
     action: String,
 ) -> String {
     crate::client::screenshot::handle_screenshot(action)
+}
+
+pub fn session_take_screenshot_data(#[allow(unused_variables)] session_id: SessionID) -> String {
+    match crate::client::screenshot::take_screenshot_data() {
+        Ok(data) => crate::encode64(data),
+        Err(e) => format!("ERR:{e}"),
+    }
+}
+
+pub fn main_save_png_file(path: String, data: Vec<u8>) -> String {
+    match std::fs::write(path, data) {
+        Ok(()) => "".to_owned(),
+        Err(e) => e.to_string(),
+    }
+}
+
+pub fn main_set_png_clipboard(data: Vec<u8>) -> String {
+    match crate::client::screenshot::copy_png_to_clipboard(data.into()) {
+        Ok(()) => "".to_owned(),
+        Err(e) => e.to_string(),
+    }
+}
+
+pub fn main_set_rgba_clipboard(width: usize, height: usize, data: Vec<u8>) -> String {
+    match crate::client::screenshot::copy_rgba_to_clipboard(width, height, data.into()) {
+        Ok(()) => "".to_owned(),
+        Err(e) => e.to_string(),
+    }
 }
 
 pub fn session_is_multi_ui_session(session_id: SessionID) -> SyncReturn<bool> {

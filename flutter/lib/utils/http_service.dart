@@ -45,13 +45,9 @@ class HttpService {
     return _parseHttpResponse(resJson);
   }
 
-  // SSL 인증서 검증 우회 HttpClient 생성
+  // Keep the platform's default TLS certificate validation.
   HttpClient _createSecureHttpClient() {
-    return HttpClient()
-      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
-        debugPrint('HttpService SSL BadCertificate callback - host=$host, port=$port');
-        return true; // 모든 인증서 허용
-      };
+    return HttpClient();
   }
 
   Future<http.Response> _pollFlutterHttp(
@@ -60,7 +56,7 @@ class HttpService {
     Map<String, String>? headers,
     dynamic body,
   }) async {
-    // SSL 우회 HttpClient 사용
+    // Use the default certificate checks for Flutter-side HTTP.
     final httpClient = _createSecureHttpClient();
     
     try {

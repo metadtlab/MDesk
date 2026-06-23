@@ -618,14 +618,8 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
 
         final stopwatch = Stopwatch()..start();
 
-        // SSL 인증서 검증을 우회하는 HttpClient 사용
-        final httpClient = HttpClient()
-          ..badCertificateCallback =
-              (X509Certificate cert, String host, int port) {
-            debugPrint(
-                'AgentNumUpdate: BadCertificate callback - host=$host, port=$port');
-            return true; // 모든 인증서 허용
-          };
+        // Use the platform's default TLS certificate validation.
+        final httpClient = HttpClient();
 
         final request = await httpClient.getUrl(Uri.parse(url));
         final response =

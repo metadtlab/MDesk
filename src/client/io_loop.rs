@@ -1457,8 +1457,10 @@ impl<T: InvokeUiSession> Remote<T> {
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         {
+                            let mut relay_cb = cb.clone();
+                            relay_cb.relayed = true;
                             let mut relay_msg = Message::new();
-                            relay_msg.set_clipboard(cb.clone());
+                            relay_msg.set_clipboard(relay_cb);
                             update_clipboard(vec![cb], ClipboardSide::Client);
                             #[cfg(feature = "flutter")]
                             crate::flutter::send_clipboard_msg_except_peer(
@@ -1486,8 +1488,10 @@ impl<T: InvokeUiSession> Remote<T> {
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         {
+                            let mut relay_mcb = _mcb.clone();
+                            relay_mcb.relayed = true;
                             let mut relay_msg = Message::new();
-                            relay_msg.set_multi_clipboards(_mcb.clone());
+                            relay_msg.set_multi_clipboards(relay_mcb);
                             update_clipboard(_mcb.clipboards, ClipboardSide::Client);
                             #[cfg(feature = "flutter")]
                             crate::flutter::send_clipboard_msg_except_peer(

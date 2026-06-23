@@ -89,3 +89,20 @@ push_with_token.bat
 push_to_github_force.bat
 push_to_github.bat
 setup_github_ssh.bat
+
+# Multi-agent task data: keep folder placeholders, ignore private task contents.
+!AGENTS.md
+!CLAUDE.md
+!SECURITY_HIGH_RISKS.md
+!_shared/
+!_shared/**
+!_templates/
+!_templates/**
+!tasks/
+tasks/*
+!tasks/.gitkeep
+
+# Multi-agent local memory: keep folder placeholder, ignore private local notes.
+!_local/
+_local/*
+!_local/.gitkeep

@@ -5,6 +5,7 @@ import 'package:device_info_plus/device_info_plus.dart';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/android_app_role.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -58,7 +59,8 @@ class PlatformFFI {
   }
 
   bool registerEventHandler(
-      String eventName, String handlerName, HandleEvent handler, {bool replace = false}) {
+      String eventName, String handlerName, HandleEvent handler,
+      {bool replace = false}) {
     debugPrint('registerEventHandler $eventName $handlerName');
     var handlers = _eventHandlers[eventName];
     if (handlers == null) {
@@ -144,6 +146,9 @@ class PlatformFFI {
         debugPrint('Failed to get documents directory: $e');
       }
       _ffiBind = RustdeskImplImpl(dylib);
+      if (isAndroid) {
+        await _initAndroidAppRole();
+      }
 
       if (isLinux) {
         if (isMain) {
@@ -159,8 +164,9 @@ class PlatformFFI {
         if (isAndroid) {
           // Use the primary app-specific external storage directory on Android.
           final externalDirs = await getExternalStorageDirectories();
-          _homeDir =
-              externalDirs != null && externalDirs.isNotEmpty ? externalDirs.first.path : '';
+          _homeDir = externalDirs != null && externalDirs.isNotEmpty
+              ? externalDirs.first.path
+              : '';
         } else if (isIOS) {
           // The previous code was `_homeDir = (await getDownloadsDirectory())?.path ?? '';`,
           // which provided the `downloads` path in the sandbox.
@@ -220,12 +226,23 @@ class PlatformFFI {
       await _ffiBind.mainSetHomeDir(home: _homeDir);
       await _ffiBind.mainInit(
         appDir: _dir,
-        customClientConfig: '',
+        customClientConfig: isAndroid ? androidAppRoleConfigToken : '',
       );
     } catch (e) {
       debugPrintStack(label: 'initialize failed: $e');
     }
     version = await getVersion();
+  }
+
+  Future<void> _initAndroidAppRole() async {
+    try {
+      final role = await _toAndroidChannel.invokeMethod<String>('get_app_role');
+      setAndroidAppRole(role);
+      debugPrint('Android app role: $androidAppRole');
+    } catch (e) {
+      setAndroidAppRole(null);
+      debugPrint('Failed to get Android app role: $e');
+    }
   }
 
   Future<bool> tryHandle(Map<String, dynamic> evt) async {

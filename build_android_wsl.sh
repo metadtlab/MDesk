@@ -260,12 +260,11 @@ echo "다음 명령어로 Flutter APK를 빌드하세요:"
 echo "  cd flutter"
 echo "  flutter clean"
 echo "  flutter pub get"
-echo "  flutter build apk --release --target-platform android-arm64,android-arm --split-per-abi"
+echo "  flutter build apk --release --flavor host --dart-define=ANDROID_APP_ROLE=host --target-platform android-arm64,android-arm --split-per-abi"
 echo
 echo "또는 Windows에서:"
 echo "  cd flutter"
 echo "  flutter clean"
 echo "  flutter pub get"
-echo "  flutter build apk --release --target-platform android-arm64,android-arm --split-per-abi"
+echo "  flutter build apk --release --flavor host --dart-define=ANDROID_APP_ROLE=host --target-platform android-arm64,android-arm --split-per-abi"
 echo
-

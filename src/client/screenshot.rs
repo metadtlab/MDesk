@@ -1,6 +1,6 @@
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::{update_clipboard, ClipboardSide};
-use hbb_common::{message_proto::*, ResultType};
+use hbb_common::{bail, message_proto::*, ResultType};
 use std::sync::Mutex;
 
 lazy_static::lazy_static! {
@@ -67,27 +67,71 @@ impl Screenshot {
         }
     }
 
+    fn take_data(&mut self) -> ResultType<bytes::Bytes> {
+        let Some(data) = self.data.take() else {
+            bail!("No cached screenshot");
+        };
+        Ok(data)
+    }
+
     fn handle_screenshot_(data: bytes::Bytes, action: String) -> ResultType<()> {
         match ScreenshotAction::from(&action as &str) {
             ScreenshotAction::SaveAs(p) => {
                 std::fs::write(p, data)?;
             }
             ScreenshotAction::CopyToClipboard => {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                {
-                    let clips = vec![Clipboard {
-                        compress: false,
-                        content: data,
-                        format: ClipboardFormat::ImagePng.into(),
-                        ..Default::default()
-                    }];
-                    update_clipboard(clips, ClipboardSide::Client);
-                }
+                copy_png_to_clipboard(data)?;
             }
             ScreenshotAction::Discard => {}
         }
         Ok(())
     }
+}
+
+pub fn copy_png_to_clipboard(data: bytes::Bytes) -> ResultType<()> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let clips = vec![Clipboard {
+            compress: false,
+            content: data,
+            format: ClipboardFormat::ImagePng.into(),
+            ..Default::default()
+        }];
+        update_clipboard(clips, ClipboardSide::Client);
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = data;
+    }
+    Ok(())
+}
+
+pub fn copy_rgba_to_clipboard(width: usize, height: usize, data: bytes::Bytes) -> ResultType<()> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let Some(expected_len) = width
+            .checked_mul(height)
+            .and_then(|size| size.checked_mul(4))
+        else {
+            bail!("Invalid image size");
+        };
+        if data.len() != expected_len {
+            bail!(
+                "Invalid RGBA image data: got {} bytes, expected {}",
+                data.len(),
+                expected_len
+            );
+        }
+
+        let image = arboard::ImageData::rgba(width, height, data.to_vec().into());
+        let mut clipboard = arboard::Clipboard::new()?;
+        clipboard.set_image(image)?;
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (width, height, data);
+    }
+    Ok(())
 }
 
 pub fn set_screenshot(data: bytes::Bytes) {
@@ -96,4 +140,8 @@ pub fn set_screenshot(data: bytes::Bytes) {
 
 pub fn handle_screenshot(action: String) -> String {
     SCREENSHOT.lock().unwrap().handle_screenshot(action)
+}
+
+pub fn take_screenshot_data() -> ResultType<bytes::Bytes> {
+    SCREENSHOT.lock().unwrap().take_data()
 }

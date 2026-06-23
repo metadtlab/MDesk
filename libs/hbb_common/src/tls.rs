@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::RwLock};
 
 use crate::config::allow_insecure_tls_fallback;
 
+const TLS_REQUIRED_DOMAINS: &[&str] = &["787.kr", "imedixerp.co.kr"];
+
 #[derive(Debug, Clone, Copy)]
 pub enum TlsType {
     Plain,
@@ -39,12 +41,44 @@ fn get_domain_and_port_from_url(url: &str) -> &str {
 }
 
 #[inline]
+fn get_host_from_domain_and_port(domain_port: &str) -> &str {
+    if let Some(rest) = domain_port.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    domain_port.split(':').next().unwrap_or(domain_port)
+}
+
+#[inline]
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .map(|prefix| prefix.ends_with('.'))
+            .unwrap_or(false)
+}
+
+#[inline]
+pub fn requires_valid_tls_certificate(url: &str) -> bool {
+    let domain_port = get_domain_and_port_from_url(url);
+    let host = get_host_from_domain_and_port(domain_port)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    TLS_REQUIRED_DOMAINS
+        .iter()
+        .any(|domain| host_matches_domain(&host, domain))
+}
+
+#[inline]
 pub fn upsert_tls_cache(url: &str, tls_type: TlsType, danger_accept_invalid_cert: bool) {
     if is_plain(url) {
         return;
     }
 
     let domain_port = get_domain_and_port_from_url(url);
+    let danger_accept_invalid_cert =
+        danger_accept_invalid_cert && !requires_valid_tls_certificate(url);
     // Use curly braces to ensure the lock is released immediately.
     {
         URL_TLS_TYPE
@@ -82,13 +116,18 @@ pub fn get_cached_tls_type(url: &str) -> Option<TlsType> {
 
 #[inline]
 pub fn get_cached_tls_accept_invalid_cert(url: &str) -> Option<bool> {
+    if is_plain(url) {
+        return Some(false);
+    }
+
+    if requires_valid_tls_certificate(url) {
+        return Some(false);
+    }
+
     if !allow_insecure_tls_fallback() {
         return Some(false);
     }
 
-    if is_plain(url) {
-        return Some(false);
-    }
     let domain_port = get_domain_and_port_from_url(url);
     URL_TLS_DANGER_ACCEPT_INVALID_CERTS
         .read()
@@ -117,5 +156,40 @@ mod tests {
             let domain_port = get_domain_and_port_from_url(url);
             assert_eq!(domain_port, expected_domain_port);
         }
+    }
+
+    #[test]
+    fn test_requires_valid_tls_certificate_for_official_domains() {
+        for url in [
+            "https://787.kr",
+            "https://admin.787.kr/api/certno/verify",
+            "https://ADMIN.787.KR/api/certno/verify",
+            "wss://mdesk.imedixerp.co.kr:21118/ws",
+            "https://api.imedixerp.co.kr/path",
+        ] {
+            assert!(requires_valid_tls_certificate(url), "{}", url);
+        }
+    }
+
+    #[test]
+    fn test_private_domains_can_use_existing_tls_fallback_option() {
+        for url in [
+            "https://example.com",
+            "https://private.local:21118",
+            "wss://192.168.0.10:21118/ws",
+        ] {
+            assert!(!requires_valid_tls_certificate(url), "{}", url);
+        }
+    }
+
+    #[test]
+    fn test_official_domains_never_cache_invalid_cert_acceptance() {
+        reset_tls_cache();
+        upsert_tls_cache("https://admin.787.kr/api", TlsType::Rustls, true);
+        assert_eq!(
+            get_cached_tls_accept_invalid_cert("https://admin.787.kr/api"),
+            Some(false)
+        );
+        reset_tls_cache();
     }
 }

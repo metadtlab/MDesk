@@ -30,7 +30,7 @@ use std::{
     path::*,
     ptr::null_mut,
     sync::{atomic::Ordering, Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use wallpaper;
 #[cfg(not(debug_assertions))]
@@ -1661,7 +1661,15 @@ fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathB
         std::fs::File::create(&tmp2).ok();
         cmds = format!(
             "
+@echo on
+echo [MDesk command] tip={tip}
+echo [MDesk command] bat=%~f0
+echo [MDesk command] cwd=%CD%
+echo [MDesk command] user=%USERNAME%
+echo [MDesk command] temp=%TEMP%
 {cmds}
+set MDeskCmdExitCode=%ERRORLEVEL%
+echo [MDesk command] last_exit_code=%MDeskCmdExitCode%
 if exist \"{path}\" del /f /q \"{path}\"
 ",
             path = tmp2.to_string_lossy()
@@ -1697,24 +1705,131 @@ fn get_undone_file(tmp: &Path) -> ResultType<PathBuf> {
     )))
 }
 
+fn get_cmd_log_file(tmp: &Path) -> ResultType<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(tmp.with_file_name(format!(
+        "{}.{}.log",
+        tmp.file_name()
+            .ok_or(anyhow!("Failed to get filename of {:?}", tmp))?
+            .to_string_lossy(),
+        stamp
+    )))
+}
+
+fn append_cmd_diag(path: &Path, text: &str) {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{}", text);
+    }
+}
+
+fn read_file_tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return "".to_owned();
+    };
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).to_string()
+}
+
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let tmp = write_cmds(cmds, "bat", tip)?;
     let tmp2 = get_undone_file(&tmp)?;
+    let cmd_log = get_cmd_log_file(&tmp)?;
     let tmp_fn = tmp.to_str().unwrap_or("");
+    log::info!(
+        "run_cmds begin: tip={}, show={}, bat={}, undone={}, cmd_log={}",
+        tip,
+        show,
+        tmp.display(),
+        tmp2.display(),
+        cmd_log.display()
+    );
+    append_cmd_diag(
+        &cmd_log,
+        &format!(
+            "[runner] tip={tip}, show={show}, bat={}, undone={}, current_exe={}",
+            tmp.display(),
+            tmp2.display(),
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("error: {e}"))
+        ),
+    );
     // https://github.com/rustdesk/rustdesk/issues/6786#issuecomment-1879655410
     // Specify cmd.exe explicitly to avoid the replacement of cmd commands.
     let res = runas::Command::new("cmd.exe")
-        .args(&["/C", &tmp_fn])
+        .args(&["/C", tmp_fn])
         .show(show)
         .force_prompt(true)
         .status();
+    let status = match res {
+        Ok(status) => status,
+        Err(err) => {
+            append_cmd_diag(&cmd_log, &format!("[runner] launch_error={err}"));
+            log::error!(
+                "run_cmds failed to launch: tip={}, bat={}, cmd_log={}, error={}",
+                tip,
+                tmp.display(),
+                cmd_log.display(),
+                err
+            );
+            bail!(
+                "{} failed to launch: {}, bat: {}, cmd_log: {}",
+                tip,
+                err,
+                tmp.display(),
+                cmd_log.display()
+            );
+        }
+    };
+    append_cmd_diag(&cmd_log, &format!("[runner] status={status}"));
+    log::info!(
+        "run_cmds finished: tip={}, status={}, bat={}, cmd_log={}",
+        tip,
+        status,
+        tmp.display(),
+        cmd_log.display()
+    );
+    if !status.success() {
+        let tail = read_file_tail(&cmd_log, 4096);
+        log::error!(
+            "run_cmds non-zero exit: tip={}, status={}, bat={}, cmd_log={}, tail={}",
+            tip,
+            status,
+            tmp.display(),
+            cmd_log.display(),
+            tail
+        );
+        bail!(
+            "{} failed with status {}, bat: {}, cmd_log: {}",
+            tip,
+            status,
+            tmp.display(),
+            cmd_log.display()
+        );
+    }
+    if tmp2.exists() {
+        let tail = read_file_tail(&cmd_log, 4096);
+        log::error!(
+            "run_cmds marker remains: tip={}, bat={}, undone={}, cmd_log={}, tail={}",
+            tip,
+            tmp.display(),
+            tmp2.display(),
+            cmd_log.display(),
+            tail
+        );
+        bail!(
+            "{} failed, marker remains: {}, bat: {}, cmd_log: {}",
+            tip,
+            tmp2.display(),
+            tmp.display(),
+            cmd_log.display()
+        );
+    }
     if !show {
         allow_err!(std::fs::remove_file(tmp));
-    }
-    let _ = res?;
-    if tmp2.exists() {
-        allow_err!(std::fs::remove_file(tmp2));
-        bail!("{} failed", tip);
     }
     Ok(())
 }
@@ -2937,6 +3052,17 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     let app_name = crate::get_app_name();
     let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
     let (subkey, path, _, exe) = get_install_info();
+    log::info!(
+        "update_me begin: app_name={}, version={}, build_date={}, src_exe={}, install_path={}, target_exe={}, uninstall_subkey={}, debug={}",
+        app_name,
+        crate::VERSION,
+        crate::BUILD_DATE,
+        src_exe,
+        path,
+        exe,
+        subkey,
+        debug
+    );
     let is_installed = std::fs::metadata(&exe).is_ok();
     if !is_installed {
         bail!("{} is not installed.", &app_name);
@@ -2959,6 +3085,12 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         .collect::<Vec<_>>();
     kill_process_by_pids(&app_exe_name, tray_pids)?;
     let is_service_running = is_self_service_running();
+    log::info!(
+        "update_me process state: main_window_sessions={:?}, tray_sessions={:?}, service_running={}",
+        main_window_sessions,
+        tray_sessions,
+        is_service_running
+    );
 
     let mut version_major = "0";
     let mut version_minor = "0";
@@ -3039,6 +3171,12 @@ taskkill /F /IM {app_name}.exe{filter}
         sleep = if debug { "timeout 300" } else { "" },
     );
 
+    log::info!(
+        "update_me running command script: src_exe={}, target_exe={}, install_path={}",
+        src_exe,
+        exe,
+        path
+    );
     run_cmds(cmds, debug, "update")?;
 
     std::thread::sleep(std::time::Duration::from_millis(2000));

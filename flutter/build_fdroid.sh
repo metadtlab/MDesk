@@ -64,10 +64,16 @@ VERNAME="${1}"
 VERCODE="${2}"
 ANDROID_ABI="${3}"
 BUILDSTEP="${4}"
+ANDROID_FLAVOR="${ANDROID_FLAVOR:-host}"
 
 if [ -z "${VERNAME}" ] || [ -z "${VERCODE}" ] || [ -z "${ANDROID_ABI}" ] ||
 	[ -z "${BUILDSTEP}" ]; then
 	echo "ERROR: Command-line arguments are all required to be non-empty!" >&2
+	exit 1
+fi
+
+if [ "${ANDROID_FLAVOR}" != "host" ] && [ "${ANDROID_FLAVOR}" != "remote" ]; then
+	echo "ERROR: Unknown Android flavor '${ANDROID_FLAVOR}'!" >&2
 	exit 1
 fi
 
@@ -344,7 +350,8 @@ prebuild)
 
 		flutter_rust_bridge_codegen \
 			--rust-input ./src/flutter_ffi.rs \
-			--dart-output ./flutter/lib/generated_bridge.dart
+			--dart-output ./flutter/lib/generated_bridge.dart \
+			--class-name RustdeskImpl
 
 		# Add bridge files to save-list
 
@@ -590,6 +597,8 @@ build)
 
 	if [ "${ANDROID_ABI}" = "x86" ]; then
 		flutter build apk \
+			--flavor "${ANDROID_FLAVOR}" \
+			--dart-define="ANDROID_APP_ROLE=${ANDROID_FLAVOR}" \
 			--local-engine-src-path="$(readlink -mf "../flutter-sdk/src")" \
 			--local-engine=android_jit_release_x86 \
 			--debug \
@@ -598,6 +607,8 @@ build)
 			--target-platform "${FLUTTER_TARGET}"
 	else
 		flutter build apk \
+			--flavor "${ANDROID_FLAVOR}" \
+			--dart-define="ANDROID_APP_ROLE=${ANDROID_FLAVOR}" \
 			--release \
 			--build-number="${VERCODE}" \
 			--build-name="${VERNAME}" \

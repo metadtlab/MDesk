@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_hbb/android_app_role.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/mobile/pages/settings_page.dart';
@@ -60,17 +61,12 @@ class ServerModel with ChangeNotifier {
   CustomConfig? customConfig;
   bool isFetchingConfig = false;
 
-  // SSL 인증서 검증 우회 HttpClient 생성
+  // Keep the platform's default TLS certificate validation.
   HttpClient _createSecureHttpClient() {
-    return HttpClient()
-      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
-        debugPrint(
-            'ServerModel SSL BadCertificate callback - host=$host, port=$port');
-        return true; // 모든 인증서 허용
-      };
+    return HttpClient();
   }
 
-  // SSL 우회 POST 요청
+  // POST request using default TLS certificate validation.
   Future<http.Response> _securePost(String url,
       {Map<String, String>? headers, Object? body, Duration? timeout}) async {
     final httpClient = _createSecureHttpClient();
@@ -91,7 +87,7 @@ class ServerModel with ChangeNotifier {
     }
   }
 
-  // SSL 우회 GET 요청
+  // GET request using default TLS certificate validation.
   Future<http.Response> _secureGet(String url, {Duration? timeout}) async {
     final httpClient = _createSecureHttpClient();
     try {
@@ -515,6 +511,10 @@ class ServerModel with ChangeNotifier {
       if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
         await AndroidPermissionManager.request(kManageExternalStorage);
       }
+      if (isAndroidHostApp) {
+        startService();
+        return;
+      }
       final res = await parent.target?.dialogManager
           .show<bool>((setState, close, context) {
         submit() => close(true);
@@ -559,7 +559,7 @@ class ServerModel with ChangeNotifier {
     await bind.mainStopService();
     notifyListeners();
     if (!isLinux) {
-      WakelockPlus.disable();
+      await _setWakelock(false);
     }
   }
 
@@ -913,12 +913,21 @@ class ServerModel with ChangeNotifier {
     final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
         (keepScreenOn == KeepScreenOn.duringControlled &&
             _clients.map((e) => !e.disconnected).isNotEmpty);
-    if (on != await WakelockPlus.enabled) {
-      if (on) {
-        WakelockPlus.enable();
-      } else {
-        WakelockPlus.disable();
+    await _setWakelock(on);
+  }
+
+  Future<void> _setWakelock(bool on) async {
+    if (isLinux) return;
+    try {
+      if (on != await WakelockPlus.enabled) {
+        if (on) {
+          await WakelockPlus.enable();
+        } else {
+          await WakelockPlus.disable();
+        }
       }
+    } catch (e) {
+      debugPrint("update wakelock failed: $e");
     }
   }
 }
@@ -1024,8 +1033,13 @@ String getLoginDialogTag(int id) {
 
 showInputWarnAlert(FFI ffi) {
   ffi.dialogManager.show((setState, close, context) {
-    submit() {
+    openAccessibilitySettings() {
       AndroidPermissionManager.startAction(kActionAccessibilitySettings);
+      close();
+    }
+
+    openAppInfo() {
+      AndroidPermissionManager.startAction(kActionApplicationDetailsSettings);
       close();
     }
 
@@ -1037,13 +1051,17 @@ showInputWarnAlert(FFI ffi) {
           Text(translate("android_input_permission_tip1")),
           const SizedBox(height: 10),
           Text(translate("android_input_permission_tip2")),
+          const SizedBox(height: 10),
+          Text(translate("android_input_permission_tip_restricted")),
         ],
       ),
       actions: [
         dialogButton("Cancel", onPressed: close, isOutline: true),
-        dialogButton("Open System Setting", onPressed: submit),
+        dialogButton("Open App Info", onPressed: openAppInfo, isOutline: true),
+        dialogButton("Open Accessibility Settings",
+            onPressed: openAccessibilitySettings),
       ],
-      onSubmit: submit,
+      onSubmit: openAccessibilitySettings,
       onCancel: close,
     );
   });

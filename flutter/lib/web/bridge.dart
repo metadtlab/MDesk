@@ -1915,6 +1915,28 @@ class RustdeskImpl {
     throw UnimplementedError("sessionHandleScreenshot");
   }
 
+  Future<String> sessionTakeScreenshotData(
+      {required UuidValue sessionId, dynamic hint}) {
+    throw UnimplementedError("sessionTakeScreenshotData");
+  }
+
+  Future<String> mainSavePngFile(
+      {required String path, required Uint8List data, dynamic hint}) {
+    throw UnimplementedError("mainSavePngFile");
+  }
+
+  Future<String> mainSetPngClipboard({required Uint8List data, dynamic hint}) {
+    throw UnimplementedError("mainSetPngClipboard");
+  }
+
+  Future<String> mainSetRgbaClipboard(
+      {required int width,
+      required int height,
+      required Uint8List data,
+      dynamic hint}) {
+    throw UnimplementedError("mainSetRgbaClipboard");
+  }
+
   String? sessionGetCommonSync(
       {required UuidValue sessionId,
       required String key,

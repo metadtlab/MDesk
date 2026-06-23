@@ -275,6 +275,15 @@ pub struct Connection {
     video_ack_required: bool,
     server_audit_conn: String,
     server_audit_file: String,
+    server_audit_clipboard: String,
+    // Last clipboard received from the controller (already summarized as a
+    // client_to_host audit payload). Logged only when the operator actually
+    // pastes on this host (Ctrl+V / Shift+Insert), so phantom records from
+    // multi-session relay are avoided while real pastes are captured.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    last_clipboard_audit_for_paste: Option<Value>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    last_paste_audit_at: Option<Instant>,
     lr: LoginRequest,
     peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
@@ -451,6 +460,11 @@ impl Connection {
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
+            server_audit_clipboard: "".to_owned(),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            last_clipboard_audit_for_paste: None,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            last_paste_audit_at: None,
             lr: Default::default(),
             peer_argb: 0u32,
             session_last_recv_time: None,
@@ -716,6 +730,11 @@ impl Connection {
                                     let files_audit: Vec<(String, i64)> = files.iter().map(|(f, s)| {
                                         (f.clone(), *s as i64)
                                     }).collect();
+                                    conn.post_clipboard_audit(crate::clipboard_audit::summarize_files(
+                                        crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                        &files_audit,
+                                        &conn.ip,
+                                    ));
                                     conn.post_file_audit(
                                         FileAuditType::RemoteSend,
                                         "",
@@ -901,6 +920,13 @@ impl Connection {
                             }
                         }
                         Some(message::Union::MultiClipboards(_multi_clipboards)) => {
+                            conn.post_clipboard_audit(
+                                crate::clipboard_audit::summarize_multi_clipboards(
+                                    crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                    &_multi_clipboards.clipboards,
+                                    &conn.ip,
+                                ),
+                            );
                             #[cfg(not(target_os = "ios"))]
                             if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(&conn.lr.version, &conn.lr.my_platform, _multi_clipboards) {
                                 if let Err(err) = conn.stream.send(&msg_out).await {
@@ -1283,10 +1309,16 @@ impl Connection {
             Config::get_option("custom-rendezvous-server"),
             "file".to_owned(),
         );
+        self.server_audit_clipboard = crate::get_audit_server(
+            Config::get_option("api-server"),
+            Config::get_option("custom-rendezvous-server"),
+            "clipboard".to_owned(),
+        );
         log::info!(
-            "Audit server configured - conn: {}, file: {}",
+            "Audit server configured - conn: {}, file: {}, clipboard: {}",
             self.server_audit_conn,
-            self.server_audit_file
+            self.server_audit_file,
+            self.server_audit_clipboard
         );
     }
 
@@ -1394,6 +1426,133 @@ impl Connection {
                 }
             }
         });
+    }
+
+    // 클립보드 전송 내역(메타데이터 전용)을 audit 서버로 전송한다.
+    // info에는 클립보드 "내용"은 절대 포함되지 않으며, 방향/종류/포맷/파일명(basename)
+    // /개수/크기/이미지 크기 등 메타데이터만 담긴다. (src/clipboard_audit.rs 참고)
+    fn post_clipboard_audit(&self, info: Value) {
+        if self.server_audit_clipboard.is_empty() {
+            log::debug!("Clipboard audit URL is empty, skipping clipboard audit");
+            return;
+        }
+        let url = self.server_audit_clipboard.clone();
+        // id = 연결하는 클라이언트 ID (from_id), peer_id = 서버(자신)의 ID
+        let v = json!({
+            "id": json!(self.lr.my_id.clone()),
+            "peer_id": json!(Config::get_id()),
+            "type": 0,
+            "info": info.to_string(),
+        });
+        log::info!("Sending clipboard audit to {}: {:?}", url, v);
+        let url_clone = url.clone();
+        tokio::spawn(async move {
+            match Self::post_audit_async(url, v).await {
+                Ok(response) => {
+                    log::info!("Clipboard audit response from {}: {}", url_clone, response);
+                }
+                Err(e) => {
+                    log::error!("Failed to post clipboard audit to {}: {}", url_clone, e);
+                }
+            }
+        });
+    }
+
+    // 호스트에서 실제 붙여넣기(Ctrl+V / Shift+Insert)가 일어났는지 키 입력으로 감지해,
+    // 직전에 컨트롤러로부터 받은 클립보드를 "수신(client_to_host)" audit으로 기록한다.
+    // 멀티세션 자동 중계로 받은 클립보드는 붙여넣기 전에는 기록되지 않으므로 유령
+    // 기록을 막으면서, 실제 붙여넣기는 정확히 캡처한다.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn key_event_rdev_key(me: &KeyEvent) -> Option<rdev::Key> {
+        match me.mode.enum_value() {
+            Ok(KeyboardMode::Map) => Some(crate::keyboard::keycode_to_rdev_key(me.chr())),
+            Ok(KeyboardMode::Translate) => {
+                if let Some(key_event::Union::Chr(code)) = &me.union {
+                    Some(crate::keyboard::keycode_to_rdev_key(*code & 0x0000FFFF))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn detect_and_audit_paste(&mut self, me: &KeyEvent) {
+        if !self.clipboard || self.last_clipboard_audit_for_paste.is_none() {
+            return;
+        }
+        // 키 업 이벤트는 붙여넣기 판별에서 제외.
+        if !me.down && !me.press {
+            return;
+        }
+
+        let rdev_key = Self::key_event_rdev_key(me);
+        let is_v = match me.mode.enum_value() {
+            Ok(KeyboardMode::Legacy) => matches!(
+                &me.union,
+                Some(key_event::Union::Chr(c)) if {
+                    let c = *c as u32;
+                    c == 'v' as u32 || c == 'V' as u32
+                }
+            ),
+            _ => matches!(rdev_key, Some(rdev::Key::KeyV)),
+        };
+        let is_insert = match me.mode.enum_value() {
+            Ok(KeyboardMode::Legacy) => matches!(
+                &me.union,
+                Some(key_event::Union::ControlKey(ck)) if ck.value() == ControlKey::Insert.value()
+            ),
+            _ => {
+                matches!(rdev_key, Some(rdev::Key::Insert))
+                    || matches!(
+                        &me.union,
+                        Some(key_event::Union::ControlKey(ck))
+                            if ck.value() == ControlKey::Insert.value()
+                    )
+            }
+        };
+
+        let ctrl_held = self
+            .pressed_modifiers
+            .iter()
+            .any(|k| matches!(k, rdev::Key::ControlLeft | rdev::Key::ControlRight))
+            || me.modifiers.iter().any(|m| {
+                m.value() == ControlKey::Control.value()
+                    || m.value() == ControlKey::RControl.value()
+            });
+        let shift_held = self
+            .pressed_modifiers
+            .iter()
+            .any(|k| matches!(k, rdev::Key::ShiftLeft | rdev::Key::ShiftRight))
+            || me.modifiers.iter().any(|m| {
+                m.value() == ControlKey::Shift.value() || m.value() == ControlKey::RShift.value()
+            });
+        let meta_held = self
+            .pressed_modifiers
+            .iter()
+            .any(|k| matches!(k, rdev::Key::MetaLeft | rdev::Key::MetaRight))
+            || me.modifiers.iter().any(|m| {
+                m.value() == ControlKey::Meta.value() || m.value() == ControlKey::RWin.value()
+            });
+
+        let is_paste = (ctrl_held && is_v) || (meta_held && is_v) || (shift_held && is_insert);
+        if !is_paste {
+            return;
+        }
+
+        // 키 auto-repeat로 인한 중복 기록 방지(디바운스).
+        let now = Instant::now();
+        if let Some(last) = self.last_paste_audit_at {
+            if now.duration_since(last) < Duration::from_millis(1000) {
+                return;
+            }
+        }
+        self.last_paste_audit_at = Some(now);
+
+        if let Some(info) = self.last_clipboard_audit_for_paste.clone() {
+            self.post_clipboard_audit(info);
+        }
     }
 
     pub fn post_alarm_audit(typ: AlarmAuditType, info: Value) {
@@ -2962,8 +3121,12 @@ impl Connection {
                         return true;
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
-                    if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
-                        log::debug!("call_main_service_pointer_input fail:{}", e);
+                    if self.peer_keyboard_enabled() {
+                        if let Err(e) =
+                            call_main_service_pointer_input("mouse", me.mask, me.x, me.y)
+                        {
+                            log::debug!("call_main_service_pointer_input fail:{}", e);
+                        }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
@@ -3001,32 +3164,38 @@ impl Connection {
                         return true;
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
-                    if let Err(e) = match pde.union {
-                        Some(pointer_device_event::Union::TouchEvent(touch)) => match touch.union {
-                            Some(touch_event::Union::PanStart(pan_start)) => {
-                                call_main_service_pointer_input(
-                                    "touch",
-                                    4,
-                                    pan_start.x,
-                                    pan_start.y,
-                                )
-                            }
-                            Some(touch_event::Union::PanUpdate(pan_update)) => {
-                                call_main_service_pointer_input(
-                                    "touch",
-                                    5,
-                                    pan_update.x,
-                                    pan_update.y,
-                                )
-                            }
-                            Some(touch_event::Union::PanEnd(pan_end)) => {
-                                call_main_service_pointer_input("touch", 6, pan_end.x, pan_end.y)
+                    if self.peer_keyboard_enabled() {
+                        if let Err(e) = match pde.union {
+                            Some(pointer_device_event::Union::TouchEvent(touch)) => {
+                                match touch.union {
+                                    Some(touch_event::Union::PanStart(pan_start)) => {
+                                        call_main_service_pointer_input(
+                                            "touch",
+                                            4,
+                                            pan_start.x,
+                                            pan_start.y,
+                                        )
+                                    }
+                                    Some(touch_event::Union::PanUpdate(pan_update)) => {
+                                        call_main_service_pointer_input(
+                                            "touch",
+                                            5,
+                                            pan_update.x,
+                                            pan_update.y,
+                                        )
+                                    }
+                                    Some(touch_event::Union::PanEnd(pan_end)) => {
+                                        call_main_service_pointer_input(
+                                            "touch", 6, pan_end.x, pan_end.y,
+                                        )
+                                    }
+                                    _ => Ok(()),
+                                }
                             }
                             _ => Ok(()),
-                        },
-                        _ => Ok(()),
-                    } {
-                        log::debug!("call_main_service_pointer_input fail:{}", e);
+                        } {
+                            log::debug!("call_main_service_pointer_input fail:{}", e);
+                        }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
@@ -3040,6 +3209,10 @@ impl Connection {
                 #[cfg(any(target_os = "android"))]
                 Some(message::Union::KeyEvent(mut me)) => {
                     if self.is_authed_view_camera_conn() {
+                        return true;
+                    }
+                    if !self.peer_keyboard_enabled() {
+                        self.update_auto_disconnect_timer();
                         return true;
                     }
                     let key = match me.mode.enum_value() {
@@ -3129,13 +3302,17 @@ impl Connection {
                             me.press
                         };
 
+                        // Map/Legacy 모드는 press 없이 down만 사용하므로 down 기준으로 수정키 추적.
                         if let Some(key) = key {
-                            if is_press {
+                            if me.down || me.press {
                                 self.pressed_modifiers.insert(key);
                             } else {
                                 self.pressed_modifiers.remove(&key);
                             }
                         }
+
+                        // 호스트에서 실제 붙여넣기(Ctrl/⌘+V, Shift+Insert) 감지 후 audit.
+                        self.detect_and_audit_paste(&me);
 
                         if is_press {
                             match me.union {
@@ -3155,6 +3332,18 @@ impl Connection {
                 }
                 Some(message::Union::Clipboard(cb)) => {
                     if self.clipboard {
+                        // Don't audit on receipt: a clipboard arriving here (direct or
+                        // relayed via multi-session sync) does not mean the operator
+                        // pasted on this host. Cache it and log only on real paste.
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        {
+                            self.last_clipboard_audit_for_paste =
+                                Some(crate::clipboard_audit::summarize_multi_clipboards(
+                                    crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
+                                    std::slice::from_ref(&cb),
+                                    &self.ip,
+                                ));
+                        }
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Host);
                         // ios as the controlled side is actually not supported for now.
@@ -3182,6 +3371,16 @@ impl Connection {
                     }
                 }
                 Some(message::Union::MultiClipboards(_mcb)) => {
+                    // Cache only; logged on real paste. See Clipboard branch above.
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if self.clipboard {
+                        self.last_clipboard_audit_for_paste =
+                            Some(crate::clipboard_audit::summarize_multi_clipboards(
+                                crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
+                                &_mcb.clipboards,
+                                &self.ip,
+                            ));
+                    }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.clipboard {
                         update_clipboard(_mcb.clipboards, ClipboardSide::Host);
@@ -3198,11 +3397,9 @@ impl Connection {
                     #[cfg(target_os = "windows")]
                     {
                         const REMOTE_DROP_CLIPRDR_GRACE_MS: u64 = 60_000;
-                        let in_drop_grace =
-                            self.last_remote_drop_recv_at.map_or(false, |t| {
-                                t.elapsed()
-                                    < Duration::from_millis(REMOTE_DROP_CLIPRDR_GRACE_MS)
-                            });
+                        let in_drop_grace = self.last_remote_drop_recv_at.map_or(false, |t| {
+                            t.elapsed() < Duration::from_millis(REMOTE_DROP_CLIPRDR_GRACE_MS)
+                        });
                         if in_drop_grace {
                             log::info!(
                                 "Skip inbound cliprdr message within remote-drop grace period to avoid connection drop"
@@ -3229,14 +3426,20 @@ impl Connection {
                     }
 
                     if let Some(cliprdr::Union::Files(files)) = &clip.union {
+                        let files_audit = files
+                            .files
+                            .iter()
+                            .map(|f| (f.name.clone(), f.size as i64))
+                            .collect::<Vec<(String, i64)>>();
+                        self.post_clipboard_audit(crate::clipboard_audit::summarize_files(
+                            crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
+                            &files_audit,
+                            &self.ip,
+                        ));
                         self.post_file_audit(
                             FileAuditType::RemoteReceive,
                             "",
-                            files
-                                .files
-                                .iter()
-                                .map(|f| (f.name.clone(), f.size as i64))
-                                .collect::<Vec<(String, i64)>>(),
+                            files_audit,
                             json!({}),
                         );
                     } else if let Some(clip) = msg_2_clip(clip) {

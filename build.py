@@ -206,7 +206,7 @@ def generate_build_script_for_docker():
             pushd /tmp && git clone https://github.com/SoLongAndThanksForAllThePizza/flutter_rust_bridge --depth=1 && popd
             pushd /tmp/flutter_rust_bridge/frb_codegen && cargo install --path . && popd
             pushd flutter && flutter pub get && popd
-            ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart
+            ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --class-name RustdeskImpl
             # install vcpkg
             pushd /opt
             export VCPKG_ROOT=`pwd`/vcpkg
@@ -712,6 +712,7 @@ def build_msi(version, dist_dir=None):
 
 
 def build_flutter_windows(version, features, skip_portable_pack):
+    root_dir = os.getcwd()
     # Runner.rc를 MDesk로 임시 수정 (빌드 전)
     rc_backup = modify_runner_rc_for_mdesk()
     
@@ -778,7 +779,7 @@ def build_flutter_windows(version, features, skip_portable_pack):
     finally:
         # Cargo.toml 복원
         if portable_cargo_backup:
-            os.chdir('../..')
+            os.chdir(root_dir)
             restore_portable_cargo_toml(portable_cargo_backup)
     
     # 빌드 결과물 경로 확인 (workspace 설정에 따라 다를 수 있음)
@@ -790,8 +791,8 @@ def build_flutter_windows(version, features, skip_portable_pack):
         portable_exe_src = os.path.abspath(os.path.join(portable_dir, '../../target/release/rustdesk-portable-packer.exe'))
     else:
         # workspace 멤버이므로 루트의 target에 빌드됨
-        root_dir = os.path.abspath(os.path.join(portable_dir, '../..'))
-        root_target = os.path.join(root_dir, 'target/release/rustdesk-portable-packer.exe')
+        candidate_root = os.path.abspath(os.path.join(portable_dir, '../..'))
+        root_target = os.path.join(candidate_root, 'target/release/rustdesk-portable-packer.exe')
         if os.path.exists(root_target):
             portable_exe_src = root_target
         else:
@@ -799,11 +800,10 @@ def build_flutter_windows(version, features, skip_portable_pack):
             print(f"Checked: {os.path.join(portable_dir, 'target/release/rustdesk-portable-packer.exe')}")
             print(f"Checked: {root_target}")
             print("Please check if cargo build completed successfully in libs/portable")
-            os.chdir('../..')
+            os.chdir(root_dir)
             exit(-1)
     
-    os.chdir('../..')
-    root_dir = os.getcwd()
+    os.chdir(root_dir)
     portable_exe_dst = os.path.join(root_dir, 'MDesk_portable.exe')
     if os.path.exists(portable_exe_dst):
         os.replace(portable_exe_src, portable_exe_dst)

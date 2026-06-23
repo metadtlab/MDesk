@@ -43,6 +43,8 @@ set "BUILD_ARM=1"
 set "BUILD_X64=0"
 set "BUILD_X86=0"
 set "CARGO_BUILD_FLAG=--release"
+set "ANDROID_FLAVOR=host"
+set "BUILD_ARTIFACT=apk"
 
 :: Parse arguments
 :parse_args
@@ -79,6 +81,17 @@ if /i "%~1"=="--all" (
     set "BUILD_X64=1"
     set "BUILD_X86=1"
 )
+if /i "%~1"=="--flavor" (
+    if "%~2"=="" goto :show_help
+    set "ANDROID_FLAVOR=%~2"
+    shift
+)
+if /i "%~1"=="--aab" (
+    set "BUILD_ARTIFACT=aab"
+)
+if /i "%~1"=="--appbundle" (
+    set "BUILD_ARTIFACT=aab"
+)
 if /i "%~1"=="--help" goto :show_help
 shift
 goto :parse_args
@@ -96,11 +109,20 @@ echo   --arm64-only  Build ARM64 only
 echo   --arm-only    Build ARM32 only
 echo   --x64-only    Build x86_64 only ^(best for emulator^)
 echo   --all         Build all architectures
+echo   --flavor NAME Build Android flavor: host or remote ^(default: host^)
+echo   --aab         Build Android App Bundle instead of APK ^(release only^)
 echo   --help        Show this help
 echo.
 goto :eof
 
 :check_env
+if /i not "%ANDROID_FLAVOR%"=="host" if /i not "%ANDROID_FLAVOR%"=="remote" (
+    echo [ERROR] Invalid flavor: %ANDROID_FLAVOR%
+    echo.
+    echo Use --flavor host or --flavor remote.
+    goto :error
+)
+
 echo [1/6] Checking environment...
 echo.
 
@@ -141,6 +163,8 @@ set "ANDROID_NDK=%ANDROID_NDK_HOME_UNIX%"
 
 echo   ANDROID_NDK_HOME: %ANDROID_NDK_HOME%
 echo   BUILD_MODE: %BUILD_MODE%
+echo   ANDROID_FLAVOR: %ANDROID_FLAVOR%
+echo   BUILD_ARTIFACT: %BUILD_ARTIFACT%
 if defined PERL_PROVIDER (
     echo   PERL_PROVIDER: %PERL_PROVIDER%
 ) else (
@@ -355,7 +379,11 @@ if "%BUILD_X86%"=="1" if defined X86_FAIL (
 )
 
 :: Flutter build
-echo [5/6] Building Flutter APK...
+if /i "%BUILD_ARTIFACT%"=="aab" (
+    echo [5/6] Building Flutter Android App Bundle...
+) else (
+    echo [5/6] Building Flutter APK...
+)
 echo.
 
 cd flutter
@@ -391,9 +419,11 @@ if defined FLUTTER_PUB_FAIL (
 )
 if defined FLUTTER_PUB_FAIL goto :error
 
+if /i "%BUILD_ARTIFACT%"=="aab" goto :build_aab
+
 :: Build APK
 echo   Building APK...
-call flutter build apk --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
+call flutter build apk --flavor %ANDROID_FLAVOR% --dart-define=ANDROID_APP_ROLE=%ANDROID_FLAVOR% --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
 set "FLUTTER_APK_FAIL="
 if errorlevel 1 set "FLUTTER_APK_FAIL=1"
 if defined FLUTTER_APK_FAIL (
@@ -404,7 +434,7 @@ if defined FLUTTER_APK_FAIL goto :error
 
 :: Build split APKs
 echo   Building split APKs...
-call flutter build apk --split-per-abi --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
+call flutter build apk --flavor %ANDROID_FLAVOR% --dart-define=ANDROID_APP_ROLE=%ANDROID_FLAVOR% --split-per-abi --target-platform %TARGET_PLATFORMS% --%BUILD_MODE%
 set "FLUTTER_SPLIT_APK_FAIL="
 if errorlevel 1 set "FLUTTER_SPLIT_APK_FAIL=1"
 if defined FLUTTER_SPLIT_APK_FAIL (
@@ -413,6 +443,33 @@ if defined FLUTTER_SPLIT_APK_FAIL (
 )
 if defined FLUTTER_SPLIT_APK_FAIL goto :error
 
+goto :flutter_build_done
+
+:build_aab
+if /i not "%BUILD_MODE%"=="release" (
+    echo [ERROR] Android App Bundle output is release-only in this script.
+    cd ..
+    goto :error
+)
+if not exist "android\key.properties" (
+    echo [ERROR] Missing flutter\android\key.properties.
+    echo.
+    echo Create an upload keystore and key.properties before building a Play Store AAB.
+    cd ..
+    goto :error
+)
+
+echo   Building Android App Bundle...
+call flutter build appbundle --flavor %ANDROID_FLAVOR% --dart-define=ANDROID_APP_ROLE=%ANDROID_FLAVOR% --target-platform %TARGET_PLATFORMS% --release
+set "FLUTTER_AAB_FAIL="
+if errorlevel 1 set "FLUTTER_AAB_FAIL=1"
+if defined FLUTTER_AAB_FAIL (
+    echo [ERROR] Flutter Android App Bundle build failed
+    cd ..
+)
+if defined FLUTTER_AAB_FAIL goto :error
+
+:flutter_build_done
 cd ..
 
 :: Results
@@ -425,17 +482,29 @@ echo ============================================
 echo.
 
 set "APK_DIR=%~dp0flutter\build\app\outputs\flutter-apk"
-if exist "%APK_DIR%\app-%BUILD_MODE%.apk" (
-    echo   Universal APK: %APK_DIR%\app-%BUILD_MODE%.apk
-)
-if exist "%APK_DIR%\app-arm64-v8a-%BUILD_MODE%.apk" (
-    echo   ARM64 APK: %APK_DIR%\app-arm64-v8a-%BUILD_MODE%.apk
-)
-if exist "%APK_DIR%\app-armeabi-v7a-%BUILD_MODE%.apk" (
-    echo   ARM32 APK: %APK_DIR%\app-armeabi-v7a-%BUILD_MODE%.apk
-)
-if exist "%APK_DIR%\app-x86_64-%BUILD_MODE%.apk" (
-    echo   x64 APK: %APK_DIR%\app-x86_64-%BUILD_MODE%.apk
+set "BUNDLE_DIR=%~dp0flutter\build\app\outputs\bundle"
+if /i "%BUILD_ARTIFACT%"=="aab" (
+    echo   App Bundle:
+    for %%F in ("%BUNDLE_DIR%\%ANDROID_FLAVOR%Release\*.aab") do (
+        if exist "%%~fF" echo     %%~fF
+    )
+) else (
+    echo   Flavor APKs:
+    for %%F in ("%APK_DIR%\*%ANDROID_FLAVOR%*%BUILD_MODE%*.apk") do (
+        if exist "%%~fF" echo     %%~fF
+    )
+    if exist "%APK_DIR%\app-%BUILD_MODE%.apk" (
+        echo   Universal APK: %APK_DIR%\app-%BUILD_MODE%.apk
+    )
+    if exist "%APK_DIR%\app-arm64-v8a-%BUILD_MODE%.apk" (
+        echo   ARM64 APK: %APK_DIR%\app-arm64-v8a-%BUILD_MODE%.apk
+    )
+    if exist "%APK_DIR%\app-armeabi-v7a-%BUILD_MODE%.apk" (
+        echo   ARM32 APK: %APK_DIR%\app-armeabi-v7a-%BUILD_MODE%.apk
+    )
+    if exist "%APK_DIR%\app-x86_64-%BUILD_MODE%.apk" (
+        echo   x64 APK: %APK_DIR%\app-x86_64-%BUILD_MODE%.apk
+    )
 )
 
 echo.

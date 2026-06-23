@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/android_app_role.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
@@ -14,7 +15,7 @@ import '../../common/widgets/dialog.dart';
 import '../../consts.dart';
 import '../../models/platform_model.dart';
 import '../../models/server_model.dart';
-import 'home_page_shared.dart';
+import 'page_shape.dart';
 
 class ServerPage extends StatefulWidget implements PageShape {
   @override
@@ -220,8 +221,7 @@ class _ServerPageState extends State<ServerPage> {
                                           enabled: isLoggedIn),
                                   const ConnectionManager(),
                                   PermissionChecker(enabled: isLoggedIn),
-                                  SizedBox.fromSize(
-                                      size: const Size(0, 15.0)),
+                                  SizedBox.fromSize(size: const Size(0, 15.0)),
                                 ],
                               ),
                             ),
@@ -296,14 +296,12 @@ class ServiceNotRunningNotification extends StatelessWidget {
                 icon: const Icon(Icons.play_arrow),
                 onPressed: enabled
                     ? () {
-                  if (gFFI.userModel.userName.value.isEmpty &&
-                      bind.mainGetLocalOption(key: "show-scam-warning") !=
-                          "N") {
-                    showScamWarning(context, serverModel);
-                  } else {
-                    serverModel.toggleService();
-                  }
-                }
+                        if (shouldShowScamWarning()) {
+                          showScamWarning(context, serverModel);
+                        } else {
+                          serverModel.toggleService();
+                        }
+                      }
                     : null,
                 label: Text(translate("Start service")))
           ],
@@ -646,19 +644,23 @@ class _PermissionCheckerState extends State<PermissionChecker> {
               translate("Screen Capture"),
               serverModel.mediaOk,
               enabled: widget.enabled,
-              !serverModel.mediaOk &&
-                      gFFI.userModel.userName.value.isEmpty &&
-                      bind.mainGetLocalOption(key: "show-scam-warning") != "N"
+              !serverModel.mediaOk && shouldShowScamWarning()
                   ? () => showScamWarning(context, serverModel)
                   : serverModel.toggleService),
-          PermissionRow(translate("Input Control"), serverModel.inputOk,
+          PermissionRow(
+              translate("Input Control"),
+              serverModel.inputOk,
               enabled: widget.enabled,
               serverModel.toggleInput),
-          PermissionRow(translate("Transfer file"), serverModel.fileOk,
+          PermissionRow(
+              translate("Transfer file"),
+              serverModel.fileOk,
               enabled: widget.enabled,
               serverModel.toggleFile),
           hasAudioPermission
-              ? PermissionRow(translate("Audio Capture"), serverModel.audioOk,
+              ? PermissionRow(
+                  translate("Audio Capture"),
+                  serverModel.audioOk,
                   enabled: widget.enabled,
                   serverModel.toggleAudio)
               : Row(children: [
@@ -669,7 +671,9 @@ class _PermissionCheckerState extends State<PermissionChecker> {
                     style: const TextStyle(color: MyTheme.darkGray),
                   ))
                 ]),
-          PermissionRow(translate("Enable clipboard"), serverModel.clipboardOk,
+          PermissionRow(
+              translate("Enable clipboard"),
+              serverModel.clipboardOk,
               enabled: widget.enabled,
               serverModel.toggleClipboard),
         ]));
@@ -710,9 +714,8 @@ class ConnectionManager extends StatelessWidget {
     return Column(
         children: serverModel.clients
             .map((client) => PaddingCard(
-                title: translate(client.isFileTransfer
-                    ? "Transfer file"
-                    : "Share screen"),
+                title: translate(
+                    client.isFileTransfer ? "Transfer file" : "Share screen"),
                 titleIcon: client.isFileTransfer
                     ? Icon(Icons.folder_outlined)
                     : Icon(Icons.mobile_screen_share),
@@ -983,4 +986,10 @@ void showScamWarning(BuildContext context, ServerModel serverModel) {
       return ScamWarningDialog(serverModel: serverModel);
     },
   );
+}
+
+bool shouldShowScamWarning() {
+  return !isAndroidHostApp &&
+      gFFI.userModel.userName.value.isEmpty &&
+      bind.mainGetLocalOption(key: "show-scam-warning") != "N";
 }
