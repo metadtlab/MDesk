@@ -553,6 +553,102 @@ fn is_compressed_file(name: &str) -> bool {
     compressed_exts.contains(&ext)
 }
 
+pub fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
+    if name.bytes().any(|b| b == 0) {
+        bail!("file name contains null bytes");
+    }
+    let has_traversal = name
+        .split(|c: char| c == '/' || (cfg!(windows) && c == '\\'))
+        .filter(|s| !s.is_empty())
+        .any(|s| s == "..");
+    if has_traversal {
+        bail!("path traversal detected in file name");
+    }
+    #[cfg(windows)]
+    {
+        if name.len() >= 2 {
+            let bytes = name.as_bytes();
+            if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                bail!("absolute path detected in file name");
+            }
+        }
+        if name.starts_with('/') || name.starts_with('\\') {
+            bail!("absolute path detected in file name");
+        }
+    }
+    #[cfg(not(windows))]
+    if name.starts_with('/') {
+        bail!("absolute path detected in file name");
+    }
+    Ok(())
+}
+
+fn validate_transfer_file_names(files: &[FileEntry]) -> ResultType<()> {
+    // Single-file transfer may use an empty relative name, because the
+    // destination file path is carried by transfer metadata.
+    if files.len() == 1 && files.first().map_or(false, |f| f.name.is_empty()) {
+        return Ok(());
+    }
+    for file in files {
+        if file.name.is_empty() {
+            bail!("empty file name in multi-file transfer");
+        }
+        validate_file_name_no_traversal(&file.name)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_fs_path_argument(path: &str, arg_name: &str) -> ResultType<()> {
+    if path.is_empty() {
+        bail!("{arg_name} cannot be empty");
+    }
+    if path.bytes().any(|b| b == 0) {
+        bail!("{arg_name} contains null bytes");
+    }
+    Ok(())
+}
+
+fn validate_no_symlink_components(base: &PathBuf, name: &str) -> ResultType<()> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    let mut current = base.clone();
+    for component in Path::new(name).components() {
+        match component {
+            std::path::Component::Normal(seg) => {
+                current.push(seg);
+                // Best-effort guard. A later filesystem change can still race
+                // this check; handle-based no-follow open would be stronger.
+                match std::fs::symlink_metadata(&current) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            bail!("symlink path component is not allowed");
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        bail!(
+                            "failed to validate path component '{}': {}",
+                            current.display(),
+                            err
+                        );
+                    }
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => bail!("invalid file name component"),
+        }
+    }
+    Ok(())
+}
+
+fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
+    validate_file_name_no_traversal(name)?;
+    validate_no_symlink_components(base, name)?;
+    Ok(TransferJob::join(base, name))
+}
+
 impl TransferJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new_write(
@@ -563,11 +659,9 @@ impl TransferJob {
         file_num: i32,
         show_hidden: bool,
         is_remote: bool,
-        files: Vec<FileEntry>,
         enable_overwrite_detection: bool,
     ) -> Self {
         log::info!("new write {}", data_source);
-        let total_size = files.iter().map(|x| x.size).sum();
         Self {
             id,
             r#type,
@@ -576,11 +670,16 @@ impl TransferJob {
             file_num,
             show_hidden,
             is_remote,
-            files,
-            total_size,
+            files: Vec::new(),
+            total_size: 0,
             enable_overwrite_detection,
             ..Default::default()
         }
+    }
+
+    pub fn with_files(mut self, files: Vec<FileEntry>) -> ResultType<Self> {
+        self.set_files(files)?;
+        Ok(self)
     }
 
     pub fn new_read(
@@ -634,8 +733,16 @@ impl TransferJob {
     }
 
     #[inline]
-    pub fn set_files(&mut self, files: Vec<FileEntry>) {
+    pub fn set_files(&mut self, files: Vec<FileEntry>) -> ResultType<()> {
+        validate_transfer_file_names(&files)?;
+        if let DataSource::FilePath(base) = &self.data_source {
+            for file in &files {
+                validate_no_symlink_components(base, &file.name)?;
+            }
+        }
+        self.total_size = files.iter().map(|x| x.size).sum();
         self.files = files;
+        Ok(())
     }
 
     #[inline]
@@ -700,6 +807,20 @@ impl TransferJob {
         self.file_num
     }
 
+    fn resolve_entry_path(&self, base: &PathBuf, name: &str) -> Option<PathBuf> {
+        if self.r#type == JobType::Printer {
+            Some(Self::join(base, name))
+        } else {
+            match join_validated_path(base, name) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    log::error!("Invalid file name in transfer job {}: {}", self.id, err);
+                    None
+                }
+            }
+        }
+    }
+
     pub fn modify_time(&self) {
         if self.r#type == JobType::Printer {
             return;
@@ -708,7 +829,9 @@ impl TransferJob {
             let file_num = self.file_num as usize;
             if file_num < self.files.len() {
                 let entry = &self.files[file_num];
-                let path = Self::join(p, &entry.name);
+                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+                    return;
+                };
                 let download_path = format!("{}.download", get_string(&path));
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(digest_path).ok();
@@ -731,7 +854,9 @@ impl TransferJob {
             let file_num = self.file_num as usize;
             if file_num < self.files.len() {
                 let entry = &self.files[file_num];
-                let path = Self::join(p, &entry.name);
+                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+                    return;
+                };
                 let download_path = format!("{}.download", get_string(&path));
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(download_path).ok();
@@ -773,7 +898,7 @@ impl TransferJob {
                     let (path, digest_path) = if self.r#type == JobType::Printer {
                         (p.to_string_lossy().to_string(), None)
                     } else {
-                        let path = Self::join(p, &entry.name);
+                        let path = join_validated_path(p, &entry.name)?;
                         if let Some(pp) = path.parent() {
                             std::fs::create_dir_all(pp).ok();
                         }
@@ -1097,7 +1222,9 @@ impl TransferJob {
     async fn set_stream_offset(&mut self, file_num: usize, offset: u64) {
         if let DataSource::FilePath(p) = &self.data_source {
             let entry = &self.files[file_num];
-            let path = Self::join(p, &entry.name);
+            let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+                return;
+            };
             let file_path = get_string(&path);
             let download_path = format!("{}.download", &file_path);
             let digest_path = format!("{}.digest", &file_path);
@@ -1388,18 +1515,25 @@ pub fn remove_all_empty_dir(path: &Path) -> ResultType<()> {
 
 #[inline]
 pub fn remove_file(file: &str) -> ResultType<()> {
+    validate_fs_path_argument(file, "file path")?;
     std::fs::remove_file(get_path(file))?;
     Ok(())
 }
 
 #[inline]
 pub fn create_dir(dir: &str) -> ResultType<()> {
+    validate_fs_path_argument(dir, "directory path")?;
     std::fs::create_dir_all(get_path(dir))?;
     Ok(())
 }
 
 #[inline]
 pub fn rename_file(path: &str, new_name: &str) -> ResultType<()> {
+    validate_fs_path_argument(path, "path")?;
+    if new_name.is_empty() {
+        bail!("new file name cannot be empty");
+    }
+    validate_file_name_no_traversal(new_name)?;
     let path = std::path::Path::new(&path);
     if path.exists() {
         let dir = path
@@ -1505,4 +1639,69 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
     value["cancel"] = json!(cancel);
     value["error"] = json!(error);
     serde_json::to_string(&value).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn validation_job() -> TransferJob {
+        TransferJob::new_write(
+            1,
+            JobType::Generic,
+            String::new(),
+            DataSource::FilePath(std::env::temp_dir()),
+            0,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn validate_file_name_rejects_traversal_and_null() {
+        assert!(validate_file_name_no_traversal("../payload.txt").is_err());
+        assert!(validate_file_name_no_traversal("dir/../payload.txt").is_err());
+        assert!(validate_file_name_no_traversal("bad\0name.txt").is_err());
+    }
+
+    #[test]
+    fn validate_file_name_rejects_absolute_path() {
+        #[cfg(windows)]
+        {
+            assert!(validate_file_name_no_traversal("C:\\Windows\\Temp\\payload.txt").is_err());
+            assert!(validate_file_name_no_traversal("\\\\server\\share\\payload.txt").is_err());
+        }
+        #[cfg(not(windows))]
+        assert!(validate_file_name_no_traversal("/tmp/payload.txt").is_err());
+    }
+
+    #[test]
+    fn set_files_allows_single_empty_name() {
+        let mut job = validation_job();
+        assert!(job.set_files(vec![file_entry("")]).is_ok());
+    }
+
+    #[test]
+    fn set_files_rejects_empty_name_in_multi_file_transfer() {
+        let mut job = validation_job();
+        assert!(job
+            .set_files(vec![file_entry(""), file_entry("ok.txt")])
+            .is_err());
+    }
+
+    #[test]
+    fn set_files_rejects_mixed_entries_when_one_is_traversal() {
+        let mut job = validation_job();
+        assert!(job
+            .set_files(vec![file_entry("safe.txt"), file_entry("../../escape.txt")])
+            .is_err());
+    }
 }

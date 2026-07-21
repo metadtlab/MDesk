@@ -10,6 +10,7 @@ import 'package:flutter_hbb/common/widgets/my_group.dart';
 import 'package:flutter_hbb/common/widgets/peers_view.dart';
 import 'package:flutter_hbb/common/widgets/peer_card.dart';
 import 'package:flutter_hbb/common/widgets/peer_tree_view.dart';
+import 'package:flutter_hbb/common/widgets/root_overlay_control.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
 import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
@@ -30,7 +31,15 @@ import '../../common.dart';
 import '../../models/platform_model.dart';
 
 class PeerTabPage extends StatefulWidget {
-  const PeerTabPage({Key? key}) : super(key: key);
+  const PeerTabPage({
+    Key? key,
+    this.onOpenSettings,
+    this.showCustomRemoteOnly = false,
+  }) : super(key: key);
+
+  final VoidCallback? onOpenSettings;
+  final bool showCustomRemoteOnly;
+
   @override
   State<PeerTabPage> createState() => _PeerTabPageState();
 }
@@ -93,8 +102,10 @@ class _PeerTabPageState extends State<PeerTabPage>
     // agentid가 파일명에 있으면 Custom Remote 탭(인덱스 5)으로 자동 이동
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_hasAgentIdInFilename()) {
-        debugPrint('PeerTabPage: agentid detected, switching to Custom Remote tab');
-        gFFI.peerTabModel.setCurrentTab(6); // Custom Remote tab index (트리뷰 추가로 인덱스 변경)
+        debugPrint(
+            'PeerTabPage: agentid detected, switching to Custom Remote tab');
+        gFFI.peerTabModel
+            .setCurrentTab(6); // Custom Remote tab index (트리뷰 추가로 인덱스 변경)
       }
     });
   }
@@ -104,20 +115,23 @@ class _PeerTabPageState extends State<PeerTabPage>
   bool _hasAgentIdInFilename() {
     try {
       // 환경변수 우선 확인
-      final envName = Platform.environment['MDESK_APPNAME'] ?? 
-                      Platform.environment['RUSTDESK_APPNAME'] ?? '';
+      final envName = Platform.environment['MDESK_APPNAME'] ??
+          Platform.environment['RUSTDESK_APPNAME'] ??
+          '';
       final envLower = envName.toLowerCase();
-      if (envLower.contains('agentid=') || 
-          envLower.contains('id=') || 
+      if (envLower.contains('agentid=') ||
+          envLower.contains('id=') ||
           envLower.contains('certno=')) {
         return true;
       }
       // 실행 파일명 확인
-      final filename = Platform.resolvedExecutable.split(Platform.isWindows ? '\\' : '/').last;
+      final filename = Platform.resolvedExecutable
+          .split(Platform.isWindows ? '\\' : '/')
+          .last;
       final filenameLower = filename.toLowerCase();
-      return filenameLower.contains('agentid=') || 
-             filenameLower.contains('id=') || 
-             filenameLower.contains('certno=');
+      return filenameLower.contains('agentid=') ||
+          filenameLower.contains('id=') ||
+          filenameLower.contains('certno=');
     } catch (e) {
       return false;
     }
@@ -154,46 +168,37 @@ class _PeerTabPageState extends State<PeerTabPage>
     }
 
     return Obx(() {
-      final isLoggedIn = gFFI.userModel.isLogin;
+      final tabBar = Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          if (widget.showCustomRemoteOnly)
+            const Spacer()
+          else
+            Expanded(
+              child: visibleContextMenuListener(_createSwitchBar(context)),
+            ),
+          if (stateGlobal.isPortrait.isTrue)
+            ..._portraitRightActions(context)
+          else
+            ..._landscapeRightActions(context),
+        ],
+      );
+      final tabActions = SizedBox(
+        height: 32,
+        child: Container(
+          padding: stateGlobal.isPortrait.isTrue
+              ? EdgeInsets.symmetric(horizontal: 2)
+              : null,
+          child: widget.showCustomRemoteOnly ? tabBar : selectionWrap(tabBar),
+        ),
+      ).paddingOnly(right: stateGlobal.isPortrait.isTrue ? 0 : 12);
+
       return Column(
         textBaseline: TextBaseline.ideographic,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Obx(() => Opacity(
-                opacity: isLoggedIn ? 1.0 : 0.5,
-                child: IgnorePointer(
-                  ignoring: !isLoggedIn,
-                  child: SizedBox(
-                    height: 32,
-                    child: Container(
-                      padding: stateGlobal.isPortrait.isTrue
-                          ? EdgeInsets.symmetric(horizontal: 2)
-                          : null,
-                      child: selectionWrap(Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
-                          Expanded(
-                              child: visibleContextMenuListener(
-                                  _createSwitchBar(context))),
-                          if (stateGlobal.isPortrait.isTrue)
-                            ..._portraitRightActions(context)
-                          else
-                            ..._landscapeRightActions(context)
-                        ],
-                      )),
-                    ),
-                  ).paddingOnly(right: stateGlobal.isPortrait.isTrue ? 0 : 12),
-                ),
-              )),
-          Expanded(
-            child: Opacity(
-              opacity: isLoggedIn ? 1.0 : 0.5,
-              child: IgnorePointer(
-                ignoring: !isLoggedIn,
-                child: _createPeersViewContent(),
-              ),
-            ),
-          ),
+          tabActions,
+          Expanded(child: _createPeersViewContent()),
         ],
       );
     });
@@ -310,7 +315,12 @@ class _PeerTabPageState extends State<PeerTabPage>
   Widget _createPeersViewContent() {
     final model = Provider.of<PeerTabModel>(context);
     Widget child;
-    if (model.visibleEnabledOrderedIndexs.isEmpty) {
+    if (widget.showCustomRemoteOnly) {
+      child = CustomRemoteView(
+        menuPadding: _menuPadding(),
+        useNumberManagementDesign: true,
+      );
+    } else if (model.visibleEnabledOrderedIndexs.isEmpty) {
       child = visibleContextMenuListener(Row(
         children: [Expanded(child: InkWell())],
       ));
@@ -520,7 +530,8 @@ class _PeerTabPageState extends State<PeerTabPage>
               case 1:
                 if (gFFI.userModel.isLogin) {
                   final apiServer = await bind.mainGetApiServer();
-                  final accessToken = bind.mainGetLocalOption(key: 'access_token');
+                  final accessToken =
+                      bind.mainGetLocalOption(key: 'access_token');
                   if (apiServer.isNotEmpty && accessToken.isNotEmpty) {
                     for (final p in peers) {
                       await favoriteService.removeFavorite(
@@ -687,9 +698,17 @@ class _PeerTabPageState extends State<PeerTabPage>
   }
 
   List<Widget> _landscapeRightActions(BuildContext context) {
+    if (widget.showCustomRemoteOnly) {
+      return [
+        const PeerSearchBar().marginOnly(right: 2),
+        if (widget.onOpenSettings != null) _createSettings(context),
+      ];
+    }
     final model = Provider.of<PeerTabModel>(context);
     return [
-      const PeerSearchBar().marginOnly(right: 13),
+      const PeerSearchBar().marginOnly(right: 2),
+      if (widget.onOpenSettings != null)
+        _createSettings(context).marginOnly(right: 9),
       _createRefresh(
           index: PeerTabIndex.ab, loading: gFFI.abModel.currentAbLoading),
       _createRefresh(
@@ -710,6 +729,12 @@ class _PeerTabPageState extends State<PeerTabPage>
   }
 
   List<Widget> _portraitRightActions(BuildContext context) {
+    if (widget.showCustomRemoteOnly) {
+      return [
+        const PeerSearchBar(),
+        if (widget.onOpenSettings != null) _createSettings(context),
+      ];
+    }
     final model = Provider.of<PeerTabModel>(context);
     final screenWidth = MediaQuery.of(context).size.width;
     final leftIconSize = Theme.of(context).iconTheme.size ?? 24;
@@ -756,6 +781,7 @@ class _PeerTabPageState extends State<PeerTabPage>
     // Always show search, refresh
     List<Widget> actions = [
       const PeerSearchBar(),
+      if (widget.onOpenSettings != null) _createSettings(context),
       if (model.currentTab == PeerTabIndex.ab.index)
         _createRefresh(
             index: PeerTabIndex.ab, loading: gFFI.abModel.currentAbLoading),
@@ -768,9 +794,9 @@ class _PeerTabPageState extends State<PeerTabPage>
       if (model.currentTab != PeerTabIndex.recent.index) PeerSortDropdown(),
       if (model.currentTab == PeerTabIndex.ab.index) _toggleTags()
     ];
-    final rightWidth = availableWidth -
-        searchWidth -
-        (actions.length == 2 ? otherActionWidth : 0);
+    final fixedActionCount = actions.length - 1;
+    final rightWidth =
+        availableWidth - searchWidth - fixedActionCount * otherActionWidth;
     final availablePositions = rightWidth ~/ otherActionWidth;
 
     if (availablePositions < dynamicActions.length &&
@@ -789,6 +815,24 @@ class _PeerTabPageState extends State<PeerTabPage>
       actions.addAll(dynamicActions);
     }
     return actions;
+  }
+
+  Widget _createSettings(BuildContext context) {
+    return RootOverlayControl(
+      size: const Size.square(28),
+      child: IconButton(
+        tooltip: translate('Settings'),
+        onPressed: () => widget.onOpenSettings?.call(),
+        padding: const EdgeInsets.all(4),
+        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+        visualDensity: VisualDensity.compact,
+        icon: Icon(
+          Icons.settings_outlined,
+          size: 20,
+          color: Theme.of(context).colorScheme.onSurface,
+        ),
+      ),
+    );
   }
 }
 

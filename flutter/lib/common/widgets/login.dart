@@ -637,7 +637,7 @@ Future<bool?> loginDialog() async {
       onCancel: onDialogCancel,
       onSubmit: onLogin,
     );
-  });
+  }, forceGlobal: true);
 
   if (res != null) {
     await UserModel.updateOtherModels();

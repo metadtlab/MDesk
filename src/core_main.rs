@@ -247,6 +247,18 @@ pub fn core_main() -> Option<Vec<String>> {
                     log::error!("Failed to before-uninstall: {}", err);
                 }
                 return None;
+            } else if args[0] == "--send-to-controller" {
+                if args.len() > 1 {
+                    let select_path = args.iter().any(|arg| arg == "--select");
+                    if let Err(err) =
+                        platform::send_explorer_path_to_controller(args[1].clone(), select_path)
+                    {
+                        log::error!("Failed to request file transfer from Explorer: {err}");
+                    }
+                } else {
+                    log::error!("Failed to request file transfer from Explorer: no path selected");
+                }
+                return None;
             } else if args[0] == "--silent-install" {
                 if config::is_disable_installation() {
                     return None;

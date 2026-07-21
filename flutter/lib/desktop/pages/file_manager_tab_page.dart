@@ -58,6 +58,8 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
           tabController: tabController,
           forceRelay: params['forceRelay'],
           connToken: params['connToken'],
+          initialRemoteDir: params['initialRemoteDir'],
+          initialRemoteSelectedName: params['initialRemoteSelectedName'],
         )));
   }
 
@@ -95,6 +97,8 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
               tabController: tabController,
               forceRelay: args['forceRelay'],
               connToken: args['connToken'],
+              initialRemoteDir: args['initialRemoteDir'],
+              initialRemoteSelectedName: args['initialRemoteSelectedName'],
             )));
       } else if (call.method == "onDestroy") {
         tabController.clear();

@@ -95,6 +95,21 @@ pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
+const EXPLORER_SEND_MENU_KEY: &str = "MDeskSendToController";
+const EXPLORER_SEND_MENU_TEXT: &str =
+    "\u{c6d0}\u{aca9}\u{c790}\u{c5d0}\u{ac8c} \u{d30c}\u{c77c}\u{c804}\u{c1a1}";
+const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
+const SHCNF_IDLIST: u32 = 0;
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHChangeNotify(
+        w_event_id: i32,
+        u_flags: u32,
+        dw_item1: *const c_void,
+        dw_item2: *const c_void,
+    );
+}
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -122,6 +137,157 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
             return None;
         }
         return Some((out.x, out.y));
+    }
+}
+
+pub fn register_explorer_send_to_controller_menu() -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_string_lossy().to_string();
+    let icon = format!("\"{exe}\"");
+    let selected_command = format!("\"{exe}\" --send-to-controller \"%1\" --select");
+    let background_command = format!("\"{exe}\" --send-to-controller \"%V\"");
+
+    register_explorer_send_menu_key(
+        &format!("Software\\Classes\\*\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+        &icon,
+        &selected_command,
+    )?;
+    register_explorer_send_menu_key(
+        &format!("Software\\Classes\\Directory\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+        &icon,
+        &selected_command,
+    )?;
+    register_explorer_send_menu_key(
+        &format!("Software\\Classes\\Directory\\Background\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+        &icon,
+        &background_command,
+    )?;
+
+    notify_shell_assoc_changed();
+    Ok(())
+}
+
+fn register_explorer_send_menu_key(key_path: &str, icon: &str, command: &str) -> io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(key_path)?;
+    key.set_value("", &EXPLORER_SEND_MENU_TEXT)?;
+    key.set_value("MUIVerb", &EXPLORER_SEND_MENU_TEXT)?;
+    key.set_value("Icon", &icon)?;
+    let (command_key, _) = key.create_subkey("command")?;
+    command_key.set_value("", &command)?;
+    Ok(())
+}
+
+pub fn unregister_explorer_send_to_controller_menu() {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    for key_path in [
+        format!("Software\\Classes\\*\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+        format!("Software\\Classes\\Directory\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+        format!("Software\\Classes\\Directory\\Background\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+    ] {
+        match hkcu.delete_subkey_all(&key_path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => log::warn!("Failed to remove Explorer send menu {key_path}: {err}"),
+        }
+    }
+    notify_shell_assoc_changed();
+}
+
+pub fn send_explorer_path_to_controller(path: String, select_path: bool) -> Result<(), String> {
+    let (folder, selected_name) = explorer_transfer_target(&path, select_path)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+
+    runtime.block_on(async move {
+        let mut conn = ipc::connect(1500, "_cm")
+            .await
+            .map_err(|_| "MDesk is not running or no remote session is active.".to_owned())?;
+        conn.send(&ipc::Data::OpenFileTransferFolder {
+            path: folder,
+            selected_name,
+            result: None,
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("MDesk did not respond.".to_owned());
+            }
+            match conn.next_timeout(remaining.as_millis() as u64).await {
+                Ok(Some(ipc::Data::OpenFileTransferFolder {
+                    result: Some(result),
+                    ..
+                })) if result.is_empty() => return Ok(()),
+                Ok(Some(ipc::Data::OpenFileTransferFolder {
+                    result: Some(result),
+                    ..
+                })) => return Err(result),
+                Ok(Some(_)) => continue,
+                Ok(None) => return Err("MDesk did not respond.".to_owned()),
+                Err(err) => return Err(format!("MDesk did not respond: {err}")),
+            }
+        }
+    })
+}
+
+fn explorer_transfer_target(
+    path: &str,
+    select_path: bool,
+) -> Result<(String, Option<String>), String> {
+    let trimmed = path.trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return Err("No file or folder was selected.".to_owned());
+    }
+
+    let selected = PathBuf::from(trimmed);
+    let selected_name = selected
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty());
+
+    let (folder, selected_name) = match fs::metadata(&selected) {
+        Ok(metadata) if metadata.is_dir() && select_path => (
+            selected
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| selected.clone()),
+            selected_name,
+        ),
+        Ok(metadata) if metadata.is_dir() => (selected, None),
+        Ok(_) => (
+            selected
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "Selected file has no parent folder.".to_owned())?,
+            selected_name,
+        ),
+        Err(_) if selected.extension().is_some() || select_path => (
+            selected
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "Selected file has no parent folder.".to_owned())?,
+            selected_name,
+        ),
+        Err(_) => (selected, None),
+    };
+
+    Ok((folder.to_string_lossy().to_string(), selected_name))
+}
+
+fn notify_shell_assoc_changed() {
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
     }
 }
 

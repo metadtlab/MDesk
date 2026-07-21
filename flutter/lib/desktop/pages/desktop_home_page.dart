@@ -5,7 +5,7 @@ import 'dart:io';
 import 'package:auto_size_text/auto_size_text.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/common.dart' hide Dialog;
 import 'package:flutter_hbb/common/widgets/animated_rotation_widget.dart';
 import 'package:flutter_hbb/common/widgets/custom_password.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
@@ -55,19 +55,33 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   final GlobalKey _childKey = GlobalKey();
 
+  late final RxString _userExperienceMode;
+  bool _initialModeDialogOpen = false;
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
     final isIncomingOnly = bind.isIncomingOnly();
     // 원격 진행 중에도 메인 MDesk UI 조작 가능하도록 차단 오버레이 비사용
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        buildLeftPane(context),
-        if (!isIncomingOnly) const VerticalDivider(width: 1),
-        if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
-      ],
-    );
+    return Obx(() {
+      final isAgentMode =
+          normalizeUserExperienceMode(_userExperienceMode.value) ==
+              kUserExperienceModeAgent;
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!isAgentMode) buildLeftPane(context),
+          if (!isIncomingOnly && !isAgentMode) const VerticalDivider(width: 1),
+          if (!isIncomingOnly || isAgentMode)
+            Expanded(
+              child: buildRightPane(
+                context,
+                hideRemoteIdInput: isAgentMode,
+              ),
+            ),
+        ],
+      );
+    });
   }
 
   Widget buildLeftPane(BuildContext context) {
@@ -178,11 +192,79 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  buildRightPane(BuildContext context) {
+  buildRightPane(BuildContext context, {bool hideRemoteIdInput = false}) {
     return Container(
       color: Colors.transparent,
-      child: ConnectionPage(),
+      child: ConnectionPage(
+        hideRemoteIdInput: hideRemoteIdInput,
+        onOpenSettings: hideRemoteIdInput ? DesktopTabPage.onAddSetting : null,
+      ),
     );
+  }
+
+  String _getSavedUserExperienceMode() {
+    return normalizeUserExperienceMode(
+        bind.mainGetLocalOption(key: kLocalOptionUserExperienceMode));
+  }
+
+  void _syncUserExperienceModeFromLocal() {
+    final mode = _getSavedUserExperienceMode();
+    if (_userExperienceMode.value != mode) {
+      _userExperienceMode.value = mode;
+    }
+  }
+
+  Future<void> _showInitialUserExperienceModeDialogIfNeeded() async {
+    if (!mounted || _initialModeDialogOpen) return;
+
+    final promptCompleted =
+        bind.mainGetLocalOption(key: kLocalOptionUserExperiencePromptCompleted);
+    if (promptCompleted == kUserExperienceModePromptVersion) return;
+
+    final savedMode =
+        bind.mainGetLocalOption(key: kLocalOptionUserExperienceMode);
+    if (isOptionFixed(kLocalOptionUserExperienceMode)) {
+      await bind.mainSetLocalOption(
+          key: kLocalOptionUserExperiencePromptCompleted,
+          value: kUserExperienceModePromptVersion);
+      return;
+    }
+
+    _initialModeDialogOpen = true;
+    try {
+      final initialMode = normalizeUserExperienceMode(savedMode);
+      if (savedMode.isEmpty) {
+        await bind.mainSetLocalOption(
+            key: kLocalOptionUserExperienceMode, value: initialMode);
+      }
+      if (!mounted) return;
+      _userExperienceMode.value = initialMode;
+
+      final selectedMode = await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        barrierColor: Colors.black.withValues(alpha: 0.45),
+        builder: (_) => _UserExperienceModeDialog(initialMode: initialMode),
+      );
+      if (selectedMode == _kUserExperienceModePromptDeferred) {
+        if (mounted) {
+          _userExperienceMode.value = initialMode;
+        }
+        return;
+      }
+      final mode = normalizeUserExperienceMode(selectedMode ?? initialMode);
+      await bind.mainSetLocalOption(
+          key: kLocalOptionUserExperienceMode, value: mode);
+      await bind.mainSetLocalOption(
+          key: kLocalOptionUserExperiencePromptCompleted,
+          value: kUserExperienceModePromptVersion);
+      if (mounted) {
+        _userExperienceMode.value = mode;
+        Get.forceAppUpdate();
+      }
+    } finally {
+      _initialModeDialogOpen = false;
+    }
   }
 
   buildIDBoard(BuildContext context) {
@@ -1105,7 +1187,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   void initState() {
     super.initState();
+    final userExperienceMode = _getSavedUserExperienceMode().obs;
+    if (Get.isRegistered<RxString>(tag: kUserExperienceModeStateTag)) {
+      _userExperienceMode =
+          Get.find<RxString>(tag: kUserExperienceModeStateTag);
+      _userExperienceMode.value = userExperienceMode.value;
+    } else {
+      _userExperienceMode = userExperienceMode;
+      Get.put<RxString>(_userExperienceMode, tag: kUserExperienceModeStateTag);
+    }
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
+      _syncUserExperienceModeFromLocal();
       await gFFI.serverModel.fetchID();
       final error = await bind.mainGetError();
       if (systemError != error) {
@@ -1260,6 +1352,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     });
     _uniLinksSubscription = listenUniLinks();
 
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showInitialUserExperienceModeDialogIfNeeded();
+    });
+
     if (bind.isIncomingOnly()) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _updateWindowSize();
@@ -1285,6 +1381,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   void dispose() {
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
+    if (Get.isRegistered<RxString>(tag: kUserExperienceModeStateTag) &&
+        identical(Get.find<RxString>(tag: kUserExperienceModeStateTag),
+            _userExperienceMode)) {
+      Get.delete<RxString>(tag: kUserExperienceModeStateTag);
+    }
     _updateTimer?.cancel();
     super.dispose();
   }
@@ -1380,6 +1481,376 @@ class _VersionLabelWithRefreshState extends State<_VersionLabelWithRefresh> {
           ],
         );
       },
+    );
+  }
+}
+
+const _kUserExperienceModePromptDeferred = '__deferred__';
+
+class _UserExperienceModeDialog extends StatefulWidget {
+  const _UserExperienceModeDialog({required this.initialMode});
+
+  final String initialMode;
+
+  @override
+  State<_UserExperienceModeDialog> createState() =>
+      _UserExperienceModeDialogState();
+}
+
+class _UserExperienceModeDialogState extends State<_UserExperienceModeDialog> {
+  late String _selectedMode;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedMode = normalizeUserExperienceMode(widget.initialMode);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final availableHeight = screenHeight - 32;
+    final maxHeight = availableHeight < 720.0 ? availableHeight : 720.0;
+
+    return Dialog(
+      insetPadding: const EdgeInsets.all(16),
+      backgroundColor: theme.colorScheme.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 760, maxHeight: maxHeight),
+        child: SizedBox(
+          width: 760,
+          child: Stack(
+            children: [
+              SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(24, 18, 24, 18),
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final horizontalOptions = constraints.maxWidth >= 600;
+                    final narrowFooter = constraints.maxWidth < 460;
+                    final optionHeight = horizontalOptions ? 220.0 : 205.0;
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 50,
+                          height: 50,
+                          decoration: BoxDecoration(
+                            color:
+                                const Color(0xFF8067F5).withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.auto_awesome,
+                            color: Color(0xFF8067F5),
+                            size: 27,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          '시작 모드 선택',
+                          style: theme.textTheme.headlineSmall?.copyWith(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          '처음 실행 시 사용할 기본 모드를 선택해 주세요.',
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            fontSize: 14,
+                            color: theme.textTheme.bodyMedium?.color
+                                ?.withValues(alpha: 0.68),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 5),
+                          decoration: BoxDecoration(
+                            color:
+                                const Color(0xFF8067F5).withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.info_outline,
+                                size: 17,
+                                color: Color(0xFF8067F5),
+                              ),
+                              SizedBox(width: 7),
+                              Text(
+                                '기본 선택: 레거시 모드',
+                                style: TextStyle(
+                                  color: Color(0xFF8067F5),
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        if (horizontalOptions)
+                          Row(
+                            children: [
+                              Expanded(
+                                child: _buildModeOption(
+                                  mode: kUserExperienceModeLegacy,
+                                  icon: Icons.business_outlined,
+                                  title: '레거시 모드',
+                                  description:
+                                      '기존 방식과 동일한 화면으로 사용합니다.\n익숙한 메뉴와 흐름을 유지합니다.',
+                                  height: optionHeight,
+                                ),
+                              ),
+                              const SizedBox(width: 16),
+                              Expanded(
+                                child: _buildModeOption(
+                                  mode: kUserExperienceModeAgent,
+                                  icon: Icons.person_outline,
+                                  title: '상담원 모드',
+                                  description:
+                                      '상담원 번호 중심으로 간편하게 관리합니다.\n새로운 화면 구성을 사용합니다.',
+                                  height: optionHeight,
+                                ),
+                              ),
+                            ],
+                          )
+                        else
+                          Column(
+                            children: [
+                              _buildModeOption(
+                                mode: kUserExperienceModeLegacy,
+                                icon: Icons.business_outlined,
+                                title: '레거시 모드',
+                                description:
+                                    '기존 방식과 동일한 화면으로 사용합니다.\n익숙한 메뉴와 흐름을 유지합니다.',
+                                height: optionHeight,
+                              ),
+                              const SizedBox(height: 12),
+                              _buildModeOption(
+                                mode: kUserExperienceModeAgent,
+                                icon: Icons.person_outline,
+                                title: '상담원 모드',
+                                description:
+                                    '상담원 번호 중심으로 간편하게 관리합니다.\n새로운 화면 구성을 사용합니다.',
+                                height: optionHeight,
+                              ),
+                            ],
+                          ),
+                        const SizedBox(height: 16),
+                        Divider(color: theme.dividerColor),
+                        const SizedBox(height: 12),
+                        if (narrowFooter)
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              _buildCompleteButton(double.infinity),
+                              const SizedBox(height: 10),
+                              _buildLaterButton(double.infinity),
+                            ],
+                          )
+                        else
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              _buildLaterButton(150),
+                              _buildCompleteButton(190),
+                            ],
+                          ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+              Positioned(
+                top: 8,
+                right: 8,
+                child: IconButton(
+                  tooltip: '닫기',
+                  onPressed: () => Navigator.of(context).pop(),
+                  icon: Icon(
+                    Icons.close,
+                    color: theme.textTheme.bodyMedium?.color
+                        ?.withValues(alpha: 0.62),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildModeOption({
+    required String mode,
+    required IconData icon,
+    required String title,
+    required String description,
+    required double height,
+  }) {
+    final theme = Theme.of(context);
+    final selected = _selectedMode == mode;
+    const accent = Color(0xFF735DF6);
+
+    return SizedBox(
+      height: height,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () => setState(() => _selectedMode = mode),
+          borderRadius: BorderRadius.circular(8),
+          child: Ink(
+            decoration: BoxDecoration(
+              color: selected
+                  ? accent.withValues(alpha: 0.045)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: selected ? accent : theme.dividerColor,
+                width: selected ? 2 : 1,
+              ),
+            ),
+            child: Stack(
+              children: [
+                if (selected)
+                  const Positioned(
+                    top: 14,
+                    right: 14,
+                    child: CircleAvatar(
+                      radius: 18,
+                      backgroundColor: accent,
+                      child: Icon(Icons.check, color: Colors.white, size: 21),
+                    ),
+                  ),
+                Positioned.fill(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Container(
+                          width: 54,
+                          height: 54,
+                          decoration: BoxDecoration(
+                            color: accent.withValues(alpha: 0.11),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(icon, size: 31, color: accent),
+                        ),
+                        const SizedBox(height: 14),
+                        Text(
+                          title,
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          description,
+                          textAlign: TextAlign.center,
+                          maxLines: 2,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            fontSize: 13,
+                            height: 1.5,
+                            color: theme.textTheme.bodySmall?.color
+                                ?.withValues(alpha: 0.68),
+                          ),
+                        ),
+                        const Spacer(),
+                        Container(
+                          width: 28,
+                          height: 28,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: selected ? accent : theme.dividerColor,
+                              width: 2,
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: selected
+                              ? Container(
+                                  width: 14,
+                                  height: 14,
+                                  decoration: const BoxDecoration(
+                                    color: accent,
+                                    shape: BoxShape.circle,
+                                  ),
+                                )
+                              : null,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLaterButton(double width) {
+    return SizedBox(
+      width: width,
+      height: 50,
+      child: OutlinedButton(
+        onPressed: () =>
+            Navigator.of(context).pop(_kUserExperienceModePromptDeferred),
+        style: OutlinedButton.styleFrom(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        ),
+        child: const Text('다음에 설정', style: TextStyle(fontSize: 15)),
+      ),
+    );
+  }
+
+  Widget _buildCompleteButton(double width) {
+    return SizedBox(
+      width: width,
+      height: 50,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFF4F8BFF), Color(0xFF745CF6)],
+          ),
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF5B7CFA).withValues(alpha: 0.26),
+              blurRadius: 12,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: () => Navigator.of(context).pop(_selectedMode),
+            borderRadius: BorderRadius.circular(8),
+            child: const Center(
+              child: Text(
+                '선택 완료',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

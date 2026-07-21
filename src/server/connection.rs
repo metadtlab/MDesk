@@ -618,6 +618,22 @@ impl Connection {
                             conn.send(msg_out).await;
                             conn.chat_unanswered = false;
                         }
+                        #[cfg(windows)]
+                        ipc::Data::OpenFileTransferFolder {
+                            path,
+                            selected_name,
+                            ..
+                        } => {
+                            let mut misc = Misc::new();
+                            misc.set_open_file_transfer(OpenFileTransfer {
+                                dir: path,
+                                selected_name: selected_name.unwrap_or_default(),
+                                ..Default::default()
+                            });
+                            let mut msg_out = Message::new();
+                            msg_out.set_misc(misc);
+                            conn.send(msg_out).await;
+                        }
                         ipc::Data::SwitchPermission{name, enabled} => {
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {

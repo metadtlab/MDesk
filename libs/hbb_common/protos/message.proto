@@ -830,6 +830,11 @@ message MessageQuery {
   int32 switch_display = 1;
 }
 
+message OpenFileTransfer {
+  string dir = 1;
+  string selected_name = 2;
+}
+
 message Misc {
   oneof union {
     ChatMessage chat_message = 4;
@@ -867,6 +872,7 @@ message Misc {
     DisplayResolution change_display_resolution = 36;
     MessageQuery message_query = 37;
     int32 follow_current_display = 38;
+    OpenFileTransfer open_file_transfer = 39;
   }
 }
 

@@ -36,7 +36,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         RwLock,
     },
 };
@@ -88,6 +88,39 @@ lazy_static::lazy_static! {
 }
 
 static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
+#[cfg(target_os = "windows")]
+static EXPLORER_SEND_MENU_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+fn is_default_remote_client(client: &Client) -> bool {
+    client.authorized
+        && !client.disconnected
+        && !client.is_file_transfer
+        && !client.is_view_camera
+        && !client.is_terminal
+        && client.port_forward.is_empty()
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_explorer_send_to_controller_menu() {
+    let should_register = CLIENTS
+        .read()
+        .unwrap()
+        .values()
+        .any(is_default_remote_client);
+
+    if should_register {
+        if !EXPLORER_SEND_MENU_REGISTERED.swap(true, Ordering::SeqCst) {
+            if let Err(err) = crate::platform::windows::register_explorer_send_to_controller_menu()
+            {
+                EXPLORER_SEND_MENU_REGISTERED.store(false, Ordering::SeqCst);
+                log::warn!("Failed to register Explorer send menu: {err}");
+            }
+        }
+    } else if EXPLORER_SEND_MENU_REGISTERED.swap(false, Ordering::SeqCst) {
+        crate::platform::windows::unregister_explorer_send_to_controller_menu();
+    }
+}
 
 #[derive(Clone)]
 pub struct ConnectionManager<T: InvokeUiCM> {
@@ -177,6 +210,8 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             .unwrap()
             .retain(|_, c| !(c.disconnected && c.peer_id == client.peer_id));
         CLIENTS.write().unwrap().insert(id, client.clone());
+        #[cfg(target_os = "windows")]
+        refresh_explorer_send_to_controller_menu();
         self.ui_handler.add_connection(&client);
     }
 
@@ -201,6 +236,8 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
                 .get_mut(&id)
                 .map(|c| c.disconnected = true);
         }
+        #[cfg(target_os = "windows")]
+        refresh_explorer_send_to_controller_menu();
 
         #[cfg(target_os = "windows")]
         {
@@ -279,6 +316,8 @@ pub fn authorize(id: i32) {
         client.authorized = true;
         allow_err!(client.tx.send(Data::Authorize));
     };
+    #[cfg(target_os = "windows")]
+    refresh_explorer_send_to_controller_menu();
 }
 
 #[inline]
@@ -292,6 +331,8 @@ pub fn close(id: i32) {
 #[inline]
 pub fn remove(id: i32) {
     CLIENTS.write().unwrap().remove(&id);
+    #[cfg(target_os = "windows")]
+    refresh_explorer_send_to_controller_menu();
 }
 
 // server mode send chat to peer
@@ -310,6 +351,31 @@ pub fn switch_permission(id: i32, name: String, enabled: bool) {
     if let Some(client) = CLIENTS.read().unwrap().get(&id) {
         allow_err!(client.tx.send(Data::SwitchPermission { name, enabled }));
     };
+}
+
+#[cfg(all(target_os = "windows", not(any(target_os = "ios"))))]
+pub fn open_file_transfer_folder(
+    path: String,
+    selected_name: Option<String>,
+) -> Result<(), String> {
+    let clients = CLIENTS.read().unwrap();
+    let active_clients = clients
+        .values()
+        .filter(|client| is_default_remote_client(client))
+        .collect::<Vec<_>>();
+
+    match active_clients.as_slice() {
+        [] => Err("No active remote controller.".to_owned()),
+        [client] => client
+            .tx
+            .send(Data::OpenFileTransferFolder {
+                path,
+                selected_name,
+                result: None,
+            })
+            .map_err(|err| err.to_string()),
+        _ => Err("Multiple remote controllers are connected.".to_owned()),
+    }
 }
 
 #[inline]
@@ -440,6 +506,25 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 Data::ChatMessage { text } => {
                                     self.cm.new_message(self.conn_id, text);
+                                }
+                                #[cfg(target_os = "windows")]
+                                Data::OpenFileTransferFolder {
+                                    path,
+                                    selected_name,
+                                    ..
+                                } => {
+                                    let result = open_file_transfer_folder(path, selected_name)
+                                        .map(|_| String::new())
+                                        .unwrap_or_else(|err| err);
+                                    allow_err!(
+                                        self.stream
+                                            .send(&Data::OpenFileTransferFolder {
+                                                path: String::new(),
+                                                selected_name: None,
+                                                result: Some(result)
+                                            })
+                                            .await
+                                    );
                                 }
                                 Data::FS(mut fs) => {
                                     if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
@@ -640,6 +725,8 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
 pub async fn start_ipc<T: InvokeUiCM>(cm: ConnectionManager<T>) {
     #[cfg(target_os = "windows")]
     ContextSend::enable(crate::Connection::permission(OPTION_ENABLE_FILE_TRANSFER));
+    #[cfg(target_os = "windows")]
+    crate::platform::windows::unregister_explorer_send_to_controller_menu();
     match ipc::new_listener("_cm").await {
         Ok(mut incoming) => {
             while let Some(result) = incoming.next().await {
@@ -839,26 +926,35 @@ async fn handle_fs(
                     return;
                 }
             };
+            let file_entries: Vec<FileEntry> = files
+                .drain(..)
+                .map(|f| FileEntry {
+                    name: f.0,
+                    modified_time: f.1,
+                    ..Default::default()
+                })
+                .collect();
             // cm has no show_hidden context
             // dummy remote, show_hidden, is_remote
             let mut job = fs::TransferJob::new_write(
                 id,
                 fs::JobType::Generic,
                 "".to_string(),
-                fs::DataSource::FilePath(path),
+                fs::DataSource::FilePath(path.clone()),
                 file_num,
                 false,
                 false,
-                files
-                    .drain(..)
-                    .map(|f| FileEntry {
-                        name: f.0,
-                        modified_time: f.1,
-                        ..Default::default()
-                    })
-                    .collect(),
                 overwrite_detection,
             );
+            if let Err(err) = job.set_files(file_entries) {
+                log::warn!(
+                    "Reject unsafe transfer file list for {}: {}",
+                    path.display(),
+                    err
+                );
+                send_raw(fs::new_error(id, err, file_num), tx);
+                return;
+            }
             if is_remote_drop_downloads {
                 job.set_mtime_to_now(true);
                 job.set_open_folder_on_done(true);
@@ -1162,5 +1258,7 @@ pub fn quit_cm() {
     // in case of std::process::exit not work
     log::info!("quit cm");
     CLIENTS.write().unwrap().clear();
+    #[cfg(target_os = "windows")]
+    refresh_explorer_send_to_controller_menu();
     crate::platform::quit_gui();
 }

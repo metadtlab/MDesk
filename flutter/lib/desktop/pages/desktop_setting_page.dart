@@ -369,6 +369,7 @@ class _GeneralState extends State<_General> {
       children: [
         if (!isWeb) service(),
         theme(),
+        userExperience(),
         _Card(title: 'Language', children: [language()]),
         if (!isWeb) hwcodec(),
         if (!isWeb) audio(context),
@@ -402,6 +403,40 @@ class _GeneralState extends State<_General> {
           value: 'system',
           groupValue: current,
           label: 'Follow System',
+          onChanged: isOptFixed ? null : onChanged),
+    ]);
+  }
+
+  Widget userExperience() {
+    var current = normalizeUserExperienceMode(
+        bind.mainGetLocalOption(key: kLocalOptionUserExperienceMode));
+
+    onChanged(String value) async {
+      final mode = normalizeUserExperienceMode(value);
+      await bind.mainSetLocalOption(
+          key: kLocalOptionUserExperienceMode, value: mode);
+      await bind.mainSetLocalOption(
+          key: kLocalOptionUserExperiencePromptCompleted,
+          value: kUserExperienceModePromptVersion);
+      if (Get.isRegistered<RxString>(tag: kUserExperienceModeStateTag)) {
+        Get.find<RxString>(tag: kUserExperienceModeStateTag).value = mode;
+      }
+      setState(() {});
+      Get.forceAppUpdate();
+      reloadCurrentWindow();
+    }
+
+    final isOptFixed = isOptionFixed(kLocalOptionUserExperienceMode);
+    return _Card(title: '사용자경험', children: [
+      _Radio<String>(context,
+          value: kUserExperienceModeLegacy,
+          groupValue: current,
+          label: '레거시 모드',
+          onChanged: isOptFixed ? null : onChanged),
+      _Radio<String>(context,
+          value: kUserExperienceModeAgent,
+          groupValue: current,
+          label: '상담원 모드',
           onChanged: isOptFixed ? null : onChanged),
     ]);
   }

@@ -189,7 +189,14 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
 
 /// Connection page for connecting to a remote peer.
 class ConnectionPage extends StatefulWidget {
-  const ConnectionPage({Key? key}) : super(key: key);
+  const ConnectionPage({
+    Key? key,
+    this.hideRemoteIdInput = false,
+    this.onOpenSettings,
+  }) : super(key: key);
+
+  final bool hideRemoteIdInput;
+  final VoidCallback? onOpenSettings;
 
   @override
   State<ConnectionPage> createState() => _ConnectionPageState();
@@ -309,14 +316,21 @@ class _ConnectionPageState extends State<ConnectionPage>
         Expanded(
             child: Column(
           children: [
-            Row(
-              children: [
-                Flexible(child: _buildRemoteIDTextField(context)),
-              ],
-            ).marginOnly(top: 22),
-            SizedBox(height: 12),
-            const Divider(),
-            Expanded(child: PeerTabPage()),
+            if (!widget.hideRemoteIdInput) ...[
+              Row(
+                children: [
+                  Flexible(child: _buildRemoteIDTextField(context)),
+                ],
+              ).marginOnly(top: 22),
+              SizedBox(height: 12),
+              const Divider(),
+            ],
+            Expanded(
+              child: PeerTabPage(
+                onOpenSettings: widget.onOpenSettings,
+                showCustomRemoteOnly: widget.hideRemoteIdInput,
+              ),
+            ),
           ],
         ).paddingSymmetric(horizontal: 12.0)),
         if (!isOutgoingOnly) const Divider(height: 1),

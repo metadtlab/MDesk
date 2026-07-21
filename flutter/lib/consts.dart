@@ -309,6 +309,19 @@ const kInvalidValueStr = 'InvalidValueStr';
 // Config key shared by flutter and other ui.
 const kCommConfKeyTheme = 'theme';
 const kCommConfKeyLang = 'lang';
+const kLocalOptionUserExperienceMode = 'user-experience-mode';
+const kLocalOptionUserExperiencePromptCompleted =
+    'user-experience-prompt-completed';
+const kUserExperienceModePromptVersion = '1';
+const kUserExperienceModeLegacy = 'legacy';
+const kUserExperienceModeAgent = 'agent';
+const kUserExperienceModeStateTag = 'user-experience-mode-state';
+
+String normalizeUserExperienceMode(String value) {
+  return value == kUserExperienceModeAgent
+      ? kUserExperienceModeAgent
+      : kUserExperienceModeLegacy;
+}
 
 const kMobilePageConstraints = BoxConstraints(maxWidth: 600);
 

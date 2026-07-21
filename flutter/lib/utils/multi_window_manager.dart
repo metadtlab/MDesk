@@ -230,6 +230,8 @@ class RustDeskMultiWindowManager {
     bool? isRDP,
     bool? isSharedPassword,
     String? connToken,
+    String? initialRemoteDir,
+    String? initialRemoteSelectedName,
   }) async {
     var params = {
       "type": type.index,
@@ -248,6 +250,12 @@ class RustDeskMultiWindowManager {
     }
     if (connToken != null) {
       params['connToken'] = connToken;
+    }
+    if (initialRemoteDir != null) {
+      params['initialRemoteDir'] = initialRemoteDir;
+    }
+    if (initialRemoteSelectedName != null) {
+      params['initialRemoteSelectedName'] = initialRemoteSelectedName;
     }
     final msg = jsonEncode(params);
 
@@ -292,6 +300,8 @@ class RustDeskMultiWindowManager {
     bool? isSharedPassword,
     bool? forceRelay,
     String? connToken,
+    String? initialRemoteDir,
+    String? initialRemoteSelectedName,
   }) async {
     return await newSession(
       WindowType.FileTransfer,
@@ -302,6 +312,8 @@ class RustDeskMultiWindowManager {
       forceRelay: forceRelay,
       isSharedPassword: isSharedPassword,
       connToken: connToken,
+      initialRemoteDir: initialRemoteDir,
+      initialRemoteSelectedName: initialRemoteSelectedName,
     );
   }
 
@@ -472,7 +484,8 @@ class RustDeskMultiWindowManager {
     }
     for (int i = 0; i < windows.length; i++) {
       final wId = windows[i];
-      final shouldSavePos = type != WindowType.Terminal || i == windows.length - 1;
+      final shouldSavePos =
+          type != WindowType.Terminal || i == windows.length - 1;
       if (shouldSavePos) {
         debugPrint("closing multi window, type: ${type.toString()} id: $wId");
         try {

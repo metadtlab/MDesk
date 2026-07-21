@@ -586,7 +586,6 @@ impl<T: InvokeUiSession> Remote<T> {
                         file_num,
                         include_hidden,
                         is_remote,
-                        Vec::new(),
                         od,
                     ));
                     allow_err!(
@@ -659,7 +658,6 @@ impl<T: InvokeUiSession> Remote<T> {
                         file_num,
                         include_hidden,
                         is_remote,
-                        Vec::new(),
                         od,
                     );
                     job.is_last_job = true;
@@ -845,19 +843,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
             }
             Data::CancelJob(id) => {
-                let mut msg_out = Message::new();
-                let mut file_action = FileAction::new();
-                file_action.set_cancel(FileTransferCancel {
-                    id: id,
-                    ..Default::default()
-                });
-                msg_out.set_file_action(file_action);
-                allow_err!(peer.send(&msg_out).await);
-                if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
-                    job.remove_download_file();
-                }
-                let _ = fs::remove_job(id, &mut self.read_jobs);
-                self.remove_jobs.remove(&id);
+                self.cancel_transfer_job(id, peer).await;
             }
             Data::RemoveDir((id, path)) => {
                 let mut msg_out = Message::new();
@@ -1051,6 +1037,22 @@ impl<T: InvokeUiSession> Remote<T> {
             }
             self.last_update_jobs_status.0 = Instant::now();
         }
+    }
+
+    async fn cancel_transfer_job(&mut self, id: i32, peer: &mut Stream) {
+        let mut msg_out = Message::new();
+        let mut file_action = FileAction::new();
+        file_action.set_cancel(FileTransferCancel {
+            id,
+            ..Default::default()
+        });
+        msg_out.set_file_action(file_action);
+        allow_err!(peer.send(&msg_out).await);
+        if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
+            job.remove_download_file();
+        }
+        let _ = fs::remove_job(id, &mut self.read_jobs);
+        self.remove_jobs.remove(&id);
     }
 
     pub async fn sync_jobs_status_to_local(&mut self) -> bool {
@@ -1524,14 +1526,47 @@ impl<T: InvokeUiSession> Remote<T> {
                                     fs::transform_windows_path(&mut entries);
                                 }
                             }
-                            self.handler
-                                .update_folder_files(fd.id, &entries, fd.path, false, false);
+                            let mut set_files_err = None;
                             if let Some(job) = fs::get_job(fd.id, &mut self.write_jobs) {
                                 log::info!("job set_files: {:?}", entries);
-                                job.set_files(entries);
-                                job.set_finished_size_on_resume();
+                                if let Err(err) = job.set_files(entries) {
+                                    set_files_err = Some(err.to_string());
+                                } else {
+                                    job.set_finished_size_on_resume();
+                                    self.handler.update_folder_files(
+                                        fd.id,
+                                        job.files(),
+                                        fd.path.clone(),
+                                        false,
+                                        false,
+                                    );
+                                }
                             } else if let Some(job) = self.remove_jobs.get_mut(&fd.id) {
                                 job.files = entries;
+                                self.handler.update_folder_files(
+                                    fd.id,
+                                    &job.files,
+                                    fd.path.clone(),
+                                    false,
+                                    false,
+                                );
+                            } else {
+                                self.handler.update_folder_files(
+                                    fd.id,
+                                    &entries,
+                                    fd.path.clone(),
+                                    false,
+                                    false,
+                                );
+                            }
+                            if let Some(err) = set_files_err {
+                                log::warn!(
+                                    "Rejected unsafe file list from remote peer for job {}: {}",
+                                    fd.id,
+                                    err
+                                );
+                                self.cancel_transfer_job(fd.id, peer).await;
+                                self.handle_job_status(fd.id, -1, Some(err));
                             }
                         }
                         Some(file_response::Union::Digest(digest)) => {
@@ -1750,6 +1785,31 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::ChatMessage(c)) => {
                         self.handler.new_message(c.text);
+                    }
+                    #[cfg(feature = "flutter")]
+                    Some(misc::Union::OpenFileTransfer(req)) => {
+                        if self.handler.is_default() {
+                            let (id, conn_token) = {
+                                let lch = self.handler.get_lch();
+                                let lch = lch.read().unwrap();
+                                (lch.get_id().to_owned(), lch.get_conn_token())
+                            };
+                            let mut evt = serde_json::json!({
+                                "name": "open_file_transfer_folder",
+                                "id": id,
+                                "dir": req.dir,
+                            });
+                            if !req.selected_name.is_empty() {
+                                evt["selectedName"] = serde_json::json!(req.selected_name);
+                            }
+                            if let Some(conn_token) = conn_token {
+                                evt["connToken"] = serde_json::json!(conn_token);
+                            }
+                            let _ = crate::flutter::push_global_event(
+                                crate::flutter::APP_TYPE_MAIN,
+                                evt.to_string(),
+                            );
+                        }
                     }
                     Some(misc::Union::PermissionInfo(p)) => {
                         log::info!("Change permission {:?} -> {}", p.permission, p.enabled);

@@ -60,6 +60,8 @@ class FileManagerPage extends StatefulWidget {
       required this.isSharedPassword,
       this.tabController,
       this.connToken,
+      this.initialRemoteDir,
+      this.initialRemoteSelectedName,
       this.forceRelay})
       : super(key: key);
   final String id;
@@ -67,6 +69,8 @@ class FileManagerPage extends StatefulWidget {
   final bool? isSharedPassword;
   final bool? forceRelay;
   final String? connToken;
+  final String? initialRemoteDir;
+  final String? initialRemoteSelectedName;
   final DesktopTabController? tabController;
   final SimpleWrapper<State<FileManagerPage>?> _lastState = SimpleWrapper(null);
 
@@ -96,6 +100,8 @@ class _FileManagerPageState extends State<FileManagerPage>
   void initState() {
     super.initState();
     _ffi = FFI(null);
+    _ffi.fileModel.initialRemoteDir = widget.initialRemoteDir;
+    _ffi.fileModel.initialRemoteSelectedName = widget.initialRemoteSelectedName;
     _ffi.start(widget.id,
         isFileTransfer: true,
         password: widget.password,
@@ -434,7 +440,10 @@ class _FileManagerViewState extends State<FileManagerView> {
     super.initState();
     // register location listener
     _locationNode.addListener(onLocationFocusChanged);
-    controller.directory.listen((e) => breadCrumbScrollToEnd());
+    controller.directory.listen((e) {
+      breadCrumbScrollToEnd();
+      _selectPendingEntry();
+    });
   }
 
   @override
@@ -1334,6 +1343,39 @@ class _FileManagerViewState extends State<FileManagerView> {
     scrollController.jumpTo(offset);
     selectedEntries.add(searchResult.first);
     debugPrint("focused on ${searchResult.first.name}");
+  }
+
+  void _selectPendingEntry() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final selectedName =
+          controller.takePendingSelectedName(controller.directory.value.path);
+      if (selectedName == null || selectedName.isEmpty) return;
+
+      final compareName = controller.options.value.isWindows
+          ? selectedName.toLowerCase()
+          : selectedName;
+      Entry? target;
+      for (final entry in controller.directory.value.entries) {
+        final entryName = controller.options.value.isWindows
+            ? entry.name.toLowerCase()
+            : entry.name;
+        if (entryName == compareName) {
+          target = entry;
+          break;
+        }
+      }
+
+      selectedItems.clear();
+      if (target == null) return;
+      if (_fileListScrollController.hasClients) {
+        _jumpToEntry(isLocal, target, _fileListScrollController,
+            kDesktopFileTransferRowHeight);
+      } else {
+        selectedItems.add(target);
+        setState(() {});
+      }
+    });
   }
 
   void _onSelectedChanged(SelectedItems selectedItems, List<Entry> entries,

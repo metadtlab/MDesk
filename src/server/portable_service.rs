@@ -536,6 +536,14 @@ pub mod client {
         Logon(String, String),
     }
 
+    pub fn start_quick_support_portable_service() -> ResultType<()> {
+        if running() {
+            return Ok(());
+        }
+        set_quick_support(true);
+        start_portable_service(StartPara::Direct)
+    }
+
     pub(crate) fn start_portable_service(para: StartPara) -> ResultType<()> {
         log::info!("start portable service");
         if RUNNING.lock().unwrap().clone() {

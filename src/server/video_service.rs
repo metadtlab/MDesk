@@ -717,6 +717,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                 if !crate::platform::windows::try_change_desktop() {
                     bail!("Desktop changed");
                 }
+                log::info!("Desktop changed, recreate video capturer");
+                bail!("Desktop changed");
             }
         }
         let now = time::Instant::now();

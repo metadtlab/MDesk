@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hbb_common::config::{self, Config};
 #[cfg(target_os = "windows")]
 use librustdesk::platform;
-use librustdesk::{common, flutter_ffi, start_server, VERSION};
+use librustdesk::{common, flutter_ffi, portable_service, start_server, VERSION};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -52,7 +52,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED,
     WS_SYSMENU, WS_VISIBLE,
 };
-
 const DEFAULT_CERT_VERIFY_URL: &str = "https://admin.787.kr/api/certno/verify";
 const DEFAULT_AGENTNUMUPDATE_BASE_URL: &str = "https://787.kr";
 const DEFAULT_API_HINT: &str = "https://admin.787.kr";
@@ -74,6 +73,8 @@ const PROGRESS_WIDTH: i32 = 320;
 const PROGRESS_HEIGHT: i32 = 10;
 #[cfg(target_os = "windows")]
 const REMOTE_EXIT_IDLE_TICKS: u32 = 20;
+#[cfg(target_os = "windows")]
+const PORTABLE_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "windows")]
 const TRAY_ICON_ID: u32 = 1;
 #[cfg(target_os = "windows")]
@@ -115,6 +116,11 @@ enum Commands {
     Id,
     /// Print build version
     Version,
+    /// Ask the active controller to open file transfer at this file or folder
+    SendToController {
+        /// Selected Explorer path
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +185,12 @@ struct CertVerifyResponse {
     #[serde(default)]
     mdesk_id: String,
     #[serde(default)]
+    owner_mdesk_id: String,
+    #[serde(default)]
+    session_id: i64,
+    #[serde(default)]
+    connection_token: String,
+    #[serde(default)]
     message: String,
 }
 
@@ -189,16 +201,34 @@ struct CertVerification {
     peer_id: String,
     customer_id: String,
     verified_peer_id: String,
+    owner_mdesk_id: String,
+    session_id: i64,
+    connection_token: String,
 }
 
 fn main() {
     #[cfg(target_os = "windows")]
     enable_per_monitor_dpi_awareness();
 
-    if let Some(mode) = internal_mode_from_arg(std::env::args().nth(1).as_deref()) {
+    let first_arg = std::env::args().nth(1);
+
+    if is_rustdesk_internal_arg(first_arg.as_deref()) {
+        let _ = librustdesk::core_main::core_main();
+        return;
+    }
+
+    if let Some(mode) = internal_mode_from_arg(first_arg.as_deref()) {
         match mode {
             InternalMode::Whiteboard => run_whiteboard_mode(),
         }
+        return;
+    }
+
+    if first_arg.as_deref() == Some("--send-to-controller") {
+        let args = std::env::args().collect::<Vec<_>>();
+        let path = args.get(2).cloned().unwrap_or_default();
+        let select_path = args.iter().any(|arg| arg == "--select");
+        run_send_to_controller(path, select_path, false);
         return;
     }
 
@@ -218,6 +248,7 @@ fn main() {
         }),
         Some(Commands::Id) => run_id(),
         Some(Commands::Version) => println!("{VERSION}"),
+        Some(Commands::SendToController { path }) => run_send_to_controller(path, false, false),
         None => run_serve(ServeOptions::default()),
     }
 }
@@ -244,6 +275,13 @@ fn internal_mode_from_arg(arg: Option<&str>) -> Option<InternalMode> {
     }
 }
 
+fn is_rustdesk_internal_arg(arg: Option<&str>) -> bool {
+    matches!(
+        arg,
+        Some("--portable-service" | "--elevate" | "--run-as-system")
+    )
+}
+
 fn run_whiteboard_mode() {
     // Whiteboard worker process is launched by host runtime via current exe + `--whiteboard`.
     // Delegate to upstream core_main handler to keep behavior aligned with the main project.
@@ -256,6 +294,41 @@ fn run_id() {
     }
     println!("{}", Config::get_id());
     common::global_clean();
+}
+
+fn run_send_to_controller(path: String, select_path: bool, show_errors: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        if !init_runtime() {
+            if show_errors {
+                show_error_popup("MDeskMini", "Failed to initialize MDeskMini.");
+            }
+            std::process::exit(1);
+        }
+
+        let result = run_send_to_controller_windows(path, select_path);
+        common::global_clean();
+
+        if let Err(err) = result {
+            eprintln!("failed to request file transfer from Explorer: {err}");
+            if show_errors {
+                show_error_popup("MDeskMini", &err);
+            }
+            std::process::exit(1);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, select_path, show_errors);
+        eprintln!("send-to-controller is only supported on Windows.");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_send_to_controller_windows(path: String, select_path: bool) -> Result<(), String> {
+    platform::send_explorer_path_to_controller(path, select_path)
 }
 
 fn run_serve(options: ServeOptions) {
@@ -283,6 +356,8 @@ fn run_serve(options: ServeOptions) {
         );
         std::process::exit(1);
     }
+    #[cfg(target_os = "windows")]
+    platform::unregister_explorer_send_to_controller_menu();
 
     #[cfg(target_os = "windows")]
     update_startup_progress(
@@ -314,6 +389,14 @@ fn run_serve(options: ServeOptions) {
         "원격 연결 허용 상태를 준비하고 있습니다.",
     );
     ensure_host_accepting_mode();
+
+    #[cfg(target_os = "windows")]
+    match ensure_portable_service_ready() {
+        Ok(()) => println!("SYSTEM portable service is ready"),
+        Err(err) => {
+            eprintln!("failed to prepare SYSTEM portable service; continuing without it: {err}")
+        }
+    }
 
     println!("starting mdeskmini host server");
     println!("version={VERSION}");
@@ -362,6 +445,8 @@ fn run_serve(options: ServeOptions) {
     }
 
     let _ = server_thread.join();
+    #[cfg(target_os = "windows")]
+    platform::unregister_explorer_send_to_controller_menu();
     #[cfg(target_os = "windows")]
     if let Some(window) = waiting_window.take() {
         window.close();
@@ -656,12 +741,22 @@ fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerificatio
         ));
     }
 
+    let owner_mdesk_id = parsed.owner_mdesk_id.trim();
+    if owner_mdesk_id.is_empty() || parsed.session_id <= 0 || parsed.connection_token.trim().is_empty() {
+        return Err(format!(
+            "{verify_url}: success=true but the cert session binding is incomplete"
+        ));
+    }
+
     Ok(CertVerification {
         cert_code: cert_code.trim().to_owned(),
         verify_url,
         peer_id,
         customer_id: customer_id.to_owned(),
         verified_peer_id: returned_peer_id.to_owned(),
+        owner_mdesk_id: owner_mdesk_id.to_owned(),
+        session_id: parsed.session_id,
+        connection_token: parsed.connection_token.trim().to_owned(),
     })
 }
 
@@ -695,8 +790,13 @@ fn call_agentnumupdate(verification: &CertVerification, api_hint: &str) -> Resul
         .map_err(|err| format!("http client build failed: {err}"))?;
 
     let mut last_error = String::new();
+    let body = json!({
+        "session_id": verification.session_id,
+        "owner_mdesk_id": verification.owner_mdesk_id,
+        "connection_token": verification.connection_token,
+    });
     for attempt in 1..=3 {
-        let response = match client.get(&agent_url).send() {
+        let response = match client.post(&agent_url).json(&body).send() {
             Ok(response) => response,
             Err(err) => {
                 last_error = format!("{agent_url}: request failed on attempt {attempt}: {err}");
@@ -755,6 +855,32 @@ fn ensure_host_accepting_mode() {
         );
         Config::set_option("stop-service".to_owned(), "".to_owned());
     }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_portable_service_ready() -> Result<(), String> {
+    if platform::is_installed() {
+        return Ok(());
+    }
+
+    if portable_service::client::running() {
+        return Ok(());
+    }
+
+    portable_service::client::start_quick_support_portable_service()
+        .map_err(|err| err.to_string())?;
+    let started_at = Instant::now();
+    while started_at.elapsed() < PORTABLE_SERVICE_READY_TIMEOUT {
+        if portable_service::client::running() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(format!(
+        "timed out after {} seconds",
+        PORTABLE_SERVICE_READY_TIMEOUT.as_secs()
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -858,7 +984,10 @@ fn add_tray_icon(hwnd: HWND) -> bool {
     data.uID = TRAY_ICON_ID;
     data.uFlags = NIF_ICON | NIF_TIP;
     data.hIcon = icon;
-    copy_wide_truncated(&mut data.szTip, "MDeskMini");
+    // NOTIFYICONDATAW is packed on 32-bit Windows, so do not borrow szTip in place.
+    let mut tip = data.szTip;
+    copy_wide_truncated(&mut tip, "MDeskMini");
+    data.szTip = tip;
 
     unsafe { Shell_NotifyIconW(NIM_ADD, &data).as_bool() }
 }
@@ -1240,6 +1369,7 @@ fn monitor_pending_connections(
             if let Some(window) = waiting_window {
                 if window.is_closed() {
                     println!("waiting window closed by user; exiting mdeskmini");
+                    platform::unregister_explorer_send_to_controller_menu();
                     common::global_clean();
                     std::process::exit(0);
                 }
@@ -1276,6 +1406,7 @@ fn monitor_pending_connections(
                 idle_ticks_after_disconnect += 1;
                 if idle_ticks_after_disconnect >= REMOTE_EXIT_IDLE_TICKS {
                     println!("all remote sessions ended; exiting mdeskmini");
+                    platform::unregister_explorer_send_to_controller_menu();
                     common::global_clean();
                     std::process::exit(0);
                 }
@@ -1360,6 +1491,8 @@ fn monitor_pending_connections(
 
             thread::sleep(Duration::from_millis(300));
         }
+
+        platform::unregister_explorer_send_to_controller_menu();
     }
 }
 

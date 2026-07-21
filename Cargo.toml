@@ -1,6 +1,6 @@
 [package]
 name = "MDesk"
-version = "1.4.52"
+version = "1.4.56"
 authors = ["MDesk <metadtlab@Gmail.com>"]
 edition = "2021"
 build= "build.rs"

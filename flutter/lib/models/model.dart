@@ -434,6 +434,8 @@ class FfiModel with ChangeNotifier {
         if (isDesktop) {
           gFFI.cmFileModel.onFileTransferLog(evt);
         }
+      } else if (name == 'open_file_transfer_folder') {
+        await _handleOpenFileTransferFolder(evt);
       } else if (name == 'sync_peer_option') {
         _handleSyncPeerOption(evt, peerId);
       } else if (name == 'follow_current_display') {
@@ -462,6 +464,25 @@ class FfiModel with ChangeNotifier {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
     };
+  }
+
+  Future<void> _handleOpenFileTransferFolder(Map<String, dynamic> evt) async {
+    if (!isDesktop) return;
+    final id = evt['id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    final dir = evt['dir']?.toString();
+    final selectedName = evt['selectedName']?.toString();
+    final connTokenValue = evt['connToken']?.toString();
+    final connToken = connTokenValue == null || connTokenValue.isEmpty
+        ? null
+        : connTokenValue;
+    await rustDeskWinManager.newFileTransfer(
+      id,
+      connToken: connToken,
+      initialRemoteDir: dir,
+      initialRemoteSelectedName:
+          selectedName == null || selectedName.isEmpty ? null : selectedName,
+    );
   }
 
   Future<void> _handleScreenshot(
@@ -899,12 +920,13 @@ class FfiModel with ChangeNotifier {
       debugPrint('Direct connection failed, auto-switching to relay...');
       dialogManager.dismissAll();
       // 릴레이 연결 안내 메시지 표시 (2.5초)
-      showToast('직접 연결 실패, 릴레이 연결로 진행합니다...', timeout: const Duration(milliseconds: 2500));
+      showToast('직접 연결 실패, 릴레이 연결로 진행합니다...',
+          timeout: const Duration(milliseconds: 2500));
       dialogManager.showLoading(translate('Connecting via relay...'),
           onCancel: closeConnection);
       // 2.5초 후 릴레이 연결 시도
       Future.delayed(const Duration(milliseconds: 2500), () {
-        reconnect(dialogManager, sessionId, true);  // forceRelay: true
+        reconnect(dialogManager, sessionId, true); // forceRelay: true
       });
     } else if (text == kMsgboxTextWaitingForImage) {
       showConnectedWaitingForImage(dialogManager, sessionId, type, title, text);

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/formatter/id_formatter.dart';
+import 'package:flutter_hbb/common/widgets/root_overlay_control.dart';
 import 'package:get/get.dart';
 import 'package:http/http.dart' as http;
 import '../../common.dart';
@@ -13,11 +14,21 @@ import '../../utils/device_register_service.dart';
 
 /// 상담사 추가 버튼·관련 안내 표시. 추후 사용 시 true로 변경.
 const bool _kShowAddCounselorButton = false;
+const String _kLastCertCodeOptionPrefix = 'custom-remote-last-cert-code';
+const String _kLastCertStoredAtOptionPrefix =
+    'custom-remote-last-cert-stored-at';
+const String _kLastRemoteIdOptionPrefix = 'custom-remote-last-peer-id';
+const Duration _kCertDisplayLifetime = Duration(minutes: 5);
 
 class CustomRemoteView extends StatefulWidget {
   final EdgeInsets? menuPadding;
+  final bool useNumberManagementDesign;
 
-  const CustomRemoteView({Key? key, this.menuPadding}) : super(key: key);
+  const CustomRemoteView({
+    Key? key,
+    this.menuPadding,
+    this.useNumberManagementDesign = true,
+  }) : super(key: key);
 
   @override
   State<CustomRemoteView> createState() => _CustomRemoteViewState();
@@ -32,11 +43,20 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   String _message = '';
   late AnimationController _blinkController;
   Timer? _autoRefreshTimer; // 자동 새로고침 타이머
+  Timer? _directAutoConnectTimer;
+  Timer? _certDisplayExpiryTimer;
+  String _scheduledDirectRemoteId = '';
+  String _lastAutoConnectedRemoteId = '';
+  String _lastPromptedDirectRemoteId = '';
+  String _directRemotePromptId = '';
+  String _lastDirectRemoteId = '';
+  String _restoredSessionCacheScope = '';
+  bool _showReconnectButton = false;
   bool _isAppFocused = true; // 앱 포커스 상태
 
   // 인증번호 관련 상태
   String _certCode = '';
-  String _certExpireTime = '';
+  String _expiredCertCode = '';
   bool _isCertLoading = false;
 
   @override
@@ -52,23 +72,178 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
     // 초기 로딩 시 상담사 목록 및 디바이스 목록 조회
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (gFFI.userModel.isLogin) {
-        _fetchCounselors(showLoading: true);
-        _fetchDevices();
-        _searchCertNo(); // 인증번호 조회
-        _startAutoRefresh();
-      }
+      _initializeLoggedInData();
     });
   }
 
-  // 자동 새로고침 시작 (5초마다, 앱 포커스 시에만)
+  void _initializeLoggedInData() {
+    if (!mounted || !gFFI.userModel.isLogin || _autoRefreshTimer != null) {
+      return;
+    }
+    _restoreRemoteSessionCache();
+    _fetchCounselors(showLoading: !widget.useNumberManagementDesign);
+    if (!widget.useNumberManagementDesign) {
+      _fetchDevices();
+    }
+    _searchCertNo();
+    _startAutoRefresh();
+  }
+
+  String get _remoteSessionCacheScope {
+    final userPkid = gFFI.userModel.userPkid.value.trim();
+    final username = gFFI.userModel.userName.value.trim();
+    final rawScope = userPkid.isNotEmpty ? userPkid : username;
+    return rawScope.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+  }
+
+  String _scopedLocalOptionKey(String prefix) {
+    final scope = _remoteSessionCacheScope;
+    return scope.isEmpty ? prefix : '$prefix-$scope';
+  }
+
+  void _restoreRemoteSessionCache() {
+    final scope = _remoteSessionCacheScope;
+    if (scope.isEmpty || scope == _restoredSessionCacheScope) return;
+
+    final cachedCertCode = bind
+        .mainGetLocalOption(
+          key: _scopedLocalOptionKey(_kLastCertCodeOptionPrefix),
+        )
+        .trim();
+    final cachedStoredAtRaw = bind
+        .mainGetLocalOption(
+          key: _scopedLocalOptionKey(_kLastCertStoredAtOptionPrefix),
+        )
+        .trim();
+    final cachedStoredAt = DateTime.tryParse(cachedStoredAtRaw)?.toUtc();
+    final cacheAge = cachedStoredAt == null
+        ? null
+        : DateTime.now().toUtc().difference(cachedStoredAt);
+    final cacheIsFresh = cachedCertCode.isNotEmpty &&
+        cachedStoredAt != null &&
+        cacheAge != null &&
+        !cacheAge.isNegative &&
+        cacheAge < _kCertDisplayLifetime;
+    final cachedRemoteId = bind
+        .mainGetLocalOption(
+          key: _scopedLocalOptionKey(_kLastRemoteIdOptionPrefix),
+        )
+        .replaceAll(' ', '');
+    _restoredSessionCacheScope = scope;
+    setState(() {
+      _certCode = cacheIsFresh ? cachedCertCode : '';
+      _expiredCertCode = '';
+      _lastDirectRemoteId = cachedRemoteId;
+      _showReconnectButton = false;
+    });
+    if (cacheIsFresh) {
+      _scheduleCertDisplayExpiry(cachedStoredAt);
+      unawaited(_refreshReconnectTargetFromLastRemoteId());
+    } else if (cachedCertCode.isNotEmpty || cachedStoredAtRaw.isNotEmpty) {
+      _persistLastCertCode('');
+    }
+  }
+
+  void _persistLastCertCode(String certCode, {DateTime? storedAt}) {
+    unawaited(bind.mainSetLocalOption(
+      key: _scopedLocalOptionKey(_kLastCertCodeOptionPrefix),
+      value: certCode,
+    ));
+    unawaited(bind.mainSetLocalOption(
+      key: _scopedLocalOptionKey(_kLastCertStoredAtOptionPrefix),
+      value: certCode.isEmpty
+          ? ''
+          : (storedAt ?? DateTime.now().toUtc()).toIso8601String(),
+    ));
+  }
+
+  void _scheduleCertDisplayExpiry(DateTime storedAt) {
+    _certDisplayExpiryTimer?.cancel();
+    final elapsed = DateTime.now().toUtc().difference(storedAt.toUtc());
+    final remainingMilliseconds =
+        _kCertDisplayLifetime.inMilliseconds - elapsed.inMilliseconds;
+    if (remainingMilliseconds <= 0) {
+      _clearDisplayedCertCode(markExpired: true);
+      return;
+    }
+    _certDisplayExpiryTimer = Timer(
+      Duration(milliseconds: remainingMilliseconds),
+      () => _clearDisplayedCertCode(markExpired: true),
+    );
+  }
+
+  void _clearDisplayedCertCode({bool markExpired = false}) {
+    _certDisplayExpiryTimer?.cancel();
+    _certDisplayExpiryTimer = null;
+    _expiredCertCode = markExpired ? _certCode : '';
+    if (mounted) {
+      setState(() {
+        _certCode = '';
+      });
+    } else {
+      _certCode = '';
+    }
+    _persistLastCertCode('');
+  }
+
+  void _rememberDirectRemoteId(String remoteId) {
+    final cleanId = remoteId.replaceAll(' ', '');
+    if (cleanId.isEmpty || cleanId == _lastDirectRemoteId) return;
+
+    if (mounted) {
+      setState(() {
+        _lastDirectRemoteId = cleanId;
+      });
+    } else {
+      _lastDirectRemoteId = cleanId;
+    }
+    unawaited(bind.mainSetLocalOption(
+      key: _scopedLocalOptionKey(_kLastRemoteIdOptionPrefix),
+      value: cleanId,
+    ));
+  }
+
+  Future<void> _refreshReconnectTargetFromLastRemoteId({
+    bool force = false,
+  }) async {
+    if (!mounted || _lastDirectRemoteId.isNotEmpty) return;
+    if (!force && _certCode.isEmpty) return;
+
+    try {
+      final lastRemoteId =
+          (await bind.mainGetLastRemoteId()).replaceAll(' ', '');
+      if (!mounted || lastRemoteId.isEmpty) return;
+      final localId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
+      if (lastRemoteId == localId) return;
+      _rememberDirectRemoteId(lastRemoteId);
+    } catch (e) {
+      debugPrint('Direct Remote: Failed to read last remote ID: $e');
+    }
+  }
+
+  Future<void> _reconnectLastRemote() async {
+    if (_lastDirectRemoteId.isEmpty) {
+      await _refreshReconnectTargetFromLastRemoteId(force: true);
+    }
+    if (!mounted) return;
+    if (_lastDirectRemoteId.isEmpty) {
+      showToast('재연결할 원격 ID를 찾을 수 없습니다');
+      return;
+    }
+    _connectToDirectRemote(_lastDirectRemoteId, automatically: false);
+  }
+
+  // 자동 새로고침 시작 (5초마다, 창 포커스와 무관하게 실행)
   void _startAutoRefresh() {
     _autoRefreshTimer?.cancel();
     _autoRefreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted && gFFI.userModel.isLogin && _isAppFocused) {
+      if (mounted && gFFI.userModel.isLogin) {
         _fetchCounselors();
-        _fetchDevices();
+        if (!widget.useNumberManagementDesign) {
+          _fetchDevices();
+        }
         _searchCertNo(); // 인증번호 조회
+        _refreshReconnectTargetFromLastRemoteId();
       }
     });
   }
@@ -82,7 +257,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     // 포커스 복귀 시 즉시 새로고침
     if (!wasFocused && _isAppFocused && mounted && gFFI.userModel.isLogin) {
       _fetchCounselors();
-      _fetchDevices();
+      if (!widget.useNumberManagementDesign) {
+        _fetchDevices();
+      }
       _searchCertNo(); // 인증번호 조회
     }
   }
@@ -93,6 +270,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
     // 자동 새로고침 중지
     _autoRefreshTimer?.cancel();
+    _autoRefreshTimer = null;
+    _directAutoConnectTimer?.cancel();
+    _directAutoConnectTimer = null;
+    _certDisplayExpiryTimer?.cancel();
+    _certDisplayExpiryTimer = null;
 
     // 사용자 로그아웃 처리
     await gFFI.userModel.reset(resetOther: true);
@@ -114,6 +296,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this); // 앱 상태 감시 해제
     _autoRefreshTimer?.cancel();
+    _directAutoConnectTimer?.cancel();
+    _certDisplayExpiryTimer?.cancel();
     _blinkController.dispose();
     super.dispose();
   }
@@ -185,6 +369,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
           setState(() {
             _counselors = newCounselors;
           });
+          _scheduleDirectRemoteAutoConnect(newCounselors);
         }
       }
     } catch (e) {
@@ -357,11 +542,18 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         if (data['success'] == true) {
+          final generatedCertCode = data['cert_code']?.toString() ?? '';
+          final storedAt = DateTime.now().toUtc();
           setState(() {
-            _certCode = data['cert_code']?.toString() ?? '';
-            _certExpireTime = data['expires_at']?.toString() ?? '';
+            _certCode = generatedCertCode;
+            _expiredCertCode = '';
+            _showReconnectButton = false;
             _message = '인증번호 생성 완료!';
           });
+          _persistLastCertCode(generatedCertCode, storedAt: storedAt);
+          if (generatedCertCode.isNotEmpty) {
+            _scheduleCertDisplayExpiry(storedAt);
+          }
           showToast('인증번호: ${_formatCertCode(_certCode)}');
         } else {
           setState(() {
@@ -391,11 +583,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
     final certCodeToCancel = _certCode;
 
-    // 먼저 UI에서 즉시 제거
-    setState(() {
-      _certCode = '';
-      _certExpireTime = '';
-    });
+    // 먼저 UI와 로컬 캐시에서 즉시 제거
+    _clearDisplayedCertCode();
 
     try {
       final username = gFFI.userModel.userName.value;
@@ -502,20 +691,25 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        if (data['success'] == true && data['exists'] == true) {
-          final newCertCode = data['cert_code']?.toString() ?? '';
-          if (newCertCode.isNotEmpty && newCertCode != _certCode) {
-            setState(() {
-              _certCode = newCertCode;
-            });
-          }
-        } else {
-          // 인증번호가 없으면 초기화
-          if (_certCode.isNotEmpty) {
-            setState(() {
-              _certCode = '';
-              _certExpireTime = '';
-            });
+        if (data['success'] == true) {
+          if (data['exists'] == true) {
+            final newCertCode = data['cert_code']?.toString() ?? '';
+            if (newCertCode.isNotEmpty &&
+                newCertCode != _certCode &&
+                newCertCode != _expiredCertCode) {
+              final storedAt = DateTime.now().toUtc();
+              setState(() {
+                _certCode = newCertCode;
+              });
+              _persistLastCertCode(newCertCode, storedAt: storedAt);
+              _scheduleCertDisplayExpiry(storedAt);
+            }
+          } else {
+            // 피원격자가 인증번호를 사용하면 서버에서는 즉시 사라질 수 있다.
+            // 화면의 번호는 생성·표시 시점부터 5분 동안 유지하고 타이머가 지운다.
+            if (_certCode.isEmpty && _expiredCertCode.isNotEmpty) {
+              _expiredCertCode = '';
+            }
           }
         }
       }
@@ -587,11 +781,30 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   }
 
   int _getAgentNum(Map<String, dynamic> agent) {
-    return agent['agent_num'] ?? 0;
+    return int.tryParse(agent['agent_num']?.toString() ?? '') ?? 0;
   }
 
   String _getMdeskId(Map<String, dynamic> agent) {
     return agent['mdesk_id']?.toString() ?? '';
+  }
+
+  String _getOwnerMdeskId(Map<String, dynamic> agent) {
+    return agent['owner_mdesk_id']?.toString() ?? '';
+  }
+
+  bool _isCurrentMdeskDirectRemote(Map<String, dynamic> agent) {
+    if (_getAgentNum(agent) != 0) return false;
+
+    final remoteId = _getMdeskId(agent).replaceAll(' ', '');
+    if (remoteId.isEmpty) return false;
+
+    final ownerMdeskId = _getOwnerMdeskId(agent).replaceAll(' ', '');
+    // `/api/{username}/agents`는 이미 현재 로그인 사용자 범위다.
+    // 구버전 API처럼 owner_mdesk_id가 누락된 응답도 직접 원격 준비로 인정한다.
+    if (ownerMdeskId.isEmpty) return true;
+
+    final localMdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
+    return localMdeskId.isNotEmpty && ownerMdeskId == localMdeskId;
   }
 
   // 인증번호 표시용 포맷: 마지막 3자리 앞에 공백 추가 (예: 3439 → "3 439", 110123 → "110 123")
@@ -864,6 +1077,335 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     }
   }
 
+  Widget _buildAgentNumberManagement(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final displayNumber =
+        _certCode.isEmpty ? '----' : _certCode.replaceAll(' ', '');
+    final showReconnectButton = _showReconnectButton;
+    final hasError = _message.isNotEmpty &&
+        !_message.contains('완료') &&
+        !_message.contains('성공');
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compactHeight = constraints.maxHeight < 500;
+        final horizontalPadding = constraints.maxWidth < 520 ? 20.0 : 40.0;
+        final cardWidth = (constraints.maxWidth - horizontalPadding * 2)
+            .clamp(180.0, 292.0)
+            .toDouble();
+
+        return Padding(
+          padding: EdgeInsets.fromLTRB(
+              horizontalPadding, compactHeight ? 12 : 20, horizontalPadding, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '상담원 번호 관리',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '상담원 번호로 간편하게 관리',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Theme.of(context)
+                      .textTheme
+                      .bodyMedium
+                      ?.color
+                      ?.withValues(alpha: 0.62),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text.rich(
+                TextSpan(
+                  style: TextStyle(
+                    fontSize: 14,
+                    height: 1.45,
+                    color: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.color
+                        ?.withValues(alpha: 0.78),
+                  ),
+                  children: [
+                    const TextSpan(text: '고객에게 '),
+                    TextSpan(
+                      text: '"787.kr"',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.primary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const TextSpan(
+                      text: ' 사이트를 안내해 주신 후 인증번호를 불러주시면 됩니다.',
+                    ),
+                  ],
+                ),
+                softWrap: true,
+              ),
+              Expanded(
+                child: Center(
+                  child: SingleChildScrollView(
+                    padding:
+                        EdgeInsets.symmetric(vertical: compactHeight ? 16 : 24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: cardWidth,
+                          height: compactHeight
+                              ? (showReconnectButton ? 264 : 205)
+                              : (showReconnectButton ? 304 : 244),
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? Theme.of(context).cardColor
+                                : const Color(0xFFFFFFFF),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: isDark
+                                  ? Colors.white.withValues(alpha: 0.08)
+                                  : const Color(0xFFE9EDF5),
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black
+                                    .withValues(alpha: isDark ? 0.22 : 0.09),
+                                blurRadius: 18,
+                                offset: const Offset(0, 8),
+                              ),
+                            ],
+                          ),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Container(
+                                width: 48,
+                                height: 48,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF8B5CF6)
+                                      .withValues(alpha: 0.11),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.person_outline,
+                                  size: 28,
+                                  color: Color(0xFF8B5CF6),
+                                ),
+                              ),
+                              const SizedBox(height: 18),
+                              AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 180),
+                                child: Text(
+                                  displayNumber,
+                                  key: ValueKey(displayNumber),
+                                  maxLines: 1,
+                                  style: TextStyle(
+                                    fontSize: 48,
+                                    fontWeight: FontWeight.w800,
+                                    color: Theme.of(context)
+                                        .textTheme
+                                        .titleLarge
+                                        ?.color,
+                                  ),
+                                ),
+                              ),
+                              if (_certCode.isNotEmpty) ...[
+                                const SizedBox(height: 8),
+                                Text(
+                                  '사용 가능한 인증번호',
+                                  style: TextStyle(
+                                    color: const Color(0xFF16A34A),
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                              if (showReconnectButton) ...[
+                                const SizedBox(height: 20),
+                                _buildAgentNumberReconnectButton(context),
+                              ],
+                            ],
+                          ),
+                        ),
+                        SizedBox(height: compactHeight ? 26 : 52),
+                        _buildAgentNumberGenerateButton(context),
+                        if (hasError) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            _message,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              color: Color(0xFFD14343),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildAgentNumberReconnectButton(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      height: 58,
+      margin: const EdgeInsets.symmetric(horizontal: 18),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF10B981), Color(0xFF0EA5E9)],
+          begin: Alignment.centerLeft,
+          end: Alignment.centerRight,
+        ),
+        borderRadius: BorderRadius.circular(14),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF0EA5E9).withValues(alpha: 0.32),
+            blurRadius: 16,
+            offset: const Offset(0, 7),
+          ),
+        ],
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: _reconnectLastRemote,
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.2),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.refresh,
+                    color: Colors.white,
+                    size: 22,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '원격 재연결',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      Text(
+                        _lastDirectRemoteId.isEmpty
+                            ? '최근 연결 대상 확인'
+                            : 'ID ${formatID(_lastDirectRemoteId)}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.84),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Icon(
+                  Icons.arrow_forward,
+                  color: Colors.white,
+                  size: 22,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAgentNumberGenerateButton(BuildContext context) {
+    final disabled = _isCertLoading;
+    return SizedBox(
+      width: 204,
+      height: 58,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: disabled
+              ? const LinearGradient(
+                  colors: [Color(0xFF9CA3AF), Color(0xFF9CA3AF)])
+              : const LinearGradient(
+                  colors: [Color(0xFF4F8BFF), Color(0xFF745CF6)]),
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: disabled
+              ? null
+              : [
+                  BoxShadow(
+                    color: const Color(0xFF5B7CFA).withValues(alpha: 0.3),
+                    blurRadius: 14,
+                    offset: const Offset(0, 7),
+                  ),
+                ],
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: disabled ? null : _generateCertNo,
+            borderRadius: BorderRadius.circular(8),
+            child: Center(
+              child: disabled
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.4,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.add_circle,
+                          size: 23,
+                          color: Colors.white,
+                        ),
+                        SizedBox(width: 9),
+                        Text(
+                          '번호 생성',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Obx(() {
@@ -900,13 +1442,24 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                 ),
               ),
               const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: loginDialog,
-                child: Text(translate("Login")),
+              RootOverlayControl(
+                size: const Size(80, 40),
+                child: ElevatedButton(
+                  onPressed: () async {
+                    await loginDialog();
+                  },
+                  child: Text(translate("Login")),
+                ),
               ),
             ],
           ),
         );
+      }
+
+      if (_autoRefreshTimer == null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _initializeLoggedInData();
+        });
       }
 
       // 유료 사용자 체크
@@ -947,11 +1500,16 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         );
       }
 
+      if (widget.useNumberManagementDesign) {
+        return _buildAgentNumberManagement(context);
+      }
+
       // 로그인된 상태 - 상담사 관리 UI
       // agent_num == 0 인 상담사 찾기 (바로 원격 연결용)
       Map<String, dynamic>? directAgent;
       for (var agent in _counselors) {
-        if (_getAgentNum(agent) == 0 && _getMdeskId(agent).isNotEmpty) {
+        if (_isCurrentMdeskDirectRemote(agent) &&
+            _getMdeskId(agent).isNotEmpty) {
           directAgent = agent;
           break;
         }
@@ -1359,7 +1917,113 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     });
   }
 
-  // agent_num == 0인 상담사을 위한 바로 원격 버튼
+  String _findReadyDirectRemoteId(List<Map<String, dynamic>> counselors) {
+    for (final agent in counselors) {
+      if (_isCurrentMdeskDirectRemote(agent)) {
+        final id = _getMdeskId(agent).replaceAll(' ', '');
+        if (id.isNotEmpty) return id;
+      }
+    }
+    return '';
+  }
+
+  void _scheduleDirectRemoteAutoConnect(List<Map<String, dynamic>> counselors) {
+    final remoteId = _findReadyDirectRemoteId(counselors);
+    if (remoteId.isEmpty) {
+      _directAutoConnectTimer?.cancel();
+      _directAutoConnectTimer = null;
+      _scheduledDirectRemoteId = '';
+      _lastAutoConnectedRemoteId = '';
+      _lastPromptedDirectRemoteId = '';
+      return;
+    }
+    _rememberDirectRemoteId(remoteId);
+    if (remoteId == _lastAutoConnectedRemoteId ||
+        remoteId == _scheduledDirectRemoteId ||
+        remoteId == _lastPromptedDirectRemoteId ||
+        remoteId == _directRemotePromptId) {
+      return;
+    }
+
+    _directAutoConnectTimer?.cancel();
+    _scheduledDirectRemoteId = remoteId;
+    _directAutoConnectTimer = Timer(const Duration(seconds: 1), () {
+      _directAutoConnectTimer = null;
+      final scheduledId = _scheduledDirectRemoteId;
+      _scheduledDirectRemoteId = '';
+      if (!mounted || scheduledId.isEmpty) return;
+      if (_findReadyDirectRemoteId(_counselors) != scheduledId) return;
+      _showDirectRemoteReadyDialog(scheduledId);
+    });
+  }
+
+  Future<void> _showDirectRemoteReadyDialog(String remoteId) async {
+    final cleanId = remoteId.replaceAll(' ', '');
+    if (cleanId.isEmpty ||
+        !mounted ||
+        _directRemotePromptId.isNotEmpty ||
+        cleanId == _lastPromptedDirectRemoteId) {
+      return;
+    }
+
+    _directRemotePromptId = cleanId;
+    _lastPromptedDirectRemoteId = cleanId;
+    debugPrint('Direct Remote: Showing ready prompt for $cleanId');
+
+    try {
+      await windowOnTop(null);
+    } catch (e) {
+      debugPrint('Direct Remote: Failed to bring main window forward: $e');
+    }
+    if (!mounted || _directRemotePromptId != cleanId) return;
+
+    if (!_showReconnectButton) {
+      setState(() {
+        _showReconnectButton = true;
+      });
+    }
+
+    final shouldConnect = await showGeneralDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      barrierLabel: '원격 연결 확인',
+      barrierColor: Colors.black.withValues(alpha: 0.6),
+      transitionDuration: Duration.zero,
+      pageBuilder: (context, animation, secondaryAnimation) =>
+          _DirectRemoteReadyDialog(remoteId: cleanId),
+    );
+
+    if (_directRemotePromptId == cleanId) {
+      _directRemotePromptId = '';
+    }
+    if (!mounted || shouldConnect != true) {
+      debugPrint('Direct Remote: Ready prompt dismissed for $cleanId');
+      return;
+    }
+    if (_findReadyDirectRemoteId(_counselors) != cleanId) {
+      _lastPromptedDirectRemoteId = '';
+      showToast('피원격자의 원격 준비가 해제되었습니다');
+      return;
+    }
+
+    _connectToDirectRemote(cleanId, automatically: true);
+  }
+
+  void _connectToDirectRemote(String remoteId, {required bool automatically}) {
+    final cleanId = remoteId.replaceAll(' ', '');
+    if (cleanId.isEmpty || !mounted) return;
+
+    _rememberDirectRemoteId(cleanId);
+    _directAutoConnectTimer?.cancel();
+    _directAutoConnectTimer = null;
+    _scheduledDirectRemoteId = '';
+    _lastAutoConnectedRemoteId = cleanId;
+    debugPrint(
+        'Direct Remote: ${automatically ? 'Connecting after ready confirmation' : 'Connecting'} to $cleanId via relay');
+    connect(context, cleanId, forceRelay: true);
+  }
+
+  // agent_num == 0인 상담사를 위한 바로 원격 버튼
   Widget _buildDirectRemoteButton(Map<String, dynamic> agent) {
     final mdeskId = _getMdeskId(agent);
     final mdeskIdClean = mdeskId.replaceAll(' ', '');
@@ -1404,11 +2068,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               borderRadius: BorderRadius.circular(16),
             ),
             child: InkWell(
-              onTap: () {
-                debugPrint(
-                    'Direct Remote: Connecting to $mdeskIdClean via relay');
-                connect(context, mdeskIdClean, forceRelay: true);
-              },
+              onTap: () =>
+                  _connectToDirectRemote(mdeskIdClean, automatically: false),
               borderRadius: BorderRadius.circular(16),
               child: Row(
                 children: [
@@ -1469,6 +2130,248 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
           ),
         );
       },
+    );
+  }
+}
+
+class _DirectRemoteReadyDialog extends StatelessWidget {
+  const _DirectRemoteReadyDialog({required this.remoteId});
+
+  final String remoteId;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Center(
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            width: 500,
+            margin: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(
+                color: const Color(0xFF7182C6),
+                width: 1.2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.28),
+                  blurRadius: 24,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+              gradient: const LinearGradient(
+                colors: [Color(0xFF172554), Color(0xFF312E81)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(21),
+              child: Stack(
+                children: [
+                  SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(30, 26, 30, 28),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 13,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(999),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.16),
+                            ),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.check_circle_outline,
+                                size: 16,
+                                color: Color(0xFFBAE6FD),
+                              ),
+                              SizedBox(width: 7),
+                              Text(
+                                '원격 준비 완료',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        Container(
+                          width: 76,
+                          height: 76,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: const Color(0xFF3B82F6),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.5),
+                              width: 2,
+                            ),
+                          ),
+                          child: const Icon(
+                            Icons.desktop_windows,
+                            size: 38,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        const Text(
+                          '원격이 준비되었습니다!',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w800,
+                            height: 1.2,
+                            letterSpacing: -0.4,
+                          ),
+                        ),
+                        const SizedBox(height: 9),
+                        Text(
+                          '피원격자가 접속 가능한 상태입니다.\n지금 원격으로 접속할까요?',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.78),
+                            fontSize: 15,
+                            height: 1.45,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 15,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.16),
+                            borderRadius: BorderRadius.circular(11),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.12),
+                            ),
+                          ),
+                          child: Text(
+                            '원격 ID  ${formatID(remoteId)}',
+                            style: const TextStyle(
+                              color: Color(0xFFDDEAFE),
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        LayoutBuilder(
+                          builder: (context, constraints) {
+                            final compact = constraints.maxWidth < 430;
+                            final cancelButton = _actionButton(
+                              label: '나중에',
+                              icon: Icons.schedule,
+                              onPressed: () => Navigator.of(context).pop(false),
+                              outlined: true,
+                            );
+                            final connectButton = _actionButton(
+                              label: '지금 접속하기',
+                              icon: Icons.arrow_forward,
+                              onPressed: () => Navigator.of(context).pop(true),
+                            );
+                            if (compact) {
+                              return Column(
+                                children: [
+                                  connectButton,
+                                  const SizedBox(height: 10),
+                                  cancelButton,
+                                ],
+                              );
+                            }
+                            return Row(
+                              children: [
+                                Expanded(child: cancelButton),
+                                const SizedBox(width: 12),
+                                Expanded(flex: 2, child: connectButton),
+                              ],
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _actionButton({
+    required String label,
+    required IconData icon,
+    required VoidCallback onPressed,
+    bool outlined = false,
+  }) {
+    final content = Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, size: 18, color: Colors.white),
+        const SizedBox(width: 7),
+        Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
+    );
+
+    if (outlined) {
+      return SizedBox(
+        height: 50,
+        child: OutlinedButton(
+          onPressed: onPressed,
+          style: OutlinedButton.styleFrom(
+            side: BorderSide(
+              color: Colors.white.withValues(alpha: 0.32),
+              width: 1.2,
+            ),
+            backgroundColor: Colors.white.withValues(alpha: 0.07),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+          child: content,
+        ),
+      );
+    }
+
+    return Container(
+      height: 50,
+      decoration: BoxDecoration(
+        color: const Color(0xFF3B82F6),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(12),
+          child: content,
+        ),
+      ),
     );
   }
 }

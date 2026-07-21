@@ -56,6 +56,9 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
   final TextEditingController _certNoController =
       TextEditingController(); // 인증번호 입력 컨트롤러
   bool _isCertNoVerified = false; // 인증번호 확인 상태
+  String _certSessionId = '';
+  String _certOwnerMdeskId = '';
+  String _certConnectionToken = '';
   bool _certNumAutoFilled = false; // certnum 파일명 파라미터로 자동 입력 완료 여부
   DateTime? _certNumAutoFilledAt; // certnum 자동 입력 시각 (자동 인증 확인 타이밍용)
   bool _clipboardChecked = false; // 클립보드 certno 확인 완료 여부
@@ -830,13 +833,28 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
 
   // 인증번호 인증 성공 후 agentnumupdate API 호출 (agentid=0)
   Future<void> _callAgentNumUpdateWithCertNo(String mdeskId) async {
+    if (_certSessionId.isEmpty ||
+        _certOwnerMdeskId.isEmpty ||
+        _certConnectionToken.isEmpty) {
+      debugPrint('MDesk CertNo AgentNumUpdate: missing cert session binding');
+      return;
+    }
     try {
       final url =
           'https://787.kr/api/agentnumupdate/$_userId/$mdeskId?agentid=0';
       debugPrint('MDesk CertNo AgentNumUpdate: Calling API: $url');
 
-      final response =
-          await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'session_id': _certSessionId,
+              'owner_mdesk_id': _certOwnerMdeskId,
+              'connection_token': _certConnectionToken,
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
       debugPrint(
           'MDesk CertNo AgentNumUpdate: Response: ${response.statusCode} - ${response.body}');
 
@@ -895,6 +913,12 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
               (responseData['mdesk_id'] ?? responseData['peer_id'] ?? '')
                   .toString()
                   .replaceAll(' ', '');
+          final ownerMdeskId =
+              (responseData['owner_mdesk_id']?.toString() ?? '')
+                  .replaceAll(' ', '');
+          final sessionId = responseData['session_id']?.toString() ?? '';
+          final connectionToken =
+              responseData['connection_token']?.toString() ?? '';
 
           debugPrint(
               'MDesk CertNo: Verified! customer_id=$customerId, mdesk_id=$verifiedMdeskId');
@@ -909,6 +933,14 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
             showToast('?몄쬆 ?ㅽ뙣: ID媛 ?쇱튂?섏? ?딆뒿?덈떎');
             return;
           }
+          if (ownerMdeskId.isEmpty ||
+              sessionId.isEmpty ||
+              connectionToken.isEmpty) {
+            debugPrint(
+                'MDesk CertNo: missing cert session binding in verify response');
+            showToast('인증 실패: 연결 정보를 확인할 수 없습니다');
+            return;
+          }
 
           // 2. agentnumupdate API 호출 (응답받은 customer_id 사용)
           final agentUrl =
@@ -916,7 +948,15 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
           debugPrint('MDesk CertNo: Calling agentnumupdate API: $agentUrl');
 
           final agentResponse = await http
-              .get(Uri.parse(agentUrl))
+              .post(
+                Uri.parse(agentUrl),
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({
+                  'session_id': sessionId,
+                  'owner_mdesk_id': ownerMdeskId,
+                  'connection_token': connectionToken,
+                }),
+              )
               .timeout(const Duration(seconds: 10));
           debugPrint(
               'MDesk CertNo: agentnumupdate Response: ${agentResponse.statusCode} - ${agentResponse.body}');
@@ -926,6 +966,9 @@ class _SimpleHomePageState extends State<SimpleHomePage> with WindowListener {
               _isCertNoVerified = true;
               _agentId = '0'; // 인증 완료 시 agentid=0으로 설정
               _userId = customerId; // 인증번호 소유자 ID로 업데이트
+              _certSessionId = sessionId;
+              _certOwnerMdeskId = ownerMdeskId;
+              _certConnectionToken = connectionToken;
             });
 
             // 옵션에 저장 (다른 모듈에서 사용할 수 있도록)

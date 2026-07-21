@@ -269,6 +269,12 @@ pub enum Data {
     #[cfg(windows)]
     ControlledSessionCount(usize),
     CmErr(String),
+    #[cfg(windows)]
+    OpenFileTransferFolder {
+        path: String,
+        selected_name: Option<String>,
+        result: Option<String>,
+    },
     CheckHwcodec,
     #[cfg(feature = "flutter")]
     VideoConnCount(Option<usize>),
@@ -655,6 +661,25 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .send(&Data::ControlledSessionCount(
                         crate::Connection::alive_conns().len()
                     ))
+                    .await
+            );
+        }
+        #[cfg(windows)]
+        Data::OpenFileTransferFolder {
+            path,
+            selected_name,
+            ..
+        } => {
+            let result = crate::ui_cm_interface::open_file_transfer_folder(path, selected_name)
+                .map(|_| String::new())
+                .unwrap_or_else(|err| err);
+            allow_err!(
+                stream
+                    .send(&Data::OpenFileTransferFolder {
+                        path: String::new(),
+                        selected_name: None,
+                        result: Some(result)
+                    })
                     .await
             );
         }

@@ -68,6 +68,8 @@ class FileModel {
   SessionID get sessionId => getSessionID();
   late final FileDialogEventLoop evtLoop;
   bool _transferEventLoopReady = false;
+  String? initialRemoteDir;
+  String? initialRemoteSelectedName;
 
   FileModel(this.parent) {
     getSessionID = () => parent.target!.sessionId;
@@ -111,6 +113,17 @@ class FileModel {
     await ensureTransferEventLoopReady();
     if (!isWeb) await localController.onReady();
     await remoteController.onReady();
+    final requestedRemoteDir = initialRemoteDir;
+    final requestedRemoteSelectedName = initialRemoteSelectedName;
+    initialRemoteDir = null;
+    initialRemoteSelectedName = null;
+    if (requestedRemoteDir != null && requestedRemoteDir.isNotEmpty) {
+      await remoteController.openDirectory(requestedRemoteDir,
+          selectName: requestedRemoteSelectedName);
+    } else if (requestedRemoteSelectedName != null &&
+        requestedRemoteSelectedName.isNotEmpty) {
+      remoteController.requestSelectName(requestedRemoteSelectedName);
+    }
   }
 
   Future<void> close() async {
@@ -342,6 +355,8 @@ class FileController {
 
   final DirectoryData Function() getOtherSideDirectoryData;
   late final SelectedItems selectedItems = SelectedItems(isLocal: isLocal);
+  String? _pendingSelectedName;
+  String? _pendingSelectedDirectory;
 
   FileController(
       {required this.isLocal,
@@ -430,7 +445,38 @@ class FileController {
     await openDirectory(directory.value.path);
   }
 
-  Future<void> openDirectory(String path, {bool isBack = false}) async {
+  void requestSelectName(String name, {String? directory}) {
+    final trimmed = name.trim();
+    if (trimmed.isNotEmpty) {
+      _pendingSelectedName = trimmed;
+      _pendingSelectedDirectory = directory;
+    }
+  }
+
+  String? takePendingSelectedName(String directory) {
+    final name = _pendingSelectedName;
+    final requestedDirectory = _pendingSelectedDirectory;
+    if (requestedDirectory != null &&
+        _normalizePathForCompare(requestedDirectory) !=
+            _normalizePathForCompare(directory)) {
+      return null;
+    }
+    _pendingSelectedName = null;
+    _pendingSelectedDirectory = null;
+    return name;
+  }
+
+  String _normalizePathForCompare(String value) {
+    var normalized =
+        value.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '');
+    if (options.value.isWindows) {
+      normalized = normalized.toLowerCase();
+    }
+    return normalized;
+  }
+
+  Future<void> openDirectory(String path,
+      {bool isBack = false, String? selectName}) async {
     if (path == ".") {
       refresh();
       return;
@@ -450,6 +496,9 @@ class FileController {
       if (path[path.length - 1] != '\\') {
         path = "$path\\";
       }
+    }
+    if (selectName != null) {
+      requestSelectName(selectName, directory: path);
     }
     try {
       final fd = await fileFetcher.fetchDirectory(path, isLocal, showHidden);
