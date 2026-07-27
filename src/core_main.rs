@@ -46,6 +46,7 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     crate::load_custom_client();
     config::apply_product_default_settings();
+    config::persist_recording_options();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process

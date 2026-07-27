@@ -21,6 +21,7 @@ import 'package:get/get.dart';
 import 'package:bot_toast/bot_toast.dart';
 
 import '../../common/widgets/dialog.dart';
+import '../../models/model.dart';
 import '../../models/platform_model.dart';
 
 class _MenuTheme {
@@ -49,6 +50,9 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   String? peerId;
   bool _isScreenRectSet = false;
   int? _display;
+  Timer? _connectionDurationTimer;
+  final _connectionDurationTick = 0.obs;
+  final Map<String, DateTime> _connectedAt = {};
 
   var connectionMap = RxList<Widget>.empty(growable: true);
 
@@ -114,6 +118,11 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   void initState() {
     super.initState();
 
+    _connectionDurationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _connectionDurationTick.value++;
+      _syncRecordingStates();
+    });
+
     if (!_isScreenRectSet) {
       Future.delayed(Duration.zero, () {
         restoreWindowPosition(
@@ -126,6 +135,44 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         );
       });
     }
+  }
+
+  @override
+  void dispose() {
+    _connectionDurationTimer?.cancel();
+    super.dispose();
+  }
+
+  void _syncRecordingStates() {
+    for (final tab in tabController.state.value.tabs) {
+      if (!Get.isRegistered<FFI>(tag: tab.key)) {
+        continue;
+      }
+      final ffi = Get.find<FFI>(tag: tab.key);
+      final active = bind.sessionGetIsRecording(sessionId: ffi.sessionId);
+      ffi.recordingModel.updateStatus(active);
+    }
+  }
+
+  String _formatConnectionDuration(DateTime connectedAt) {
+    final elapsed = DateTime.now().difference(connectedAt);
+    final hours = elapsed.inHours.toString().padLeft(2, '0');
+    final minutes = (elapsed.inMinutes % 60).toString().padLeft(2, '0');
+    final seconds = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
+    return '$hours:$minutes:$seconds';
+  }
+
+  String _formatAutoDisconnectCountdown(int remainingSeconds) {
+    final minutes = (remainingSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (remainingSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  Widget _buildBasicTab(Widget icon, Widget label) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [icon, label],
+    );
   }
 
   @override
@@ -142,14 +189,58 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         tabBuilder: (key, icon, label, themeConf) => Obx(() {
           final connectionType = ConnectionTypeState.find(key);
           if (!connectionType.isValid()) {
-            return Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                icon,
-                label,
-              ],
-            );
+            _connectedAt.remove(key);
+            return _buildBasicTab(icon, label);
+          }
+
+          final tabIndex = tabController.state.value.tabs
+              .indexWhere((tab) => tab.key == key);
+          if (tabIndex < 0) {
+            return _buildBasicTab(icon, label);
+          }
+          final page = tabController.state.value.tabs[tabIndex].page;
+          if (page is! RemotePage) {
+            return _buildBasicTab(icon, label);
+          }
+
+          // RemotePage registers its FFI in initState. The tab bar can be built
+          // before that state exists, so never dereference RemotePage.ffi here.
+          // The clock tick retries this safe lookup and keeps the basic label
+          // visible until the session model is ready.
+          _connectionDurationTick.value;
+          if (!Get.isRegistered<FFI>(tag: key)) {
+            _connectedAt.remove(key);
+            return _buildBasicTab(icon, label);
+          }
+          final ffi = Get.find<FFI>(tag: key);
+          final ffiModel = ffi.ffiModel;
+          final recordingModel = ffi.recordingModel;
+          final pi = ffiModel.pi;
+          final peerInfoReady = pi.isSet.value;
+          if (!peerInfoReady) {
+            _connectedAt.remove(key);
+            return _buildBasicTab(icon, label);
           } else {
+            final connectedAt = _connectedAt.putIfAbsent(key, DateTime.now);
+            final localIp = pi.localIp.trim();
+            final ipValue = localIp.isEmpty ? '-' : localIp;
+            final displayIp = localIp.isEmpty ? 'IP: -' : localIp;
+            final duration = _formatConnectionDuration(connectedAt);
+            final autoDisconnectStatusKnown =
+                ffiModel.autoDisconnectStatusKnown.value;
+            final autoDisconnectEnabled = ffiModel.autoDisconnectEnabled.value;
+            final autoDisconnectRemainingSeconds =
+                ffiModel.estimatedAutoDisconnectRemainingSeconds;
+            final autoDisconnectDisabled =
+                autoDisconnectStatusKnown && !autoDisconnectEnabled;
+            final autoDisconnectText = !autoDisconnectStatusKnown
+                ? '종료 --:--'
+                : '종료 ${_formatAutoDisconnectCountdown(autoDisconnectRemainingSeconds)}';
+            final autoDisconnectTooltip = !autoDisconnectStatusKnown
+                ? '자동 종료 상태 확인 중'
+                : !autoDisconnectEnabled
+                    ? '피원격자 자동 종료 설정이 꺼져 있음'
+                    : '자동 종료까지 ${_formatAutoDisconnectCountdown(autoDisconnectRemainingSeconds)}';
             bool secure =
                 connectionType.secure.value == ConnectionType.strSecure;
             bool direct =
@@ -181,7 +272,72 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
                     height: themeConf.iconSize,
                   ).paddingOnly(right: 5),
                 ),
-                label,
+                AnimatedBuilder(
+                  animation: recordingModel,
+                  builder: (context, _) {
+                    // The native event can arrive before the tab's Flutter
+                    // model is attached. The tab already refreshes once per
+                    // second for its duration label, so also read the native
+                    // recording state here as a reliable fallback.
+                    final active = recordingModel.start ||
+                        bind.sessionGetIsRecording(sessionId: ffi.sessionId);
+                    return active
+                        ? const _BlinkingRecordingIndicator()
+                            .paddingOnly(right: 4)
+                        : const SizedBox.shrink();
+                  },
+                ),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 200),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      label,
+                      Tooltip(
+                        message:
+                            '$autoDisconnectTooltip\n${translate('Local IP')}: $ipValue\n${translate('Connection duration')}: $duration',
+                        child: Text.rich(
+                          TextSpan(
+                            style: TextStyle(
+                              fontSize: 9,
+                              height: 1,
+                              letterSpacing: -0.2,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withAlpha(170),
+                            ),
+                            children: [
+                              if (autoDisconnectDisabled)
+                                const WidgetSpan(
+                                  alignment: PlaceholderAlignment.middle,
+                                  child: Icon(
+                                    Icons.timer_off_outlined,
+                                    size: 11,
+                                    color: Color(0xFFFF4F9A),
+                                  ),
+                                )
+                              else
+                                TextSpan(
+                                  text: autoDisconnectText,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFFFF4F9A),
+                                  ),
+                                ),
+                              TextSpan(
+                                text: '  $displayIp · $duration',
+                              ),
+                            ],
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
                 unreadMessageCountBuilder(UnreadChatCountState.find(key))
                     .marginOnly(left: 4),
               ],
@@ -192,10 +348,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
                 if (e.kind != ui.PointerDeviceKind.mouse) {
                   return;
                 }
-                final remotePage = tabController.state.value.tabs
-                    .firstWhere((tab) => tab.key == key)
-                    .page as RemotePage;
-                if (remotePage.ffi.ffiModel.pi.isSet.isTrue && e.buttons == 2) {
+                if (ffiModel.pi.isSet.isTrue && e.buttons == 2) {
                   showRightMenu(
                     (CancelFunc cancelFunc) {
                       return _tabMenuBuilder(key, cancelFunc);
@@ -353,6 +506,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   }
 
   void onRemoveId(String id) async {
+    _connectedAt.remove(id);
     if (tabController.state.value.tabs.isEmpty) {
       // Keep calling until the window status is hidden.
       //
@@ -546,5 +700,53 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     }
     _update_remote_count();
     return returnValue;
+  }
+}
+
+class _BlinkingRecordingIndicator extends StatefulWidget {
+  const _BlinkingRecordingIndicator();
+
+  @override
+  State<_BlinkingRecordingIndicator> createState() =>
+      _BlinkingRecordingIndicatorState();
+}
+
+class _BlinkingRecordingIndicatorState
+    extends State<_BlinkingRecordingIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    )..repeat(reverse: true);
+    _opacity = Tween<double>(begin: 0.15, end: 1).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: translate('Recording'),
+      child: FadeTransition(
+        opacity: _opacity,
+        child: const Icon(
+          Icons.fiber_manual_record,
+          size: 12,
+          color: Color(0xFFFF3B30),
+        ),
+      ),
+    );
   }
 }

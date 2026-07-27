@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import '../../common.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
+import '../../models/state_model.dart';
 import 'login.dart';
 import '../../utils/device_register_service.dart';
 
@@ -19,6 +20,8 @@ const String _kLastCertStoredAtOptionPrefix =
     'custom-remote-last-cert-stored-at';
 const String _kLastRemoteIdOptionPrefix = 'custom-remote-last-peer-id';
 const Duration _kCertDisplayLifetime = Duration(minutes: 5);
+const String _kMdeskMiniAutoConnectPasswordPreset =
+    '__MDESKMINI_AUTO_CONNECT_V1__';
 
 class CustomRemoteView extends StatefulWidget {
   final EdgeInsets? menuPadding;
@@ -43,8 +46,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   String _message = '';
   late AnimationController _blinkController;
   Timer? _autoRefreshTimer; // 자동 새로고침 타이머
+  Timer? _certStatusRefreshTimer;
   Timer? _directAutoConnectTimer;
   Timer? _certDisplayExpiryTimer;
+  Worker? _remoteConnectedWorker;
   String _scheduledDirectRemoteId = '';
   String _lastAutoConnectedRemoteId = '';
   String _lastPromptedDirectRemoteId = '';
@@ -58,6 +63,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   String _certCode = '';
   String _expiredCertCode = '';
   bool _isCertLoading = false;
+  bool _isSearchingCertStatus = false;
+  String _certReadinessStage = 'waiting';
+  int _certReadinessProgress = 0;
+  String _certReadinessMessage = '인증번호 생성을 기다리는 중입니다.';
+  String _certReadinessRemoteId = '';
 
   @override
   void initState() {
@@ -69,6 +79,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       vsync: this,
       duration: const Duration(milliseconds: 800),
     )..repeat(reverse: true);
+    _remoteConnectedWorker = ever<String>(
+      stateGlobal.remoteConnectedPeerId,
+      _handleRemoteConnectionCompleted,
+    );
 
     // 초기 로딩 시 상담사 목록 및 디바이스 목록 조회
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -133,11 +147,17 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     setState(() {
       _certCode = cacheIsFresh ? cachedCertCode : '';
       _expiredCertCode = '';
+      _certReadinessStage = cacheIsFresh ? 'issued' : 'waiting';
+      _certReadinessProgress = 0;
+      _certReadinessMessage =
+          cacheIsFresh ? '피원격자의 프로그램 실행을 기다리는 중입니다.' : '인증번호 생성을 기다리는 중입니다.';
+      _certReadinessRemoteId = '';
       _lastDirectRemoteId = cachedRemoteId;
       _showReconnectButton = false;
     });
     if (cacheIsFresh) {
       _scheduleCertDisplayExpiry(cachedStoredAt);
+      _startCertStatusRefresh();
       unawaited(_refreshReconnectTargetFromLastRemoteId());
     } else if (cachedCertCode.isNotEmpty || cachedStoredAtRaw.isNotEmpty) {
       _persistLastCertCode('');
@@ -172,16 +192,66 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     );
   }
 
+  bool get _needsFastCertStatusRefresh =>
+      _certCode.isNotEmpty &&
+      _certReadinessStage != 'ready' &&
+      _certReadinessStage != 'connecting';
+
+  void _startCertStatusRefresh() {
+    if (!_needsFastCertStatusRefresh || _certStatusRefreshTimer != null) {
+      return;
+    }
+    _certStatusRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_needsFastCertStatusRefresh) {
+        _stopCertStatusRefresh();
+        return;
+      }
+      unawaited(_searchCertNo());
+    });
+  }
+
+  void _stopCertStatusRefresh() {
+    _certStatusRefreshTimer?.cancel();
+    _certStatusRefreshTimer = null;
+  }
+
+  void _resetCertReadinessState() {
+    _certReadinessStage = 'waiting';
+    _certReadinessProgress = 0;
+    _certReadinessMessage = '인증번호 생성을 기다리는 중입니다.';
+    _certReadinessRemoteId = '';
+  }
+
+  void _handleRemoteConnectionCompleted(String peerId) {
+    final connectedPeerId = peerId.replaceAll(' ', '').trim();
+    final expectedPeerId = _certReadinessRemoteId.replaceAll(' ', '').trim();
+    if (!mounted ||
+        _certReadinessStage != 'connecting' ||
+        connectedPeerId.isEmpty ||
+        connectedPeerId != expectedPeerId) {
+      return;
+    }
+
+    setState(() {
+      _certReadinessStage = 'connected';
+      _certReadinessProgress = 100;
+      _certReadinessMessage = '원격 연결에 성공했습니다.';
+    });
+  }
+
   void _clearDisplayedCertCode({bool markExpired = false}) {
+    _stopCertStatusRefresh();
     _certDisplayExpiryTimer?.cancel();
     _certDisplayExpiryTimer = null;
     _expiredCertCode = markExpired ? _certCode : '';
     if (mounted) {
       setState(() {
         _certCode = '';
+        _resetCertReadinessState();
       });
     } else {
       _certCode = '';
+      _resetCertReadinessState();
     }
     _persistLastCertCode('');
   }
@@ -271,6 +341,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     // 자동 새로고침 중지
     _autoRefreshTimer?.cancel();
     _autoRefreshTimer = null;
+    _stopCertStatusRefresh();
     _directAutoConnectTimer?.cancel();
     _directAutoConnectTimer = null;
     _certDisplayExpiryTimer?.cancel();
@@ -296,8 +367,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this); // 앱 상태 감시 해제
     _autoRefreshTimer?.cancel();
+    _certStatusRefreshTimer?.cancel();
     _directAutoConnectTimer?.cancel();
     _certDisplayExpiryTimer?.cancel();
+    _remoteConnectedWorker?.dispose();
     _blinkController.dispose();
     super.dispose();
   }
@@ -366,9 +439,20 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
             }
           }
 
+          final readyDirectRemoteId = _findReadyDirectRemoteId(newCounselors);
           setState(() {
             _counselors = newCounselors;
+            if (_certCode.isNotEmpty && readyDirectRemoteId.isNotEmpty) {
+              _certReadinessStage = 'ready';
+              _certReadinessProgress = 85;
+              _certReadinessMessage = '원격 연결 준비가 완료되었습니다.';
+              _certReadinessRemoteId = readyDirectRemoteId;
+            }
           });
+          if (readyDirectRemoteId.isNotEmpty) {
+            _rememberDirectRemoteId(readyDirectRemoteId);
+            _stopCertStatusRefresh();
+          }
           _scheduleDirectRemoteAutoConnect(newCounselors);
         }
       }
@@ -547,12 +631,17 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
           setState(() {
             _certCode = generatedCertCode;
             _expiredCertCode = '';
+            _certReadinessStage = 'issued';
+            _certReadinessProgress = 0;
+            _certReadinessMessage = '피원격자의 프로그램 실행을 기다리는 중입니다.';
+            _certReadinessRemoteId = '';
             _showReconnectButton = false;
             _message = '인증번호 생성 완료!';
           });
           _persistLastCertCode(generatedCertCode, storedAt: storedAt);
           if (generatedCertCode.isNotEmpty) {
             _scheduleCertDisplayExpiry(storedAt);
+            _startCertStatusRefresh();
           }
           showToast('인증번호: ${_formatCertCode(_certCode)}');
         } else {
@@ -651,6 +740,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
   // 인증번호 조회 API 호출
   Future<void> _searchCertNo() async {
+    if (_isSearchingCertStatus) return;
+    _isSearchingCertStatus = true;
     try {
       final username = gFFI.userModel.userName.value;
       final mdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
@@ -694,6 +785,14 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         if (data['success'] == true) {
           if (data['exists'] == true) {
             final newCertCode = data['cert_code']?.toString() ?? '';
+            final stage = data['stage']?.toString().trim() ?? '';
+            final progress =
+                int.tryParse(data['progress']?.toString() ?? '') ?? 0;
+            final progressMessage =
+                data['progress_message']?.toString().trim() ?? '';
+            final remoteId =
+                data['remote_mdesk_id']?.toString().replaceAll(' ', '') ?? '';
+            final wasReady = _certReadinessStage == 'ready';
             if (newCertCode.isNotEmpty &&
                 newCertCode != _certCode &&
                 newCertCode != _expiredCertCode) {
@@ -703,6 +802,27 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               });
               _persistLastCertCode(newCertCode, storedAt: storedAt);
               _scheduleCertDisplayExpiry(storedAt);
+            }
+            if (mounted && stage.isNotEmpty) {
+              setState(() {
+                _certReadinessStage = stage;
+                _certReadinessProgress = progress.clamp(0, 100).toInt();
+                _certReadinessMessage = progressMessage.isNotEmpty
+                    ? progressMessage
+                    : _defaultCertReadinessMessage(stage);
+                _certReadinessRemoteId = remoteId;
+              });
+              if (remoteId.isNotEmpty) {
+                _rememberDirectRemoteId(remoteId);
+              }
+              if (stage == 'ready') {
+                _stopCertStatusRefresh();
+                if (!wasReady) {
+                  unawaited(_fetchCounselors());
+                }
+              } else {
+                _startCertStatusRefresh();
+              }
             }
           } else {
             // 피원격자가 인증번호를 사용하면 서버에서는 즉시 사라질 수 있다.
@@ -715,10 +835,33 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       }
     } catch (e) {
       debugPrint('CertNo Search Error: $e');
+    } finally {
+      _isSearchingCertStatus = false;
     }
   }
 
   // 상담사 삭제
+  String _defaultCertReadinessMessage(String stage) {
+    switch (stage) {
+      case 'issued':
+        return '피원격자의 프로그램 실행을 기다리는 중입니다.';
+      case 'verified':
+        return '피원격자가 인증번호를 확인했습니다.';
+      case 'preparing':
+        return '원격 서비스를 준비하는 중입니다.';
+      case 'service_ready':
+        return '원격 제어 기능을 시작하는 중입니다.';
+      case 'ready':
+        return '원격 연결 준비가 완료되었습니다.';
+      case 'connecting':
+        return '릴레이 서버로 연결하는 중입니다.';
+      case 'connected':
+        return '원격 연결에 성공했습니다.';
+      default:
+        return '원격 연결 상태를 확인하는 중입니다.';
+    }
+  }
+
   Future<void> _deleteCounselor(int agentNum) async {
     setState(() {
       _isLoading = true;
@@ -1077,6 +1220,175 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     }
   }
 
+  String get _certReadinessTitle {
+    switch (_certReadinessStage) {
+      case 'issued':
+        return '피원격자 실행 대기';
+      case 'verified':
+        return '인증번호 확인 완료';
+      case 'preparing':
+        return '원격 서비스 준비 중';
+      case 'service_ready':
+        return '원격 제어 시작 중';
+      case 'ready':
+        return '원격 준비 완료';
+      case 'connecting':
+        return '원격 연결 중';
+      case 'connected':
+        return '원격 연결 성공';
+      default:
+        return '원격 연결 준비';
+    }
+  }
+
+  IconData get _certReadinessIcon {
+    switch (_certReadinessStage) {
+      case 'verified':
+        return Icons.verified_user_outlined;
+      case 'preparing':
+        return Icons.settings_outlined;
+      case 'service_ready':
+        return Icons.desktop_windows_outlined;
+      case 'ready':
+        return Icons.check_circle_outline;
+      case 'connecting':
+        return Icons.sync;
+      case 'connected':
+        return Icons.check_circle;
+      default:
+        return Icons.hourglass_top_rounded;
+    }
+  }
+
+  Color _certReadinessColor(BuildContext context) {
+    switch (_certReadinessStage) {
+      case 'verified':
+        return const Color(0xFF7C3AED);
+      case 'preparing':
+        return const Color(0xFF2563EB);
+      case 'service_ready':
+        return const Color(0xFF0284C7);
+      case 'ready':
+        return const Color(0xFF16A34A);
+      case 'connecting':
+        return const Color(0xFF0D9488);
+      case 'connected':
+        return const Color(0xFF16A34A);
+      default:
+        return const Color(0xFFF97316);
+    }
+  }
+
+  Widget _buildCertReadinessProgress(
+    BuildContext context, {
+    bool compact = false,
+  }) {
+    final color = _certReadinessColor(context);
+    final progress = (_certReadinessProgress / 100).clamp(0.0, 1.0).toDouble();
+    final remoteId = _certReadinessRemoteId;
+
+    return Container(
+      width: double.infinity,
+      margin: compact ? const EdgeInsets.symmetric(horizontal: 18) : null,
+      padding: EdgeInsets.symmetric(
+        horizontal: compact ? 14 : 18,
+        vertical: compact ? 12 : 15,
+      ),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: compact ? 32 : 38,
+                height: compact ? 32 : 38,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.14),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  _certReadinessIcon,
+                  color: color,
+                  size: compact ? 18 : 21,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  _certReadinessTitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: compact ? 13 : 15,
+                    fontWeight: FontWeight.w700,
+                    color: Theme.of(context).textTheme.titleMedium?.color,
+                  ),
+                ),
+              ),
+              Text(
+                '$_certReadinessProgress%',
+                style: TextStyle(
+                  color: color,
+                  fontSize: compact ? 12 : 14,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: compact ? 10 : 12),
+          TweenAnimationBuilder<double>(
+            tween: Tween<double>(begin: 0, end: progress),
+            duration: const Duration(milliseconds: 420),
+            curve: Curves.easeOutCubic,
+            builder: (context, value, child) => ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: LinearProgressIndicator(
+                value: value,
+                minHeight: compact ? 7 : 9,
+                color: color,
+                backgroundColor: color.withValues(alpha: 0.14),
+              ),
+            ),
+          ),
+          SizedBox(height: compact ? 8 : 10),
+          Text(
+            _certReadinessMessage,
+            maxLines: compact ? 1 : 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: compact ? 11 : 13,
+              height: 1.35,
+              color: Theme.of(context)
+                  .textTheme
+                  .bodyMedium
+                  ?.color
+                  ?.withValues(alpha: 0.72),
+            ),
+          ),
+          if (remoteId.isNotEmpty &&
+              (_certReadinessStage == 'ready' ||
+                  _certReadinessStage == 'connecting' ||
+                  _certReadinessStage == 'connected')) ...[
+            const SizedBox(height: 5),
+            Text(
+              '원격 ID  ${formatID(remoteId)}',
+              style: TextStyle(
+                color: color,
+                fontSize: compact ? 10 : 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _buildAgentNumberManagement(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final displayNumber =
@@ -1157,9 +1469,12 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                       children: [
                         Container(
                           width: cardWidth,
-                          height: compactHeight
-                              ? (showReconnectButton ? 264 : 205)
-                              : (showReconnectButton ? 304 : 244),
+                          height: (compactHeight
+                                  ? (showReconnectButton ? 264 : 205)
+                                  : (showReconnectButton ? 304 : 244)) +
+                              (_certCode.isNotEmpty
+                                  ? (compactHeight ? 118 : 126)
+                                  : 0),
                           decoration: BoxDecoration(
                             color: isDark
                                 ? Theme.of(context).cardColor
@@ -1222,6 +1537,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                     fontSize: 12,
                                     fontWeight: FontWeight.w600,
                                   ),
+                                ),
+                                const SizedBox(height: 14),
+                                _buildCertReadinessProgress(
+                                  context,
+                                  compact: true,
                                 ),
                               ],
                               if (showReconnectButton) ...[
@@ -1569,6 +1889,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                   ],
                 ),
               ),
+              const SizedBox(height: 12),
+              _buildCertReadinessProgress(context),
               const SizedBox(height: 12),
             ],
             // agent_num == 0인 상담사이 있으면 바로 원격 버튼 표시
@@ -2018,9 +2340,21 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     _directAutoConnectTimer = null;
     _scheduledDirectRemoteId = '';
     _lastAutoConnectedRemoteId = cleanId;
+    _stopCertStatusRefresh();
+    setState(() {
+      _certReadinessStage = 'connecting';
+      _certReadinessProgress = 95;
+      _certReadinessMessage = '릴레이 서버로 연결하는 중입니다.';
+      _certReadinessRemoteId = cleanId;
+    });
     debugPrint(
         'Direct Remote: ${automatically ? 'Connecting after ready confirmation' : 'Connecting'} to $cleanId via relay');
-    connect(context, cleanId, forceRelay: true);
+    connect(
+      context,
+      cleanId,
+      forceRelay: true,
+      password: _kMdeskMiniAutoConnectPasswordPreset,
+    );
   }
 
   // agent_num == 0인 상담사를 위한 바로 원격 버튼

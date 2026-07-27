@@ -449,6 +449,46 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::RecordScreen(start));
     }
 
+    pub fn save_recording_note(&self, title: String, comment: String) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (files, peer_id, session_id) = {
+            let mut lc = self.lc.write().unwrap();
+            lc.record_state = false;
+            (
+                lc.recording_files.clone(),
+                lc.get_id().to_owned(),
+                lc.session_id,
+            )
+        };
+        // If the connection is still active, stop the recorder before updating
+        // the finalized file. If it has already disconnected, the recorder has
+        // already been dropped and the local save can still complete.
+        self.send(Data::RecordScreen(false));
+        crate::recording_note::save_recording_notes(
+            files,
+            crate::recording_note::RecordingNoteContext {
+                title,
+                comment,
+                peer_id,
+                session_id,
+                role: "controller",
+            },
+            Some(tx),
+        );
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => {
+                let mut lc = self.lc.write().unwrap();
+                if result.error.is_empty() {
+                    lc.recording_files.clear();
+                } else {
+                    lc.recording_files = result.files;
+                }
+                result.error
+            }
+            Err(_) => "녹화 작업내용 저장 시간이 초과되었습니다.".to_owned(),
+        }
+    }
+
     pub fn is_screenshot_supported(&self) -> bool {
         crate::common::is_support_screenshot_num(self.lc.read().unwrap().version)
     }
@@ -458,7 +498,7 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn is_recording(&self) -> bool {
-        self.lc.read().unwrap().record_state
+        self.lc.read().unwrap().record_active
     }
 
     pub fn save_custom_image_quality(&self, custom_image_quality: i32) {
@@ -1706,6 +1746,7 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn cancel_msgbox(&self, tag: &str);
     fn switch_back(&self, id: &str);
     fn portable_service_running(&self, running: bool);
+    fn auto_disconnect_status(&self, _enabled: bool, _remaining_seconds: u64) {}
     fn on_voice_call_started(&self);
     fn on_voice_call_closed(&self, reason: &str);
     fn on_voice_call_waiting(&self);

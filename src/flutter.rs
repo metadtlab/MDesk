@@ -933,6 +933,15 @@ impl InvokeUiSession for FlutterHandler {
             &[
                 ("username", &pi.username),
                 ("hostname", &pi.hostname),
+                ("local_ip", &pi.local_ip),
+                (
+                    "auto_disconnect_enabled",
+                    &pi.auto_disconnect_enabled.to_string(),
+                ),
+                (
+                    "auto_disconnect_timeout_seconds",
+                    &pi.auto_disconnect_timeout_seconds.to_string(),
+                ),
                 ("platform", &pi.platform),
                 ("sas_enabled", &pi.sas_enabled.to_string()),
                 ("displays", &displays),
@@ -1078,6 +1087,17 @@ impl InvokeUiSession for FlutterHandler {
         self.push_event(
             "portable_service_running",
             &[("running", running.to_string().as_str())],
+            &[],
+        );
+    }
+
+    fn auto_disconnect_status(&self, enabled: bool, remaining_seconds: u64) {
+        self.push_event(
+            "auto_disconnect_status",
+            &[
+                ("enabled", enabled.to_string()),
+                ("remaining_seconds", remaining_seconds.to_string()),
+            ],
             &[],
         );
     }

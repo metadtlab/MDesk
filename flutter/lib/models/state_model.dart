@@ -19,6 +19,7 @@ class StateGlobal {
   final RxBool showRemoteToolBar = false.obs;
   final svcStatus = SvcStatus.notReady.obs;
   final RxInt videoConnCount = 0.obs;
+  final RxString remoteConnectedPeerId = ''.obs;
   final RxBool isFocused = false.obs;
   // for mobile and web
   bool isInMainPage = true;
@@ -28,10 +29,10 @@ class StateGlobal {
 
   final updateUrl = ''.obs;
   final latestVersion = ''.obs;
-  
+
   // 강제 업데이트 관련
-  final forceUpdate = false.obs;  // 강제 업데이트 필요 여부
-  final forceUpdateMessage = ''.obs;  // 강제 업데이트 메시지
+  final forceUpdate = false.obs; // 강제 업데이트 필요 여부
+  final forceUpdateMessage = ''.obs; // 강제 업데이트 메시지
 
   String _inputSource = '';
 
@@ -76,6 +77,16 @@ class StateGlobal {
   }
 
   setMinimized(bool v) => _isMinimized = v;
+
+  void notifyRemoteConnected(String peerId) {
+    final normalizedPeerId = peerId.replaceAll(' ', '').trim();
+    if (normalizedPeerId.isEmpty) return;
+    if (remoteConnectedPeerId.value == normalizedPeerId) {
+      remoteConnectedPeerId.refresh();
+    } else {
+      remoteConnectedPeerId.value = normalizedPeerId;
+    }
+  }
 
   setFullscreen(bool v, {bool procWnd = true}) {
     if (_fullscreen.value != v) {

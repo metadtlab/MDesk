@@ -84,6 +84,38 @@ pub static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub static MOUSE_MOVE_TIME: AtomicI64 = AtomicI64::new(0);
 
+const DEFAULT_AUTO_DISCONNECT_TIMEOUT_MINUTES: u64 = 10;
+
+fn normalize_auto_disconnect_timeout(value: &str) -> u64 {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|minute| (10..=60).contains(minute) && minute % 10 == 0)
+        .unwrap_or(DEFAULT_AUTO_DISCONNECT_TIMEOUT_MINUTES)
+}
+
+#[cfg(test)]
+mod auto_disconnect_timeout_tests {
+    use super::{normalize_auto_disconnect_timeout, DEFAULT_AUTO_DISCONNECT_TIMEOUT_MINUTES};
+
+    #[test]
+    fn accepts_only_ten_minute_steps_up_to_one_hour() {
+        for minute in [10, 20, 30, 40, 50, 60] {
+            assert_eq!(
+                normalize_auto_disconnect_timeout(&minute.to_string()),
+                minute
+            );
+        }
+
+        for invalid in ["", "0", "9", "11", "59", "61", "invalid"] {
+            assert_eq!(
+                normalize_auto_disconnect_timeout(invalid),
+                DEFAULT_AUTO_DISCONNECT_TIMEOUT_MINUTES
+            );
+        }
+    }
+}
+
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 lazy_static::lazy_static! {
@@ -977,8 +1009,10 @@ impl Connection {
                 _ = second_timer.tick() => {
                     #[cfg(windows)]
                     conn.portable_check();
+                    conn.sync_auto_disconnect_timer();
+                    conn.send_auto_disconnect_status().await;
                     if let Some((instant, minute)) = conn.auto_disconnect_timer.as_ref() {
-                        if instant.elapsed().as_secs() > minute * 60 {
+                        if instant.elapsed().as_secs() >= minute * 60 {
                             conn.send_close_reason_no_retry("Connection failed due to inactivity").await;
                             conn.on_close("auto disconnect", true).await;
                             break;
@@ -1700,9 +1734,14 @@ impl Connection {
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
         let mut res = LoginResponse::new();
+        let auto_disconnect_timeout_seconds =
+            Self::get_auto_disconnect_timeout().unwrap_or_default() * 60;
         let mut pi = PeerInfo {
             username: username.clone(),
             version: VERSION.to_owned(),
+            local_ip: crate::common::client_local_ip_for_login_request(),
+            auto_disconnect_enabled: auto_disconnect_timeout_seconds > 0,
+            auto_disconnect_timeout_seconds,
             ..Default::default()
         };
 
@@ -2008,7 +2047,7 @@ impl Connection {
                 let mut s = s.write().unwrap();
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let _h = try_start_record_cursor_pos();
-                self.auto_disconnect_timer = Self::get_auto_disconenct_timer();
+                self.auto_disconnect_timer = Self::get_auto_disconnect_timer();
                 s.try_add_primay_video_service();
                 s.add_connection(self.inner.clone(), &noperms);
             }
@@ -3854,11 +3893,9 @@ impl Connection {
                             // Compatibility with old versions and sciter(remote).
                             self.refresh_video_display(None);
                         }
-                        self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::RefreshVideoDisplay(display)) => {
                         self.refresh_video_display(Some(display as usize));
-                        self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -5194,17 +5231,31 @@ impl Connection {
         self.pressed_modifiers.clear();
     }
 
-    fn get_auto_disconenct_timer() -> Option<(Instant, u64)> {
-        if Config::get_option("allow-auto-disconnect") == "Y" {
-            let mut minute: u64 = Config::get_option("auto-disconnect-timeout")
-                .parse()
-                .unwrap_or(10);
-            if minute == 0 {
-                minute = 10;
-            }
-            Some((Instant::now(), minute))
+    fn get_auto_disconnect_timeout() -> Option<u64> {
+        if Config::get_option(keys::OPTION_ALLOW_AUTO_DISCONNECT) == "Y" {
+            Some(normalize_auto_disconnect_timeout(&Config::get_option(
+                keys::OPTION_AUTO_DISCONNECT_TIMEOUT,
+            )))
         } else {
             None
+        }
+    }
+
+    fn get_auto_disconnect_timer() -> Option<(Instant, u64)> {
+        Self::get_auto_disconnect_timeout().map(|minute| (Instant::now(), minute))
+    }
+
+    fn sync_auto_disconnect_timer(&mut self) {
+        match (
+            self.auto_disconnect_timer.as_mut(),
+            Self::get_auto_disconnect_timeout(),
+        ) {
+            (Some(timer), Some(minute)) => timer.1 = minute,
+            (None, Some(minute)) => {
+                self.auto_disconnect_timer = Some((Instant::now(), minute));
+            }
+            (Some(_), None) => self.auto_disconnect_timer = None,
+            (None, None) => {}
         }
     }
 
@@ -5212,6 +5263,32 @@ impl Connection {
         self.auto_disconnect_timer
             .as_mut()
             .map(|t| t.0 = Instant::now());
+    }
+
+    async fn send_auto_disconnect_status(&mut self) {
+        let (enabled, remaining_seconds, timeout_seconds) =
+            if let Some((started_at, minute)) = self.auto_disconnect_timer.as_ref() {
+                let timeout_seconds = minute * 60;
+                (
+                    true,
+                    timeout_seconds.saturating_sub(started_at.elapsed().as_secs()),
+                    timeout_seconds,
+                )
+            } else {
+                (false, 0, 0)
+            };
+
+        let status = AutoDisconnectStatus {
+            enabled,
+            remaining_seconds,
+            timeout_seconds,
+            ..Default::default()
+        };
+        let mut misc = Misc::new();
+        misc.set_auto_disconnect_status(status);
+        let mut msg = Message::new();
+        msg.set_misc(misc);
+        self.send(msg).await;
     }
 
     #[cfg(feature = "hwcodec")]

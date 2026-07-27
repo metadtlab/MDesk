@@ -45,6 +45,61 @@ const Color _accentColor = MyTheme.accent;
 const String _kSettingPageControllerTag = 'settingPageController';
 const String _kSettingPageTabKeyTag = 'settingPageTabKey';
 
+Future<bool> _isRecordingDirectoryWritable(String directoryPath) async {
+  File? probe;
+  try {
+    final directory = Directory(directoryPath);
+    if (!await directory.exists()) {
+      return false;
+    }
+    probe = File(
+      '${directory.path}${Platform.pathSeparator}'
+      '.mdesk-recording-write-test-$pid-'
+      '${DateTime.now().microsecondsSinceEpoch}.tmp',
+    );
+    await probe.writeAsString('MDesk recording directory write test',
+        flush: true);
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    if (probe != null) {
+      try {
+        if (await probe.exists()) {
+          await probe.delete();
+        }
+      } catch (_) {
+        // A failed probe must not prevent the user-facing warning.
+      }
+    }
+  }
+}
+
+Future<void> _showRecordingDirectoryBlockedDialog(
+  BuildContext context,
+  String directoryPath,
+) {
+  return showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('녹화 저장 위치를 사용할 수 없습니다'),
+      content: SelectableText(
+        '선택한 폴더에 녹화 파일을 저장할 수 없습니다.\n\n'
+        '$directoryPath\n\n'
+        'Windows 보안의 “제어된 폴더 액세스”가 차단했을 수 있습니다. '
+        '다른 폴더(예: 다운로드\\MDesk)를 선택하거나 Windows 보안에서 '
+        'MDesk를 허용해 주세요.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(dialogContext).pop(),
+          child: const Text('확인'),
+        ),
+      ],
+    ),
+  );
+}
+
 class _TabInfo {
   late final SettingsTabKey key;
   late final String label;
@@ -156,8 +211,8 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
               tab, 'General', Icons.settings_outlined, Icons.settings));
           break;
         case SettingsTabKey.myapp:
-          settingTabs.add(_TabInfo(
-              tab, '나만의앱', Icons.apps_outlined, Icons.apps));
+          settingTabs
+              .add(_TabInfo(tab, '나만의앱', Icons.apps_outlined, Icons.apps));
           break;
         case SettingsTabKey.safety:
           settingTabs.add(_TabInfo(tab, 'Security',
@@ -180,8 +235,8 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
               _TabInfo(tab, 'Account', Icons.person_outline, Icons.person));
           break;
         case SettingsTabKey.about:
-          settingTabs
-              .add(_TabInfo(tab, 'About MDesk', Icons.info_outline, Icons.info));
+          settingTabs.add(
+              _TabInfo(tab, 'About MDesk', Icons.info_outline, Icons.info));
           break;
       }
     }
@@ -676,11 +731,14 @@ class _GeneralState extends State<_General> {
           _OptionCheckBox(context, 'Automatically record outgoing sessions',
               kOptionAllowAutoRecordOutgoing,
               isServer: false),
+        if (!bind.isIncomingOnly())
+          _OptionCheckBox(context, 'Ask for work details when recording ends',
+              kOptionRecordingNoteOnEnd,
+              isServer: false),
         if (showRootDir && !bind.isOutgoingOnly())
           Row(
             children: [
-              Text(
-                  '${translate(bind.isIncomingOnly() ? "Directory" : "Incoming")}:'),
+              Text('${translate("Controlled device recording location")}:'),
               Expanded(
                 child: GestureDetector(
                     onTap: root_dir_exists
@@ -700,8 +758,7 @@ class _GeneralState extends State<_General> {
         if (!(showRootDir && bind.isIncomingOnly()))
           Row(
             children: [
-              Text(
-                  '${translate((showRootDir && !bind.isOutgoingOnly()) ? "Outgoing" : "Directory")}:'),
+              Text('${translate("Controller recording location")}:'),
               Expanded(
                 child: GestureDetector(
                     onTap: user_dir_exists
@@ -730,9 +787,19 @@ class _GeneralState extends State<_General> {
                                   await FilePicker.platform.getDirectoryPath(
                                       initialDirectory: initialDirectory);
                               if (selectedDirectory != null) {
+                                final writable =
+                                    await _isRecordingDirectoryWritable(
+                                        selectedDirectory);
+                                if (!context.mounted) return;
+                                if (!writable) {
+                                  await _showRecordingDirectoryBlockedDialog(
+                                      context, selectedDirectory);
+                                  return;
+                                }
                                 await bind.mainSetLocalOption(
                                     key: kOptionVideoSaveDirectory,
                                     value: selectedDirectory);
+                                showToast('녹화 저장 위치가 변경되었습니다.');
                                 setState(() {});
                               }
                             },
@@ -848,7 +915,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   bool get wantKeepAlive => true;
   bool locked = bind.mainIsInstalled();
   final scrollController = ScrollController();
-  
+
   // 등록된 원격자 목록
   List<Map<String, String>> registeredUsers = [];
 
@@ -882,7 +949,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         registeredUsers = decoded.map((e) {
           final user = Map<String, String>.from(e);
           // 암호 복호화
-          if (user['connectionPassword'] != null && user['connectionPassword']!.isNotEmpty) {
+          if (user['connectionPassword'] != null &&
+              user['connectionPassword']!.isNotEmpty) {
             final encrypted = user['connectionPassword']!;
             // "00"으로 시작하지 않으면 레거시 암호 → 마이그레이션 필요
             if (!encrypted.startsWith('00')) {
@@ -893,7 +961,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           return user;
         }).toList();
         setState(() {});
-        
+
         // 레거시 암호가 있으면 새 방식으로 재암호화하여 저장
         if (needsMigration) {
           debugPrint('[Security] 레거시 암호를 XSalsa20-Poly1305로 마이그레이션 합니다');
@@ -911,11 +979,12 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       final encryptedUsers = registeredUsers.map((u) {
         final user = Map<String, String>.from(u);
         if (user['connectionPassword'] != null) {
-          user['connectionPassword'] = _encryptPassword(user['connectionPassword']!);
+          user['connectionPassword'] =
+              _encryptPassword(user['connectionPassword']!);
         }
         return user;
       }).toList();
-      
+
       await bind.mainSetLocalOption(
         key: 'registered_remote_users',
         value: jsonEncode(encryptedUsers),
@@ -925,7 +994,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     }
   }
 
-  Future<void> _addOrUpdateRemoteUser(String id, String name, String connectionPassword) async {
+  Future<void> _addOrUpdateRemoteUser(
+      String id, String name, String connectionPassword) async {
     // 로컬 목록에 추가/업데이트 후 저장
     final exists = registeredUsers.any((u) => u['id'] == id);
     if (!exists) {
@@ -955,15 +1025,17 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           remoteId: remoteId,
         );
         if (response.success) {
-          debugPrint('_removeRemoteUser: Device unregistered from server - userId=$userId, remoteId=$remoteId');
+          debugPrint(
+              '_removeRemoteUser: Device unregistered from server - userId=$userId, remoteId=$remoteId');
         } else {
-          debugPrint('_removeRemoteUser: Server unregister failed - ${response.message}');
+          debugPrint(
+              '_removeRemoteUser: Server unregister failed - ${response.message}');
         }
       }
     } catch (e) {
       debugPrint('_removeRemoteUser: Error calling unregister API - $e');
     }
-    
+
     // 로컬에서도 삭제
     registeredUsers.removeWhere((u) => u['id'] == userId);
     await _saveRegisteredUsers();
@@ -985,7 +1057,9 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               child: Column(children: [
                 permissions(context),
                 password(context),
-                _Card(title: '원격기기 등록', children: [remoteDeviceRegistration(context)]),
+                _Card(
+                    title: '원격기기 등록',
+                    children: [remoteDeviceRegistration(context)]),
                 _Card(title: '2FA', children: [tfa()]),
                 _Card(title: 'ID', children: [changeId()]),
                 more(context),
@@ -1002,36 +1076,40 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         Row(
           children: [
             // 등록된 사용자 목록 표시
-            ...registeredUsers.map((user) => Container(
-              margin: EdgeInsets.only(right: 8),
-              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: Colors.blue.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: Colors.blue.withOpacity(0.5)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.person, size: 16, color: Colors.blue),
-                  SizedBox(width: 4),
-                  Text(
-                    user['id'] ?? user['name'] ?? '',
-                    style: TextStyle(color: Colors.blue),
-                  ),
-                  SizedBox(width: 4),
-                  InkWell(
-                    onTap: () async {
-                      await _removeRemoteUser(user['id'] ?? '');
-                      setState(() {
-                        registeredUsers.remove(user);
-                      });
-                    },
-                    child: Icon(Icons.close, size: 16, color: Colors.red),
-                  ),
-                ],
-              ),
-            )).toList(),
+            ...registeredUsers
+                .map((user) => Container(
+                      margin: EdgeInsets.only(right: 8),
+                      padding:
+                          EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: Colors.blue.withOpacity(0.5)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.person, size: 16, color: Colors.blue),
+                          SizedBox(width: 4),
+                          Text(
+                            user['id'] ?? user['name'] ?? '',
+                            style: TextStyle(color: Colors.blue),
+                          ),
+                          SizedBox(width: 4),
+                          InkWell(
+                            onTap: () async {
+                              await _removeRemoteUser(user['id'] ?? '');
+                              setState(() {
+                                registeredUsers.remove(user);
+                              });
+                            },
+                            child:
+                                Icon(Icons.close, size: 16, color: Colors.red),
+                          ),
+                        ],
+                      ),
+                    ))
+                .toList(),
             // 원격자등록 버튼
             ElevatedButton.icon(
               onPressed: () => _showRemoteUserLoginDialog(context),
@@ -1246,21 +1324,23 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                         if (result['success'] == true) {
                           // 별칭이 입력되면 별칭 사용, 없으면 API에서 받아온 name 사용
                           final alias = aliasController.text.trim();
-                          final userName = alias.isNotEmpty 
-                              ? alias 
+                          final userName = alias.isNotEmpty
+                              ? alias
                               : (result['name'] ?? userId);
-                          final connPassword = connectionPasswordController.text;
-                          
+                          final connPassword =
+                              connectionPasswordController.text;
+
                           // 저장 (내부적으로 목록 업데이트 및 저장)
-                          await _addOrUpdateRemoteUser(userId, userName, connPassword);
-                          
+                          await _addOrUpdateRemoteUser(
+                              userId, userName, connPassword);
+
                           // 기기 등록 API 호출
                           final registered =
                               await _registerDeviceToServer(userId, userName);
                           if (!registered) return;
-                          
+
                           setState(() {});
-                          
+
                           Navigator.of(context).pop();
                           showToast('$userName 등록 완료');
                         } else {
@@ -1287,17 +1367,20 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   }
 
   // ignore: unused_element
-  Future<Map<String, dynamic>> _loginRemoteUser(String id, String password) async {
+  Future<Map<String, dynamic>> _loginRemoteUser(
+      String id, String password) async {
     try {
       // API 호출하여 원격자 자격 증명 검증 (토큰 갱신 없음)
-      final response = await http.post(
-        Uri.parse('$_remoteUserApiBase/api/verify_remote_user'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'username': id,
-          'password': password,
-        }),
-      ).timeout(Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse('$_remoteUserApiBase/api/verify_remote_user'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'username': id,
+              'password': password,
+            }),
+          )
+          .timeout(Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -1335,19 +1418,21 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       String id, String password) async {
     try {
       final apiServer = await _getRemoteUserApiServer();
-      final response = await http.post(
-        Uri.parse('$apiServer/api/login'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'username': id,
-          'password': password,
-          'id': await bind.mainGetMyId(),
-          'uuid': await bind.mainGetUuid(),
-          'autoLogin': true,
-          'type': HttpType.kAuthReqTypeAccount,
-          'deviceInfo': _getLoginDeviceInfo(),
-        }),
-      ).timeout(Duration(seconds: 10));
+      final response = await http
+          .post(
+            Uri.parse('$apiServer/api/login'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'username': id,
+              'password': password,
+              'id': await bind.mainGetMyId(),
+              'uuid': await bind.mainGetUuid(),
+              'autoLogin': true,
+              'type': HttpType.kAuthReqTypeAccount,
+              'deviceInfo': _getLoginDeviceInfo(),
+            }),
+          )
+          .timeout(Duration(seconds: 10));
 
       return await _handleRemoteUserAuthResponse(apiServer, response, id);
     } catch (e) {
@@ -1409,9 +1494,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     if (response.statusCode != 200) {
       return {
         'success': false,
-        'message': data['error'] ??
-            data['message'] ??
-            '서버 오류: ${response.statusCode}',
+        'message':
+            data['error'] ?? data['message'] ?? '서버 오류: ${response.statusCode}',
       };
     }
     if (data['error'] != null) {
@@ -1490,7 +1574,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     if (data['code'] == 1) {
       return {
         'success': true,
-        'name': data['data']?['name'] ?? data['data']?['username'] ?? fallbackId,
+        'name':
+            data['data']?['name'] ?? data['data']?['username'] ?? fallbackId,
       };
     }
 
@@ -1520,14 +1605,16 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     required String code,
     required String fallbackId,
   }) async {
-    final response = await http.post(
-      Uri.parse('$apiServer/api/login/2fa'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'tfa_key': tfaKey,
-        'tfa_code': code,
-      }),
-    ).timeout(Duration(seconds: 10));
+    final response = await http
+        .post(
+          Uri.parse('$apiServer/api/login/2fa'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'tfa_key': tfaKey,
+            'tfa_code': code,
+          }),
+        )
+        .timeout(Duration(seconds: 10));
     return _handleRemoteUserAuthCodeResponse(response, fallbackId);
   }
 
@@ -1539,21 +1626,23 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     required bool isEmailVerification,
     required String fallbackId,
   }) async {
-    final response = await http.post(
-      Uri.parse('$apiServer/api/login'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'username': user?.name ?? fallbackId,
-        'id': await bind.mainGetMyId(),
-        'uuid': await bind.mainGetUuid(),
-        'autoLogin': true,
-        'type': HttpType.kAuthReqTypeEmailCode,
-        'verificationCode': code,
-        if (!isEmailVerification) 'tfaCode': code,
-        if (secret != null) 'secret': secret,
-        'deviceInfo': _getLoginDeviceInfo(),
-      }),
-    ).timeout(Duration(seconds: 10));
+    final response = await http
+        .post(
+          Uri.parse('$apiServer/api/login'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'username': user?.name ?? fallbackId,
+            'id': await bind.mainGetMyId(),
+            'uuid': await bind.mainGetUuid(),
+            'autoLogin': true,
+            'type': HttpType.kAuthReqTypeEmailCode,
+            'verificationCode': code,
+            if (!isEmailVerification) 'tfaCode': code,
+            if (secret != null) 'secret': secret,
+            'deviceInfo': _getLoginDeviceInfo(),
+          }),
+        )
+        .timeout(Duration(seconds: 10));
     return _handleRemoteUserAuthCodeResponse(response, fallbackId);
   }
 
@@ -1571,9 +1660,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     if (response.statusCode != 200) {
       return {
         'success': false,
-        'message': data['error'] ??
-            data['message'] ??
-            '서버 오류: ${response.statusCode}',
+        'message':
+            data['error'] ?? data['message'] ?? '서버 오류: ${response.statusCode}',
       };
     }
     if (data['error'] != null) {
@@ -1703,9 +1791,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                     child: Text(translate('Cancel')),
                   ),
                   ElevatedButton(
-                    onPressed: codeField.isReady && !isInProgress
-                        ? onVerify
-                        : null,
+                    onPressed:
+                        codeField.isReady && !isInProgress ? onVerify : null,
                     child: Text(translate('Verify')),
                   ),
                 ],
@@ -1751,14 +1838,14 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         apiServer = _remoteUserApiBase;
       }
       final remoteId = await bind.mainGetMyId();
-      
+
       // remoteId(기기 ID)만 필수 - 피원격지 등록이므로 로그인 토큰 불필요
       if (remoteId.isEmpty) {
         debugPrint('_registerDeviceToServer: Missing remoteId');
         showToast('기기 ID를 가져올 수 없습니다.');
         return false;
       }
-      
+
       // 시스템 정보 수집
       final hostname = Platform.localHostname;
       String platform = 'Unknown';
@@ -1769,9 +1856,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       } else if (Platform.isLinux) {
         platform = 'Linux';
       }
-      
-      debugPrint('_registerDeviceToServer: Registering device - apiServer=$apiServer, remoteId=$remoteId, alias=$alias, userId=$userId');
-      
+
+      debugPrint(
+          '_registerDeviceToServer: Registering device - apiServer=$apiServer, remoteId=$remoteId, alias=$alias, userId=$userId');
+
       final response = await deviceRegisterService.registerDeviceSimple(
         apiServer: apiServer,
         userId: userId,
@@ -1780,12 +1868,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         hostname: hostname,
         platform: platform,
       );
-      
+
       if (response.success) {
         debugPrint('_registerDeviceToServer: Device registered successfully');
         return true;
       } else {
-        debugPrint('_registerDeviceToServer: Device registration failed - ${response.message}');
+        debugPrint(
+            '_registerDeviceToServer: Device registration failed - ${response.message}');
         if (response.isLimitExceeded) {
           await _showDeviceRegisterLimitDialog(response);
         } else {
@@ -1993,7 +2082,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             _OptionCheckBox(context, 'Enable audio', kOptionEnableAudio,
                 enabled: enabled, fakeValue: fakeValue),
             // 카메라: 설치 모드에서는 지원되지 않음 (Windows 서비스 제한)
-            _CameraOptionCheckBox(context, enabled: enabled, fakeValue: fakeValue),
+            _CameraOptionCheckBox(context,
+                enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
@@ -2180,7 +2270,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           reverse: true, enabled: enabled),
       ...directIp(context),
       whitelist(),
-      ...autoDisconnect(context),
+      autoDisconnect(context),
       if (bind.mainIsInstalled())
         _OptionCheckBox(context, 'allow-only-conn-window-open-tip',
             'allow-only-conn-window-open',
@@ -2374,64 +2464,69 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         }));
   }
 
-  List<Widget> autoDisconnect(BuildContext context) {
-    TextEditingController controller = TextEditingController();
-    update(bool v) => setState(() {});
-    RxBool applyEnabled = false.obs;
-    return [
-      _OptionCheckBox(
-          context, 'auto_disconnect_option_tip', kOptionAllowAutoDisconnect,
-          update: update, enabled: !locked),
-      () {
-        bool enabled = option2bool(kOptionAllowAutoDisconnect,
-            bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
-        if (!enabled) applyEnabled.value = false;
-        controller.text =
-            bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
-        final isOptFixed = isOptionFixed(kOptionAutoDisconnectTimeout);
-        return Offstage(
-          offstage: !enabled,
-          child: _SubLabeledWidget(
-            context,
-            'Timeout in minutes',
-            Row(children: [
-              SizedBox(
-                width: 95,
-                child: TextField(
-                  controller: controller,
-                  enabled: enabled && !locked && !isOptFixed,
-                  onChanged: (_) => applyEnabled.value = true,
-                  inputFormatters: [
-                    FilteringTextInputFormatter.allow(RegExp(
-                        r'^([0-9]|[1-9]\d|[1-9]\d{2}|[1-9]\d{3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$')),
-                  ],
-                  decoration: const InputDecoration(
-                    hintText: '10',
-                    contentPadding:
-                        EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+  Widget autoDisconnect(BuildContext context) {
+    const timeoutOptions = ['10', '20', '30', '40', '50', '60'];
+    final enabled = mainGetBoolOptionSync(kOptionAllowAutoDisconnect);
+    final storedTimeout =
+        bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
+    final timeout =
+        timeoutOptions.contains(storedTimeout) ? storedTimeout : '10';
+    final allowOptionFixed = isOptionFixed(kOptionAllowAutoDisconnect);
+    final timeoutOptionFixed = isOptionFixed(kOptionAutoDisconnectTimeout);
+
+    Future<void> setEnabled(bool value) async {
+      if (value && !timeoutOptions.contains(storedTimeout)) {
+        await bind.mainSetOption(
+            key: kOptionAutoDisconnectTimeout, value: '10');
+      }
+      await mainSetBoolOption(kOptionAllowAutoDisconnect, value);
+      if (mounted) setState(() {});
+    }
+
+    final canToggle = !locked && !allowOptionFixed;
+    return Row(
+      children: [
+        Expanded(
+          child: GestureDetector(
+            onTap: canToggle ? () => setEnabled(!enabled) : null,
+            child: Row(
+              children: [
+                Checkbox(
+                  value: enabled,
+                  onChanged: canToggle
+                      ? (value) {
+                          if (value != null) setEnabled(value);
+                        }
+                      : null,
+                ).marginOnly(right: 5),
+                Expanded(
+                  child: Text(
+                    translate('auto_disconnect_option_tip'),
+                    style:
+                        TextStyle(color: disabledTextColor(context, !locked)),
                   ),
-                ).workaroundFreezeLinuxMint().marginOnly(right: 15),
-              ),
-              Obx(() => ElevatedButton(
-                    onPressed:
-                        applyEnabled.value && enabled && !locked && !isOptFixed
-                            ? () async {
-                                applyEnabled.value = false;
-                                await bind.mainSetOption(
-                                    key: kOptionAutoDisconnectTimeout,
-                                    value: controller.text);
-                              }
-                            : null,
-                    child: Text(
-                      translate('Apply'),
-                    ),
-                  ))
-            ]),
-            enabled: enabled && !locked && !isOptFixed,
+                ),
+              ],
+            ),
           ),
-        );
-      }(),
-    ];
+        ),
+        if (enabled)
+          SizedBox(
+            width: 105,
+            child: ComboBox(
+              enabled: !locked && !timeoutOptionFixed,
+              keys: timeoutOptions,
+              values: timeoutOptions.map((value) => '$value min').toList(),
+              initialKey: timeout,
+              onChanged: (value) async {
+                await bind.mainSetOption(
+                    key: kOptionAutoDisconnectTimeout, value: value);
+                if (mounted) setState(() {});
+              },
+            ),
+          ),
+      ],
+    ).marginOnly(left: _kCheckBoxLeftMargin);
   }
 
   Widget unlockPin() {
@@ -3144,7 +3239,8 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://www.mdesk.co.kr/#open-source-license');
+                    launchUrlString(
+                        'https://www.mdesk.co.kr/#open-source-license');
                   },
                   child: Text(
                     '오픈소스 라이센스 약관',
@@ -3163,12 +3259,17 @@ class _AboutState extends State<_About> {
                         children: [
                           const Text(
                             'Copyright © 2025 MetaDataLab.\nPortions Copyright © Purslane Ltd.',
-                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold),
                           ),
                           const SizedBox(height: 16),
                           const Text(
                             'Open Source Notice',
-                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
+                            style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14),
                           ),
                           const SizedBox(height: 8),
                           Builder(
@@ -3189,7 +3290,8 @@ class _AboutState extends State<_About> {
                                 };
                               final textSpans = <TextSpan>[
                                 const TextSpan(
-                                  text: 'This software is based on RustDesk and is licensed under\nthe GNU Affero General Public License v3.0 (AGPL-3.0).\n\nIn accordance with AGPL-3.0, the complete corresponding\nsource code for this version is available at:\n',
+                                  text:
+                                      'This software is based on RustDesk and is licensed under\nthe GNU Affero General Public License v3.0 (AGPL-3.0).\n\nIn accordance with AGPL-3.0, the complete corresponding\nsource code for this version is available at:\n',
                                 ),
                                 TextSpan(
                                   text: 'https://github.com/metadtlab/MDesk',
@@ -3199,9 +3301,11 @@ class _AboutState extends State<_About> {
                                   ),
                                   recognizer: mdeskRecognizer,
                                 ),
-                                const TextSpan(text: '\n\nAPI Server source code:\n'),
+                                const TextSpan(
+                                    text: '\n\nAPI Server source code:\n'),
                                 TextSpan(
-                                  text: 'https://github.com/metadtlab/MDeskAPIServer',
+                                  text:
+                                      'https://github.com/metadtlab/MDeskAPIServer',
                                   style: const TextStyle(
                                     color: Color(0xFF4A9EFF),
                                     decoration: TextDecoration.underline,
@@ -3209,12 +3313,14 @@ class _AboutState extends State<_About> {
                                   recognizer: apiServerRecognizer,
                                 ),
                                 const TextSpan(
-                                  text: '\n\nBuild Environment:\nCore: Rust 1.75.0\nUI: Flutter 3.16.0 / Dart 3.2.0',
+                                  text:
+                                      '\n\nBuild Environment:\nCore: Rust 1.75.0\nUI: Flutter 3.16.0 / Dart 3.2.0',
                                 ),
                               ];
                               return RichText(
                                 text: TextSpan(
-                                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                                  style: const TextStyle(
+                                      color: Colors.white, fontSize: 13),
                                   children: textSpans,
                                 ),
                               );
@@ -3363,11 +3469,12 @@ Widget _CameraOptionCheckBox(
 }) {
   // Windows 설치 모드인지 확인
   final bool isInstalled = isWindows && bind.mainIsInstalled();
-  
+
   // 설치 모드에서는 카메라 비활성화 (Windows 서비스 제한)
   if (isInstalled) {
     return Tooltip(
-      message: translate('Camera is not supported in installed mode (Windows service limitation)'),
+      message: translate(
+          'Camera is not supported in installed mode (Windows service limitation)'),
       child: Row(
         children: [
           Checkbox(
@@ -3404,7 +3511,7 @@ Widget _CameraOptionCheckBox(
       ).marginOnly(left: _kCheckBoxLeftMargin),
     );
   }
-  
+
   // 포터블 모드에서는 기존 체크박스 사용
   return _OptionCheckBox(
     context,

@@ -129,6 +129,10 @@ class FfiModel with ChangeNotifier {
   RxBool waitForImageDialogShow = true.obs;
   Timer? waitForImageTimer;
   RxBool waitForFirstImage = true.obs;
+  final RxBool autoDisconnectStatusKnown = false.obs;
+  final RxBool autoDisconnectEnabled = false.obs;
+  final RxInt autoDisconnectRemainingSeconds = (-1).obs;
+  DateTime? autoDisconnectStatusUpdatedAt;
   bool isRefreshing = false;
 
   Timer? timerScreenshot;
@@ -235,6 +239,10 @@ class FfiModel with ChangeNotifier {
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
+    autoDisconnectStatusKnown.value = false;
+    autoDisconnectEnabled.value = false;
+    autoDisconnectRemainingSeconds.value = -1;
+    autoDisconnectStatusUpdatedAt = null;
     clearPermissions();
     waitForImageTimer?.cancel();
     timerScreenshot?.cancel();
@@ -255,6 +263,25 @@ class FfiModel with ChangeNotifier {
     } catch (e) {
       //
     }
+  }
+
+  void setAutoDisconnectStatus(bool enabled, int remainingSeconds) {
+    autoDisconnectStatusKnown.value = true;
+    autoDisconnectEnabled.value = enabled;
+    autoDisconnectRemainingSeconds.value = enabled ? remainingSeconds : -1;
+    autoDisconnectStatusUpdatedAt = DateTime.now();
+  }
+
+  int get estimatedAutoDisconnectRemainingSeconds {
+    if (!autoDisconnectStatusKnown.value ||
+        !autoDisconnectEnabled.value ||
+        autoDisconnectRemainingSeconds.value < 0) {
+      return -1;
+    }
+    final updatedAt = autoDisconnectStatusUpdatedAt;
+    if (updatedAt == null) return autoDisconnectRemainingSeconds.value;
+    final elapsed = DateTime.now().difference(updatedAt).inSeconds;
+    return max(0, autoDisconnectRemainingSeconds.value - elapsed);
   }
 
   Widget? getConnectionImageText() {
@@ -392,6 +419,12 @@ class FfiModel with ChangeNotifier {
         closeConnection(id: peer_id);
       } else if (name == 'portable_service_running') {
         _handlePortableServiceRunning(peerId, evt);
+      } else if (name == 'auto_disconnect_status') {
+        final enabled = evt['enabled'].toString() == 'true';
+        setAutoDisconnectStatus(
+          enabled,
+          int.tryParse(evt['remaining_seconds'].toString()) ?? -1,
+        );
       } else if (name == 'on_url_scheme_received') {
         // currently comes from "_url" ipc of mac and dbus of linux
         onUrlSchemeReceived(evt);
@@ -888,11 +921,12 @@ class FfiModel with ChangeNotifier {
     final text = evt['text'];
     final link = evt['link'];
     if (type == 're-input-password') {
-      wrongPasswordDialog(sessionId, dialogManager, type, title, text);
+      wrongPasswordDialog(sessionId, dialogManager, type, title, text,
+          peerId: peerId);
     } else if (type == 'input-2fa') {
       enter2FaDialog(sessionId, dialogManager);
     } else if (type == 'input-password') {
-      enterPasswordDialog(sessionId, dialogManager);
+      enterPasswordDialog(sessionId, dialogManager, peerId: peerId);
     } else if (type == 'session-login' || type == 'session-re-login') {
       enterUserLoginDialog(sessionId, dialogManager, 'login_linux_tip', true);
     } else if (type == 'session-login-password') {
@@ -976,7 +1010,7 @@ class FfiModel with ChangeNotifier {
       String link, bool hasRetry, OverlayDialogManager dialogManager,
       {bool? hasCancel}) async {
     final showNoteEdit = parent.target != null &&
-        allowAskForNoteAtEndOfConnection(parent.target, false) &&
+        shouldShowEndOfConnectionNote(parent.target, false) &&
         (title == "Connection Error" || type == "restarting") &&
         !hasRetry;
     if (showNoteEdit) {
@@ -1023,7 +1057,7 @@ class FfiModel with ChangeNotifier {
     final text2 = "${translate(text)}$hint";
 
     if (parent.target != null &&
-        allowAskForNoteAtEndOfConnection(parent.target, false) &&
+        shouldShowEndOfConnectionNote(parent.target, false) &&
         pi.isSet.isTrue) {
       if (await showConnEndAuditDialogCloseCanceled(
           ffi: parent.target!, type: type, title: title, text: text2)) {
@@ -1245,6 +1279,17 @@ class FfiModel with ChangeNotifier {
         bind.isSupportMultiUiSession(version: _pi.version);
     _pi.username = evt['username'];
     _pi.hostname = evt['hostname'];
+    _pi.localIp = evt['local_ip'] ?? '';
+    final autoDisconnectEnabled =
+        evt['auto_disconnect_enabled'].toString() == 'true';
+    final autoDisconnectTimeoutSeconds = int.tryParse(
+          evt['auto_disconnect_timeout_seconds'].toString(),
+        ) ??
+        0;
+    setAutoDisconnectStatus(
+      autoDisconnectEnabled,
+      autoDisconnectTimeoutSeconds,
+    );
     _pi.platform = evt['platform'];
     _pi.sasEnabled = evt['sas_enabled'] == 'true';
     final currentDisplay = int.parse(evt['current_display']);
@@ -1348,6 +1393,17 @@ class FfiModel with ChangeNotifier {
     notifyListeners();
 
     if (!isCache) {
+      if (connType == ConnType.defaultConn && isDesktop) {
+        try {
+          await rustDeskWinManager.call(
+            WindowType.Main,
+            kWindowEventRemoteConnected,
+            peerId,
+          );
+        } catch (e) {
+          debugPrint('Failed to notify main window of remote connection: $e');
+        }
+      }
       tryUseAllMyDisplaysForTheRemoteSession(peerId);
     }
   }
@@ -3423,7 +3479,9 @@ class RecordingModel with ChangeNotifier {
   WeakReference<FFI> parent;
   RecordingModel(this.parent);
   bool _start = false;
+  bool _hasRecorded = false;
   bool get start => _start;
+  bool get hasRecorded => _hasRecorded;
 
   toggle() async {
     if (isIOS) return;
@@ -3439,8 +3497,16 @@ class RecordingModel with ChangeNotifier {
   }
 
   updateStatus(bool status) {
+    if (status) {
+      _hasRecorded = true;
+    }
+    if (_start == status) return;
     _start = status;
     notifyListeners();
+  }
+
+  void markNoteSaved() {
+    _hasRecorded = false;
   }
 }
 
@@ -3908,6 +3974,7 @@ class PeerInfo with ChangeNotifier {
   String version = '';
   String username = '';
   String hostname = '';
+  String localIp = '';
   String platform = '';
   bool sasEnabled = false;
   bool isSupportMultiUiSession = false;

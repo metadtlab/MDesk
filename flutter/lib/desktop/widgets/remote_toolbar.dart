@@ -395,6 +395,9 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
 
     toolbarItems
         .add(_ControlMenu(id: widget.id, ffi: widget.ffi, state: widget.state));
+    if (widget.ffi.connType == ConnType.defaultConn && !isWeb) {
+      toolbarItems.add(_FileTransferButton(id: widget.id, ffi: widget.ffi));
+    }
     toolbarItems.add(_DisplayMenu(
       id: widget.id,
       ffi: widget.ffi,
@@ -871,6 +874,52 @@ class _ControlMenu extends StatelessWidget {
                     trailingIcon: e.trailingIcon);
               }
             }).toList());
+  }
+}
+
+class _FileTransferButton extends StatelessWidget {
+  final String id;
+  final FFI ffi;
+  const _FileTransferButton({Key? key, required this.id, required this.ffi})
+      : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return _IconMenuButton(
+      icon: SizedBox.square(
+        dimension: _ToolbarTheme.buttonSize,
+        child: Center(
+          child: SvgPicture.asset(
+            'assets/file_transfer.svg',
+            colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn),
+            width: _ToolbarTheme.buttonSize * 0.75,
+            height: _ToolbarTheme.buttonSize * 0.75,
+          ),
+        ),
+      ),
+      tooltip: 'Transfer file',
+      onPressed: () => _openFileTransfer(context),
+      color: _ToolbarTheme.blueColor,
+      hoverColor: _ToolbarTheme.hoverBlueColor,
+    );
+  }
+
+  Future<void> _openFileTransfer(BuildContext context) async {
+    if (ffi.ffiModel.pi.isSet.isFalse) {
+      showToast(translate('Connecting...'));
+      return;
+    }
+    if (ffi.ffiModel.permissions['file'] == false) {
+      showToast(translate('No permission of file transfer'));
+      return;
+    }
+    final connToken = bind.sessionGetConnToken(sessionId: ffi.sessionId);
+    await connect(
+      context,
+      id,
+      isFileTransfer: true,
+      connToken: connToken,
+    );
   }
 }
 

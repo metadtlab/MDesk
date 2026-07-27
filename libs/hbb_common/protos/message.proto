@@ -138,6 +138,10 @@ message PeerInfo {
   // NOTE: Only support one-level dictionaries (for peer to update), and the key is of type string.
   string platform_additions = 12;
   WindowsSessions windows_sessions = 13;
+  // LAN/private address reported by the controlled peer for session UI.
+  string local_ip = 14;
+  bool auto_disconnect_enabled = 15;
+  uint64 auto_disconnect_timeout_seconds = 16;
 }
 
 message WindowsSession {  
@@ -873,7 +877,14 @@ message Misc {
     MessageQuery message_query = 37;
     int32 follow_current_display = 38;
     OpenFileTransfer open_file_transfer = 39;
+    AutoDisconnectStatus auto_disconnect_status = 40;
   }
+}
+
+message AutoDisconnectStatus {
+  bool enabled = 1;
+  uint64 remaining_seconds = 2;
+  uint64 timeout_seconds = 3;
 }
 
 message VoiceCallRequest {

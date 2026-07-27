@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "MDesk"
-version = "1.4.56"
+version = "1.4.59"
 dependencies = [
  "android-wakelock",
  "android_logger",
@@ -4475,7 +4475,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "mdeskmini"
-version = "0.1.6"
+version = "0.2.1"
 dependencies = [
  "MDesk",
  "clap 4.6.0",

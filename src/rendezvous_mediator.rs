@@ -40,6 +40,19 @@ lazy_static::lazy_static! {
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
+static RENDEZVOUS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Returns true after this host has received a successful registration response
+/// from at least one rendezvous server.
+pub fn is_rendezvous_registered() -> bool {
+    RENDEZVOUS_REGISTERED.load(Ordering::SeqCst)
+}
+
+fn mark_rendezvous_registered(host: &str) {
+    if !RENDEZVOUS_REGISTERED.swap(true, Ordering::SeqCst) {
+        log::info!("rendezvous registration ready: {host}");
+    }
+}
 
 #[derive(Clone)]
 pub struct RendezvousMediator {
@@ -93,6 +106,7 @@ impl RendezvousMediator {
         }
         scrap::codec::test_av1();
         loop {
+            RENDEZVOUS_REGISTERED.store(false, Ordering::SeqCst);
             let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
@@ -279,6 +293,8 @@ impl RendezvousMediator {
                 if rpr.request_pk {
                     log::info!("request_pk received from {}", self.host);
                     self.register_pk(sink).await?;
+                } else {
+                    mark_rendezvous_registered(&self.host);
                 }
             }
             Some(rendezvous_message::Union::RegisterPkResponse(rpr)) => {
@@ -288,6 +304,7 @@ impl RendezvousMediator {
                         Config::set_key_confirmed(true);
                         Config::set_host_key_confirmed(&self.host_prefix, true);
                         *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
+                        mark_rendezvous_registered(&self.host);
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;

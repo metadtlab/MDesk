@@ -43,7 +43,7 @@ use hbb_common::{
 use hbb_common::{tokio::sync::Mutex as TokioMutex, ResultType};
 use scrap::CodecFormat;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     num::NonZeroI64,
     path::PathBuf,
@@ -77,6 +77,7 @@ pub struct Remote<T: InvokeUiSession> {
     video_threads: HashMap<usize, VideoThread>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
+    active_recording_displays: HashSet<usize>,
     sent_close_reason: bool,
 }
 
@@ -126,6 +127,7 @@ impl<T: InvokeUiSession> Remote<T> {
             video_threads: Default::default(),
             chroma: Default::default(),
             last_record_state: false,
+            active_recording_displays: Default::default(),
             sent_close_reason: false,
         }
     }
@@ -924,6 +926,37 @@ impl<T: InvokeUiSession> Remote<T> {
             Data::RecordScreen(start) => {
                 self.handler.lc.write().unwrap().record_state = start;
                 self.update_record_state();
+            }
+            Data::RecordStatus((display, active, filename)) => {
+                if active {
+                    self.active_recording_displays.insert(display);
+                } else {
+                    self.active_recording_displays.remove(&display);
+                }
+                let active = !self.active_recording_displays.is_empty();
+                log::info!(
+                    "recording status: display={display}, active={active}, active_displays={:?}",
+                    self.active_recording_displays
+                );
+                let changed = {
+                    let mut lc = self.handler.lc.write().unwrap();
+                    if let Some(filename) = filename {
+                        if !lc.recording_files.contains(&filename) {
+                            lc.recording_files.push(filename);
+                        }
+                    }
+                    let changed = lc.record_active != active;
+                    lc.record_active = active;
+                    changed
+                };
+                if changed {
+                    self.handler.update_record_status(active);
+                    let mut misc = Misc::new();
+                    misc.set_client_record_status(active);
+                    let mut msg = Message::new();
+                    msg.set_misc(misc);
+                    self.sender.send(Data::Message(msg)).ok();
+                }
             }
             Data::ElevateDirect => {
                 let mut request = ElevationRequest::new();
@@ -1992,6 +2025,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             );
                         }
                     }
+                    Some(misc::Union::AutoDisconnectStatus(status)) => {
+                        self.handler
+                            .auto_disconnect_status(status.enabled, status.remaining_seconds);
+                    }
                     Some(misc::Union::SwitchBack(_)) => {
                         #[cfg(feature = "flutter")]
                         self.handler.switch_back(&self.handler.get_id());
@@ -2504,22 +2541,26 @@ impl<T: InvokeUiSession> Remote<T> {
         );
         self.video_threads.insert(display, video_thread);
         if self.video_threads.len() == 1 {
-            let auto_record =
-                LocalConfig::get_bool_option(config::keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING);
+            // The settings UI and a remote session can live in different
+            // MDesk processes. Read the persisted value so a checked option
+            // cannot be hidden by this process' stale LocalConfig cache.
+            let auto_record = LocalConfig::get_bool_option_from_file(
+                config::keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING,
+            );
             self.handler.lc.write().unwrap().record_state = auto_record;
             self.update_record_state();
         }
     }
 
     fn update_record_state(&mut self) {
-        // state
+        // Keep the requested state even while the peer temporarily denies the
+        // recording permission. Recording remains stopped while denied and
+        // starts automatically as soon as permission is granted again.
         let permission = self.handler.lc.read().unwrap().record_permission;
-        if !permission {
-            self.handler.lc.write().unwrap().record_state = false;
-        }
         let state = self.handler.lc.read().unwrap().record_state;
+        let active = self.handler.lc.read().unwrap().record_active;
         let start = state && permission;
-        if self.last_record_state == start {
+        if self.last_record_state == start && active == start {
             return;
         }
         self.last_record_state = start;
@@ -2528,13 +2569,6 @@ impl<T: InvokeUiSession> Remote<T> {
         for (_, v) in self.video_threads.iter_mut() {
             v.video_sender.send(MediaData::RecordScreen(start)).ok();
         }
-        self.handler.update_record_status(start);
-        // update remote
-        let mut misc = Misc::new();
-        misc.set_client_record_status(start);
-        let mut msg = Message::new();
-        msg.set_misc(misc);
-        self.sender.send(Data::Message(msg)).ok();
     }
 }
 

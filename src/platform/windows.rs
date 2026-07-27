@@ -111,6 +111,23 @@ extern "system" {
     );
 }
 
+#[link(name = "imm32")]
+extern "system" {
+    fn ImmGetContext(hwnd: HWND) -> *mut c_void;
+    fn ImmGetConversionStatus(
+        input_context: *mut c_void,
+        conversion: *mut DWORD,
+        sentence: *mut DWORD,
+    ) -> BOOL;
+    fn ImmSetConversionStatus(
+        input_context: *mut c_void,
+        conversion: DWORD,
+        sentence: DWORD,
+    ) -> BOOL;
+    fn ImmSetOpenStatus(input_context: *mut c_void, open: BOOL) -> BOOL;
+    fn ImmReleaseContext(hwnd: HWND, input_context: *mut c_void) -> BOOL;
+}
+
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -2440,6 +2457,58 @@ pub fn disable_lowlevel_keyboard(hwnd: HWND) {
 
 pub fn stop_system_key_propagate(v: bool) {
     unsafe { win_stop_system_key_propagate(if v { TRUE } else { FALSE }) };
+}
+
+pub fn activate_korean_input_for_foreground_window() -> bool {
+    const KOREAN_LANGUAGE_ID: usize = 0x0412;
+    const IME_CMODE_NATIVE: DWORD = 0x0001;
+
+    unsafe {
+        let count = GetKeyboardLayoutList(0, null_mut());
+        if count <= 0 {
+            return false;
+        }
+
+        let mut layouts = vec![null_mut(); count as usize];
+        let count = GetKeyboardLayoutList(count, layouts.as_mut_ptr());
+        if count <= 0 {
+            return false;
+        }
+
+        let Some(layout) = layouts
+            .into_iter()
+            .take(count as usize)
+            .find(|layout| (*layout as usize & 0xffff) == KOREAN_LANGUAGE_ID)
+        else {
+            return false;
+        };
+
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+
+        // Run the language request on the Flutter window thread before
+        // changing its IME conversion mode.
+        SendMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, layout as LPARAM);
+
+        let input_context = ImmGetContext(hwnd);
+        if input_context.is_null() {
+            return true;
+        }
+
+        let mut conversion = 0;
+        let mut sentence = 0;
+        let has_conversion_status =
+            ImmGetConversionStatus(input_context, &mut conversion, &mut sentence) != FALSE;
+        let open_ok = ImmSetOpenStatus(input_context, TRUE) != FALSE;
+        let conversion_ok = has_conversion_status
+            && ImmSetConversionStatus(input_context, conversion | IME_CMODE_NATIVE, sentence)
+                != FALSE;
+        ImmReleaseContext(hwnd, input_context);
+
+        open_ok && conversion_ok
+    }
 }
 
 pub fn get_win_key_state() -> bool {

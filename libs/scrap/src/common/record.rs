@@ -2,6 +2,7 @@ use crate::CodecFormat;
 #[cfg(feature = "hwcodec")]
 use hbb_common::anyhow::anyhow;
 use hbb_common::{
+    anyhow::Context as _,
     bail, chrono, log,
     message_proto::{message, video_frame, EncodedVideoFrame, Message},
     ResultType,
@@ -19,11 +20,39 @@ use std::{
 use webm::mux::{self, Segment, Track, VideoTrack, Writer};
 
 const MIN_SECS: u64 = 1;
+const MAX_FILENAME_COMPONENT_CHARS: usize = 48;
+
+fn sanitize_file_component(value: &str) -> String {
+    let mut sanitized: String = value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(MAX_FILENAME_COMPONENT_CHARS)
+        .collect();
+    while sanitized.ends_with([' ', '.']) {
+        sanitized.pop();
+    }
+    sanitized
+}
+
+fn required_file_component(value: &str) -> String {
+    let sanitized = sanitize_file_component(value);
+    (!sanitized.is_empty())
+        .then_some(sanitized)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
 
 #[derive(Debug, Clone)]
 pub struct RecorderContext {
     pub server: bool,
     pub id: String,
+    pub device_name: String,
     pub dir: String,
     pub display_idx: usize,
     pub camera: bool,
@@ -43,24 +72,33 @@ impl RecorderContext2 {
         if !PathBuf::from(&ctx.dir).exists() {
             std::fs::create_dir_all(&ctx.dir)?;
         }
-        let file = if ctx.server { "incoming" } else { "outgoing" }.to_string()
-            + "_"
-            + &ctx.id.clone()
-            + &chrono::Local::now().format("_%Y%m%d%H%M%S%3f_").to_string()
-            + &format!(
-                "{}{}_",
-                if ctx.camera { "camera" } else { "display" },
-                ctx.display_idx
-            )
-            + &self.format.to_string().to_lowercase()
-            + if self.format == CodecFormat::VP9
-                || self.format == CodecFormat::VP8
-                || self.format == CodecFormat::AV1
-            {
-                ".webm"
-            } else {
-                ".mp4"
-            };
+        let device_name = if ctx.server {
+            String::new()
+        } else {
+            sanitize_file_component(&ctx.device_name)
+        };
+        let device_name = if device_name.is_empty() {
+            String::new()
+        } else {
+            format!("_{device_name}")
+        };
+        let role = if ctx.server { "incoming" } else { "outgoing" };
+        let id = required_file_component(&ctx.id);
+        let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S%3f");
+        let source = if ctx.camera { "camera" } else { "display" };
+        let codec = self.format.to_string().to_lowercase();
+        let extension = if self.format == CodecFormat::VP9
+            || self.format == CodecFormat::VP8
+            || self.format == CodecFormat::AV1
+        {
+            "webm"
+        } else {
+            "mp4"
+        };
+        let file = format!(
+            "{role}_{id}_{timestamp}_{source}{}_{codec}{device_name}.{extension}",
+            ctx.display_idx
+        );
         self.filename = PathBuf::from(&ctx.dir)
             .join(file)
             .to_string_lossy()
@@ -111,6 +149,19 @@ impl DerefMut for Recorder {
 
 impl Recorder {
     pub fn new(ctx: RecorderContext) -> ResultType<Self> {
+        if ctx.dir.trim().is_empty() {
+            bail!("Recording directory is empty");
+        }
+        let dir = PathBuf::from(&ctx.dir);
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&dir).with_context(|| {
+                format!("Failed to create recording directory '{}'", dir.display())
+            })?;
+        }
+        if !dir.is_dir() {
+            bail!("Recording path is not a directory: '{}'", dir.display());
+        }
+        log::info!("Recording output directory: {}", dir.display());
         Ok(Self {
             inner: None,
             ctx,
@@ -236,6 +287,10 @@ impl Recorder {
         Ok(())
     }
 
+    pub fn current_filename(&self) -> Option<String> {
+        self.ctx2.as_ref().map(|ctx| ctx.filename.clone())
+    }
+
     fn check_pts(
         &mut self,
         pts: i64,
@@ -290,7 +345,11 @@ impl RecorderApi for WebmRecorder {
         } {
             Ok(file) => file,
             Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => File::create(&ctx2.filename)?,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to create recording file '{}'", ctx2.filename)
+                })
+            }
         };
         let mut webm = match mux::Segment::new(mux::Writer::new(out)) {
             Some(v) => v,
@@ -341,6 +400,52 @@ impl RecorderApi for WebmRecorder {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{required_file_component, sanitize_file_component, MAX_FILENAME_COMPONENT_CHARS};
+
+    #[test]
+    fn recording_filename_component_is_safe() {
+        assert_eq!(sanitize_file_component("peer:/\\*?\"<>|"), "peer_________");
+        assert_eq!(sanitize_file_component(""), "");
+        assert_eq!(required_file_component(""), "unknown");
+        assert_eq!(sanitize_file_component("123456789"), "123456789");
+        assert_eq!(sanitize_file_component("  코드:사이닝.  "), "코드_사이닝");
+        assert_eq!(
+            sanitize_file_component(&"가".repeat(60)),
+            "가".repeat(MAX_FILENAME_COMPONENT_CHARS)
+        );
+    }
+
+    #[test]
+    fn outgoing_recording_filename_uses_device_name() {
+        let mut file = super::RecorderContext2 {
+            filename: String::new(),
+            width: 1920,
+            height: 1080,
+            format: crate::CodecFormat::AV1,
+        };
+        let context = super::RecorderContext {
+            server: false,
+            id: "170699458".to_owned(),
+            device_name: " 코드:사이닝 ".to_owned(),
+            dir: std::env::temp_dir().to_string_lossy().to_string(),
+            display_idx: 0,
+            camera: false,
+            tx: None,
+        };
+
+        file.set_filename(&context).unwrap();
+
+        let name = std::path::Path::new(&file.filename)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(name.starts_with("outgoing_170699458_"));
+        assert!(name.ends_with("_display0_av1_코드_사이닝.webm"));
     }
 }
 

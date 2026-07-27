@@ -1096,6 +1096,7 @@ class _TabState extends State<_Tab> with RestorationMixin {
                   color: isSelected
                       ? MyTheme.tabbar(context).selectedTextColor
                       : MyTheme.tabbar(context).unSelectedTextColor),
+              maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
           ));

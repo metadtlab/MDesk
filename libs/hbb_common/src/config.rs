@@ -2301,14 +2301,34 @@ impl LocalConfig {
         Config::store_(self, "_local");
     }
 
+    /// Update the latest on-disk local configuration instead of blindly
+    /// writing this process' cached copy. MDesk has multiple long-lived
+    /// processes and a stale process must not erase options saved by another
+    /// process.
+    fn update_and_store<F>(update: F)
+    where
+        F: FnOnce(&mut LocalConfig) -> bool,
+    {
+        let mut cached = LOCAL_CONFIG.write().unwrap();
+        let mut latest = Self::load();
+        if update(&mut latest) {
+            latest.store();
+        }
+        *cached = latest;
+    }
+
     pub fn get_kb_layout_type() -> String {
         LOCAL_CONFIG.read().unwrap().kb_layout_type.clone()
     }
 
     pub fn set_kb_layout_type(kb_layout_type: String) {
-        let mut config = LOCAL_CONFIG.write().unwrap();
-        config.kb_layout_type = kb_layout_type;
-        config.store();
+        Self::update_and_store(|config| {
+            if config.kb_layout_type == kb_layout_type {
+                return false;
+            }
+            config.kb_layout_type = kb_layout_type;
+            true
+        });
     }
 
     pub fn get_size() -> Size {
@@ -2316,22 +2336,27 @@ impl LocalConfig {
     }
 
     pub fn set_size(x: i32, y: i32, w: i32, h: i32) {
-        let mut config = LOCAL_CONFIG.write().unwrap();
         let size = (x, y, w, h);
-        if size == config.size || size.2 < 300 || size.3 < 300 {
+        if size.2 < 300 || size.3 < 300 {
             return;
         }
-        config.size = size;
-        config.store();
+        Self::update_and_store(|config| {
+            if size == config.size {
+                return false;
+            }
+            config.size = size;
+            true
+        });
     }
 
     pub fn set_remote_id(remote_id: &str) {
-        let mut config = LOCAL_CONFIG.write().unwrap();
-        if remote_id == config.remote_id {
-            return;
-        }
-        config.remote_id = remote_id.into();
-        config.store();
+        Self::update_and_store(|config| {
+            if remote_id == config.remote_id {
+                return false;
+            }
+            config.remote_id = remote_id.into();
+            true
+        });
     }
 
     pub fn get_remote_id() -> String {
@@ -2369,6 +2394,12 @@ impl LocalConfig {
         option2bool(k, &Self::get_option(k))
     }
 
+    /// Read a boolean option from disk so a newly started session sees a
+    /// setting changed by another MDesk process immediately.
+    pub fn get_bool_option_from_file(k: &str) -> bool {
+        option2bool(k, &Self::get_option_from_file(k))
+    }
+
     pub fn set_option(k: String, v: String) {
         let v = if k == keys::OPTION_LANGUAGE {
             FORCED_LANGUAGE.to_owned()
@@ -2376,29 +2407,33 @@ impl LocalConfig {
             v
         };
         if !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &k, &DEFAULT_LOCAL_SETTINGS, &v) {
-            let mut config = LOCAL_CONFIG.write().unwrap();
-            if config.options.remove(&k).is_some() {
-                config.store();
-            }
+            Self::update_and_store(|config| config.options.remove(&k).is_some());
             return;
         }
-        let mut config = LOCAL_CONFIG.write().unwrap();
         // The custom client will explictly set "default" as the default language.
         let is_custom_client_default_lang = k == keys::OPTION_LANGUAGE && v == "default";
         if is_custom_client_default_lang {
-            config.options.insert(k, "".to_owned());
-            config.store();
+            Self::update_and_store(|config| {
+                if config.options.get(&k).is_some_and(|value| value.is_empty()) {
+                    return false;
+                }
+                config.options.insert(k, "".to_owned());
+                true
+            });
             return;
         }
-        let v2 = if v.is_empty() { None } else { Some(&v) };
-        if v2 != config.options.get(&k) {
+        Self::update_and_store(|config| {
+            let v2 = if v.is_empty() { None } else { Some(&v) };
+            if v2 == config.options.get(&k) {
+                return false;
+            }
             if v2.is_none() {
                 config.options.remove(&k);
             } else {
                 config.options.insert(k, v);
             }
-            config.store();
-        }
+            true
+        });
     }
 
     pub fn get_flutter_option(k: &str) -> String {
@@ -2420,16 +2455,18 @@ impl LocalConfig {
         } else {
             v
         };
-        let mut config = LOCAL_CONFIG.write().unwrap();
-        let v2 = if v.is_empty() { None } else { Some(&v) };
-        if v2 != config.ui_flutter.get(&k) {
+        Self::update_and_store(|config| {
+            let v2 = if v.is_empty() { None } else { Some(&v) };
+            if v2 == config.ui_flutter.get(&k) {
+                return false;
+            }
             if v2.is_none() {
                 config.ui_flutter.remove(&k);
             } else {
                 config.ui_flutter.insert(k, v);
             }
-            config.store();
-        }
+            true
+        });
     }
 }
 
@@ -2918,9 +2955,17 @@ fn is_option_can_save(
     defaults: &RwLock<HashMap<String, String>>,
     v: &str,
 ) -> bool {
-    if overwrite.read().unwrap().contains_key(k)
-        || defaults.read().unwrap().get(k).map_or(false, |x| x == v)
+    if overwrite.read().unwrap().contains_key(k) {
+        return false;
+    }
+    // These options are consumed by separate long-lived processes. Keep an
+    // explicit on-disk value even when it matches a custom-client default so
+    // every process observes the same recording preference.
+    if k == keys::OPTION_ALLOW_AUTO_RECORD_INCOMING || k == keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING
     {
+        return true;
+    }
+    if defaults.read().unwrap().get(k).map_or(false, |x| x == v) {
         return false;
     }
     true
@@ -3001,6 +3046,21 @@ pub fn apply_product_default_settings() {
     DEFAULT_SETTINGS
         .write()
         .unwrap()
+        .entry(keys::OPTION_ALLOW_AUTO_RECORD_INCOMING.to_string())
+        .or_insert_with(|| "Y".to_string());
+    DEFAULT_LOCAL_SETTINGS
+        .write()
+        .unwrap()
+        .entry(keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING.to_string())
+        .or_insert_with(|| "Y".to_string());
+    DEFAULT_LOCAL_SETTINGS
+        .write()
+        .unwrap()
+        .entry(keys::OPTION_RECORDING_NOTE_ON_END.to_string())
+        .or_insert_with(|| "Y".to_string());
+    DEFAULT_SETTINGS
+        .write()
+        .unwrap()
         .entry(keys::OPTION_ALLOW_REMOVE_WALLPAPER.to_string())
         .or_insert_with(|| "Y".to_string());
     DEFAULT_SETTINGS
@@ -3008,6 +3068,21 @@ pub fn apply_product_default_settings() {
         .unwrap()
         .entry(keys::OPTION_ALLOW_FAST_RELAY_FALLBACK.to_string())
         .or_insert_with(|| "Y".to_string());
+}
+
+/// Persist recording preferences even when they currently match a custom
+/// client's defaults. Remote-session and service processes reload these
+/// values from disk and may not have received the same in-memory defaults.
+pub fn persist_recording_options() {
+    let incoming = Config::get_option(keys::OPTION_ALLOW_AUTO_RECORD_INCOMING);
+    if !incoming.is_empty() {
+        Config::set_option(keys::OPTION_ALLOW_AUTO_RECORD_INCOMING.to_owned(), incoming);
+    }
+
+    let outgoing = LocalConfig::get_option(keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING);
+    if !outgoing.is_empty() {
+        LocalConfig::set_option(keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING.to_owned(), outgoing);
+    }
 }
 
 pub fn use_ws() -> bool {
@@ -3088,6 +3163,7 @@ pub mod keys {
     pub const OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN: &str = "allow-only-conn-window-open";
     pub const OPTION_ALLOW_AUTO_RECORD_INCOMING: &str = "allow-auto-record-incoming";
     pub const OPTION_ALLOW_AUTO_RECORD_OUTGOING: &str = "allow-auto-record-outgoing";
+    pub const OPTION_RECORDING_NOTE_ON_END: &str = "recording-note-on-end";
     pub const OPTION_VIDEO_SAVE_DIRECTORY: &str = "video-save-directory";
     pub const OPTION_ENABLE_ABR: &str = "enable-abr";
     pub const OPTION_ALLOW_REMOVE_WALLPAPER: &str = "allow-remove-wallpaper";
@@ -3265,6 +3341,7 @@ pub mod keys {
         OPTION_PRE_ELEVATE_SERVICE,
         OPTION_ALLOW_REMOTE_CM_MODIFICATION,
         OPTION_ALLOW_AUTO_RECORD_OUTGOING,
+        OPTION_RECORDING_NOTE_ON_END,
         OPTION_VIDEO_SAVE_DIRECTORY,
         OPTION_ENABLE_UDP_PUNCH,
         OPTION_ENABLE_IPV6_PUNCH,
@@ -3420,6 +3497,34 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_recording_options_are_saved_when_matching_defaults() {
+        let overwrite = RwLock::new(HashMap::new());
+        let defaults = RwLock::new(HashMap::from([
+            (
+                keys::OPTION_ALLOW_AUTO_RECORD_INCOMING.to_owned(),
+                "Y".to_owned(),
+            ),
+            (
+                keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING.to_owned(),
+                "Y".to_owned(),
+            ),
+        ]));
+
+        assert!(is_option_can_save(
+            &overwrite,
+            keys::OPTION_ALLOW_AUTO_RECORD_INCOMING,
+            &defaults,
+            "Y",
+        ));
+        assert!(is_option_can_save(
+            &overwrite,
+            keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING,
+            &defaults,
+            "Y",
+        ));
     }
 
     #[test]

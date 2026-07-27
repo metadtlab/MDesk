@@ -11,6 +11,7 @@ import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
+import 'package:flutter_hbb/utils/device_register_service.dart';
 import 'package:get/get.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
@@ -21,7 +22,7 @@ import '../../models/platform_model.dart';
 import 'address_book.dart';
 
 void clientClose(SessionID sessionId, FFI ffi) async {
-  if (allowAskForNoteAtEndOfConnection(ffi, true)) {
+  if (shouldShowEndOfConnectionNote(ffi, true)) {
     if (await showConnEndAuditDialogCloseCanceled(ffi: ffi)) {
       return;
     }
@@ -333,7 +334,9 @@ Future<String> changeDirectAccessPort(
 }
 
 Future<String> changeAutoDisconnectTimeout(String old) async {
-  final controller = TextEditingController(text: old);
+  const timeoutOptions = ['10', '20', '30', '40', '50', '60'];
+  var selected = timeoutOptions.contains(old) ? old : '10';
+  var result = old;
   await gFFI.dialogManager.show((setState, close, context) {
     return CustomAlertDialog(
       title: Text(translate("Timeout in minutes")),
@@ -344,23 +347,21 @@ Future<String> changeAutoDisconnectTimeout(String old) async {
           Row(
             children: [
               Expanded(
-                child: TextField(
-                        maxLines: null,
-                        keyboardType: TextInputType.number,
-                        decoration: InputDecoration(
-                            hintText: '10',
-                            isCollapsed: true,
-                            suffix: IconButton(
-                                padding: EdgeInsets.zero,
-                                icon: const Icon(Icons.clear, size: 16),
-                                onPressed: () => controller.clear())),
-                        inputFormatters: [
-                          FilteringTextInputFormatter.allow(RegExp(
-                              r'^([0-9]|[1-9]\d|[1-9]\d{2}|[1-9]\d{3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$')),
-                        ],
-                        controller: controller,
-                        autofocus: true)
-                    .workaroundFreezeLinuxMint(),
+                child: DropdownButtonFormField<String>(
+                  initialValue: selected,
+                  decoration: const InputDecoration(isCollapsed: true),
+                  items: timeoutOptions
+                      .map((value) => DropdownMenuItem(
+                            value: value,
+                            child: Text('$value min'),
+                          ))
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) {
+                      setState(() => selected = value);
+                    }
+                  },
+                ),
               ),
             ],
           ),
@@ -370,14 +371,15 @@ Future<String> changeAutoDisconnectTimeout(String old) async {
         dialogButton("Cancel", onPressed: close, isOutline: true),
         dialogButton("OK", onPressed: () async {
           await bind.mainSetOption(
-              key: kOptionAutoDisconnectTimeout, value: controller.text);
+              key: kOptionAutoDisconnectTimeout, value: selected);
+          result = selected;
           close();
         }),
       ],
       onCancel: close,
     );
   });
-  return controller.text;
+  return result;
 }
 
 class DialogTextField extends StatelessWidget {
@@ -393,6 +395,7 @@ class DialogTextField extends StatelessWidget {
   final TextInputType? keyboardType;
   final List<TextInputFormatter>? inputFormatters;
   final int? maxLength;
+  final bool enabled;
 
   static const kUsernameTitle = 'Username';
   static const kUsernameIcon = Icon(Icons.account_circle_outlined);
@@ -411,6 +414,7 @@ class DialogTextField extends StatelessWidget {
       this.keyboardType,
       this.inputFormatters,
       this.maxLength,
+      this.enabled = true,
       required this.title,
       required this.controller})
       : super(key: key);
@@ -438,6 +442,7 @@ class DialogTextField extends StatelessWidget {
                 keyboardType: keyboardType,
                 inputFormatters: inputFormatters,
                 maxLength: maxLength,
+                enabled: enabled,
               ),
               if (errorText != null)
                 Align(
@@ -710,6 +715,7 @@ class PasswordWidget extends StatefulWidget {
     this.errorText,
     this.title,
     this.maxLength,
+    this.enabled = true,
   }) : super(key: key);
 
   final TextEditingController controller;
@@ -719,6 +725,7 @@ class PasswordWidget extends StatefulWidget {
   final String? errorText;
   final String? title;
   final int? maxLength;
+  final bool enabled;
 
   @override
   State<PasswordWidget> createState() => _PasswordWidgetState();
@@ -733,7 +740,7 @@ class _PasswordWidgetState extends State<PasswordWidget> {
   @override
   void initState() {
     super.initState();
-    if (widget.autoFocus) {
+    if (widget.autoFocus && widget.enabled) {
       _timer =
           Timer(Duration(milliseconds: 50), () => _focusNode.requestFocus());
     }
@@ -766,28 +773,32 @@ class _PasswordWidgetState extends State<PasswordWidget> {
       hintText: translate(widget.hintText ?? 'Enter your password'),
       controller: widget.controller,
       prefixIcon: DialogTextField.kPasswordIcon,
-      suffixIcon: IconButton(
-        icon: Icon(
-            // Based on passwordVisible state choose the icon
-            _passwordVisible ? Icons.visibility : Icons.visibility_off,
-            color: MyTheme.lightTheme.primaryColor),
-        onPressed: () {
-          // Update the state i.e. toggle the state of passwordVisible variable
-          setState(() {
-            _passwordVisible = !_passwordVisible;
-          });
-        },
-      ),
+      suffixIcon: widget.enabled
+          ? IconButton(
+              icon: Icon(
+                  // Based on passwordVisible state choose the icon
+                  _passwordVisible ? Icons.visibility : Icons.visibility_off,
+                  color: MyTheme.lightTheme.primaryColor),
+              onPressed: () {
+                // Update the state i.e. toggle the state of passwordVisible variable
+                setState(() {
+                  _passwordVisible = !_passwordVisible;
+                });
+              },
+            )
+          : null,
       obscureText: !_passwordVisible,
       errorText: widget.errorText,
       focusNode: _focusNode,
       maxLength: widget.maxLength,
+      enabled: widget.enabled,
     );
   }
 }
 
-void wrongPasswordDialog(SessionID sessionId,
-    OverlayDialogManager dialogManager, type, title, text) {
+void wrongPasswordDialog(
+    SessionID sessionId, OverlayDialogManager dialogManager, type, title, text,
+    {String? peerId}) {
   dialogManager.dismissAll();
   dialogManager.show((setState, close, context) {
     cancel() {
@@ -796,7 +807,7 @@ void wrongPasswordDialog(SessionID sessionId,
     }
 
     submit() {
-      enterPasswordDialog(sessionId, dialogManager);
+      enterPasswordDialog(sessionId, dialogManager, peerId: peerId);
     }
 
     return CustomAlertDialog(
@@ -819,11 +830,13 @@ void wrongPasswordDialog(SessionID sessionId,
 }
 
 void enterPasswordDialog(
-    SessionID sessionId, OverlayDialogManager dialogManager) async {
+    SessionID sessionId, OverlayDialogManager dialogManager,
+    {String? peerId}) async {
   await _connectDialog(
     sessionId,
     dialogManager,
     passwordController: TextEditingController(),
+    peerId: peerId,
   );
 }
 
@@ -866,12 +879,48 @@ _connectDialog(
   TextEditingController? passwordController,
   String? osAccountDescTip,
   bool canRememberAccount = true,
+  String? peerId,
 }) async {
   final errUsername = ''.obs;
   var rememberPassword = false;
   if (passwordController != null) {
     rememberPassword =
         await bind.sessionGetRemember(sessionId: sessionId) ?? false;
+  }
+  var preparedCredentialAvailable = rememberPassword;
+  if (passwordController != null &&
+      !preparedCredentialAvailable &&
+      peerId != null &&
+      peerId.isNotEmpty) {
+    try {
+      preparedCredentialAvailable = await bind.mainPeerHasPassword(id: peerId);
+      if (!preparedCredentialAvailable) {
+        final apiServer = await bind.mainGetApiServer();
+        final accessToken = bind.mainGetLocalOption(key: 'access_token');
+        final userId = gFFI.userModel.userName.value;
+        final userPkid = gFFI.userModel.userPkid.value;
+        if (apiServer.isNotEmpty &&
+            accessToken.isNotEmpty &&
+            userId.isNotEmpty) {
+          final status = await deviceRegisterService.checkRegisterLimit(
+            apiServer: apiServer,
+            accessToken: accessToken,
+            userId: userId,
+            userPkid: userPkid,
+            remoteId: peerId,
+          );
+          preparedCredentialAvailable = status.existingDevice == true;
+        }
+      }
+    } catch (error) {
+      debugPrint(
+          'Password dialog: failed to inspect prepared credential for $peerId - $error');
+    }
+  }
+  var usePreparedCredential = preparedCredentialAvailable;
+  if (usePreparedCredential && passwordController != null) {
+    rememberPassword = true;
+    passwordController.text = '••••••••';
   }
   var rememberAccount = false;
   if (canRememberAccount && osUsernameController != null) {
@@ -903,8 +952,8 @@ _connectDialog(
       }
       final osUsername = osUsernameController?.text.trim() ?? '';
       final osPassword = osPasswordController?.text.trim() ?? '';
-      final password = passwordController?.text.trim() ?? '';
-      if (passwordController != null && password.isEmpty) return;
+      final password =
+          usePreparedCredential ? '' : (passwordController?.text.trim() ?? '');
       if (rememberAccount) {
         bind.sessionPeerOption(
             sessionId: sessionId, name: 'os-username', value: osUsername);
@@ -1009,15 +1058,23 @@ _connectDialog(
         children: [
           descWidget(translate('verify_rustdesk_password_tip')),
           PasswordWidget(
+            key: ValueKey(usePreparedCredential),
             controller: passwordController,
-            autoFocus: osUsernameController == null,
+            autoFocus: osUsernameController == null && !usePreparedCredential,
+            enabled: !usePreparedCredential,
           ),
           rememberWidget(
             translate('Remember password'),
             rememberPassword,
             (v) {
               if (v != null) {
-                setState(() => rememberPassword = v);
+                setState(() {
+                  if (!v && usePreparedCredential) {
+                    usePreparedCredential = false;
+                    passwordController.clear();
+                  }
+                  rememberPassword = v;
+                });
               }
             },
           ),
@@ -1521,6 +1578,9 @@ showSetOSAccount(
 Widget buildNoteTextField({
   required TextEditingController controller,
   required VoidCallback onEscape,
+  int maxLength = 256,
+  String? hintText,
+  bool autofocus = true,
 }) {
   final focusNode = FocusNode(
     onKey: (FocusNode node, RawKeyEvent evt) {
@@ -1546,11 +1606,11 @@ Widget buildNoteTextField({
   );
 
   return TextField(
-    autofocus: true,
+    autofocus: autofocus,
     keyboardType: TextInputType.multiline,
     textInputAction: TextInputAction.newline,
     decoration: InputDecoration(
-      hintText: translate('input note here'),
+      hintText: translate(hintText ?? 'input note here'),
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(8),
       ),
@@ -1558,7 +1618,7 @@ Widget buildNoteTextField({
     ),
     minLines: 5,
     maxLines: null,
-    maxLength: 256,
+    maxLength: maxLength,
     controller: controller,
     focusNode: focusNode,
   ).workaroundFreezeLinuxMint();
@@ -1607,6 +1667,19 @@ bool allowAskForNoteAtEndOfConnection(FFI? ffi, bool closedByControlling) {
           bind.willSessionCloseCloseSession(sessionId: ffi.sessionId));
 }
 
+bool allowAskForRecordingNoteAtEndOfConnection(FFI? ffi) {
+  if (ffi == null || isWeb) {
+    return false;
+  }
+  return mainGetLocalBoolOptionSync(kOptionRecordingNoteOnEnd) &&
+      ffi.recordingModel.hasRecorded;
+}
+
+bool shouldShowEndOfConnectionNote(FFI? ffi, bool closedByControlling) {
+  return allowAskForNoteAtEndOfConnection(ffi, closedByControlling) ||
+      allowAskForRecordingNoteAtEndOfConnection(ffi);
+}
+
 // return value: close canceled
 //  true: return
 //  false: go on
@@ -1647,9 +1720,19 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
   String? text,
 }) async {
   final closedByControlling = type == null;
-  final showDialog = allowAskForNoteAtEndOfConnection(ffi, closedByControlling);
-  if (!showDialog) {
+  final showAuditNote =
+      allowAskForNoteAtEndOfConnection(ffi, closedByControlling);
+  final showRecordingNote = allowAskForRecordingNoteAtEndOfConnection(ffi);
+  if (!showAuditNote && !showRecordingNote) {
     return false;
+  }
+  final resumeRecordingOnCancel =
+      showRecordingNote && bind.sessionGetIsRecording(sessionId: ffi.sessionId);
+  if (showRecordingNote) {
+    // Finalize the video before opening the work-note dialog so the file does
+    // not keep growing while the user enters its title and description.
+    await bind.sessionRecordScreen(sessionId: ffi.sessionId, start: false);
+    ffi.recordingModel.updateStatus(false);
   }
   ffi.dialogManager.dismissAll();
 
@@ -1686,54 +1769,119 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
     }
   }
 
-  final controller = TextEditingController();
-  bool askForNote =
+  final noteController = TextEditingController();
+  final titleController = TextEditingController();
+  bool askForAuditNote =
       mainGetLocalBoolOptionSync(kOptionAllowAskForNoteAtEndOfConnection);
-  final isOptFixed = isOptionFixed(kOptionAllowAskForNoteAtEndOfConnection);
+  bool askForRecordingNote =
+      mainGetLocalBoolOptionSync(kOptionRecordingNoteOnEnd);
+  final isAuditOptFixed =
+      isOptionFixed(kOptionAllowAskForNoteAtEndOfConnection);
+  final isRecordingOptFixed = isOptionFixed(kOptionRecordingNoteOnEnd);
   bool isInProgress = false;
+  String saveError = '';
+  bool koreanInputRequested = false;
+
+  if (showRecordingNote) {
+    // The remote keyboard grab can consume the Hangul key before the local
+    // TextField receives it. Release it while the recording note dialog owns
+    // the keyboard.
+    ffi.inputModel.enterOrLeave(false);
+  }
 
   return await ffi.dialogManager.show<bool>((setState, close, context) {
-    cancel() {
+    if (showRecordingNote && isWindows && !koreanInputRequested) {
+      koreanInputRequested = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await bind.hostActivateKoreanInput();
+      });
+    }
+
+    cancel() async {
+      if (resumeRecordingOnCancel) {
+        await bind.sessionRecordScreen(sessionId: ffi.sessionId, start: true);
+      }
       close(true);
     }
 
-    set() async {
-      if (isInProgress) return;
+    Future<bool> set() async {
+      if (isInProgress) return false;
+      final recordingTitle = titleController.text.trim();
+      if (showRecordingNote &&
+          !RegExp(r'[ㄱ-ㅎㅏ-ㅣ가-힣]').hasMatch(recordingTitle)) {
+        setState(() {
+          saveError = translate('Enter a Korean video title');
+        });
+        return false;
+      }
       setState(() {
         isInProgress = true;
+        saveError = '';
       });
-      var text = controller.text;
-      if (text.isNotEmpty) {
+      final noteText = noteController.text.trim();
+      if (showRecordingNote) {
+        final error = await bind.sessionSaveRecordingNote(
+          sessionId: ffi.sessionId,
+          title: recordingTitle,
+          comment: noteText,
+        );
+        if (error.isNotEmpty) {
+          setState(() {
+            isInProgress = false;
+            saveError = error;
+          });
+          return false;
+        }
+        ffi.recordingModel.markNoteSaved();
+      }
+      if (showAuditNote && noteText.isNotEmpty) {
         await updateAuditNoteByGuid(
-                bind.sessionGetAuditGuid(sessionId: ffi.sessionId), text)
+                bind.sessionGetAuditGuid(sessionId: ffi.sessionId), noteText)
             .timeout(const Duration(seconds: 6), onTimeout: () {
           debugPrint('updateAuditNoteByGuid timeout after 6s');
         });
       }
-      // Save the "ask for note" preference
-      if (!isOptFixed) {
+      if (showAuditNote && !isAuditOptFixed) {
         await mainSetLocalBoolOption(
-            kOptionAllowAskForNoteAtEndOfConnection, askForNote);
+            kOptionAllowAskForNoteAtEndOfConnection, askForAuditNote);
       }
+      if (showRecordingNote && !isRecordingOptFixed) {
+        await mainSetLocalBoolOption(
+            kOptionRecordingNoteOnEnd, askForRecordingNote);
+      }
+      return true;
     }
 
     submit() async {
-      await set();
+      if (await set()) {
+        close(false);
+      }
+    }
+
+    discardAndClose() async {
+      if (isInProgress) return;
+      await bind.sessionRecordScreen(sessionId: ffi.sessionId, start: false);
+      ffi.recordingModel.markNoteSaved();
       close(false);
     }
 
     final buttons = [
-      dialogButton('OK', onPressed: isInProgress ? null : submit)
+      dialogButton(showRecordingNote ? 'Save and close' : 'OK',
+          onPressed: isInProgress ? null : submit)
     ];
+    if (showRecordingNote) {
+      buttons.add(dialogButton('Close without saving',
+          onPressed: isInProgress ? null : discardAndClose, isOutline: true));
+    }
     if (type == 'relay-hint' || type == 'relay-hint2') {
       buttons.add(dialogButton('Retry', onPressed: () async {
-        await set();
+        if (!await set()) return;
         close(true);
         ffi.ffiModel.reconnect(ffi.dialogManager, ffi.sessionId, false);
       }));
       if (type == 'relay-hint2') {
         buttons.add(dialogButton('Connect via relay', onPressed: () async {
-          await set();
+          if (!await set()) return;
           close(true);
           ffi.ffiModel.reconnect(ffi.dialogManager, ffi.sessionId, true);
         }));
@@ -1755,37 +1903,53 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
     }
 
     return CustomAlertDialog(
-      title: null,
+      title: showRecordingNote ? Text(translate('Recording work note')) : null,
       content: SizedBox(
-          width: 350,
+          width: showRecordingNote ? 430 : 350,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               content,
               const SizedBox(height: 16),
+              if (showRecordingNote) ...[
+                TextField(
+                  controller: titleController,
+                  autofocus: true,
+                  maxLength: 120,
+                  decoration: InputDecoration(
+                    labelText: translate('Video title'),
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               SizedBox(
-                height: 120,
+                height: showRecordingNote ? 165 : 120,
                 child: buildNoteTextField(
-                  controller: controller,
-                  onEscape: cancel,
+                  controller: noteController,
+                  onEscape: closedByControlling ? cancel : () {},
+                  maxLength: showRecordingNote ? 2000 : 256,
+                  hintText:
+                      showRecordingNote ? 'Work details' : 'input note here',
+                  autofocus: !showRecordingNote,
                 ),
               ),
-              if (!isOptFixed) ...[
+              if (showAuditNote && !isAuditOptFixed) ...[
                 const SizedBox(height: 8),
                 InkWell(
                   onTap: () {
                     setState(() {
-                      askForNote = !askForNote;
+                      askForAuditNote = !askForAuditNote;
                     });
                   },
                   child: Row(
                     children: [
                       Checkbox(
-                        value: askForNote,
+                        value: askForAuditNote,
                         onChanged: (value) {
                           setState(() {
-                            askForNote = value ?? false;
+                            askForAuditNote = value ?? false;
                           });
                         },
                       ),
@@ -1799,13 +1963,46 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
                   ),
                 ),
               ],
+              if (showRecordingNote && !isRecordingOptFixed) ...[
+                const SizedBox(height: 8),
+                InkWell(
+                  onTap: () {
+                    setState(() {
+                      askForRecordingNote = !askForRecordingNote;
+                    });
+                  },
+                  child: Row(
+                    children: [
+                      Checkbox(
+                        value: askForRecordingNote,
+                        onChanged: (value) {
+                          setState(() {
+                            askForRecordingNote = value ?? false;
+                          });
+                        },
+                      ),
+                      Expanded(
+                        child: Text(
+                          translate('Ask for work details when recording ends'),
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (isInProgress)
                 const LinearProgressIndicator().marginOnly(top: 4),
+              if (saveError.isNotEmpty)
+                Text(
+                  saveError,
+                  style: const TextStyle(color: Colors.red, fontSize: 13),
+                ).marginOnly(top: 8),
             ],
           )),
       actions: buttons,
       onSubmit: submit,
-      onCancel: cancel,
+      onCancel: closedByControlling ? cancel : null,
     );
   });
 }

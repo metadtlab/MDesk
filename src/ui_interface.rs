@@ -858,11 +858,54 @@ pub fn video_save_directory(root: bool) -> String {
     let appname = crate::get_app_name();
     // ui process can show it correctly Once vidoe process created it.
     let try_create = |path: &std::path::Path| {
-        if !path.exists() {
-            std::fs::create_dir_all(path).ok();
+        if !path.is_dir() {
+            if path.exists() {
+                log::warn!(
+                    "Recording path exists but is not a directory: {}",
+                    path.display()
+                );
+                return "".to_string();
+            }
+            if let Err(err) = std::fs::create_dir_all(path) {
+                log::warn!(
+                    "Failed to create recording directory '{}': {err}",
+                    path.display()
+                );
+                return "".to_string();
+            }
         }
-        if path.exists() {
-            path.to_string_lossy().to_string()
+        if path.is_dir() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let probe = path.join(format!(
+                ".mdesk-recording-write-test-{}-{nonce}.tmp",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(file) => {
+                    drop(file);
+                    if let Err(err) = std::fs::remove_file(&probe) {
+                        log::warn!(
+                            "Failed to remove recording directory write test '{}': {err}",
+                            probe.display()
+                        );
+                    }
+                    path.to_string_lossy().to_string()
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Recording directory is not writable '{}': {err}",
+                        path.display()
+                    );
+                    "".to_string()
+                }
+            }
         } else {
             "".to_string()
         }
@@ -873,18 +916,34 @@ pub fn video_save_directory(root: bool) -> String {
         #[cfg(windows)]
         {
             let drive = std::env::var("SystemDrive").unwrap_or("C:".to_owned());
-            let dir =
+            let path =
                 std::path::PathBuf::from(format!("{drive}\\ProgramData\\{appname}\\recording",));
-            return dir.to_string_lossy().to_string();
+            let dir = try_create(&path);
+            if !dir.is_empty() {
+                return dir;
+            }
+            log::warn!(
+                "Falling back from unavailable system recording directory: {}",
+                path.display()
+            );
         }
     }
-    // Get directory from config file otherwise --server will use the old value from global var.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Desktop MDesk can have multiple long-lived processes. Always read the
+    // latest persisted directory rather than a stale per-process cache.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let dir = LocalConfig::get_option_from_file(OPTION_VIDEO_SAVE_DIRECTORY);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let dir = LocalConfig::get_option(OPTION_VIDEO_SAVE_DIRECTORY);
     if !dir.is_empty() {
-        return dir;
+        let path = std::path::Path::new(&dir);
+        let configured_dir = try_create(path);
+        if !configured_dir.is_empty() {
+            return configured_dir;
+        }
+        log::warn!(
+            "Falling back from unavailable configured recording directory: {}",
+            path.display()
+        );
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     if let Ok(home) = config::APP_HOME_DIR.read() {
@@ -902,18 +961,56 @@ pub fn video_save_directory(root: bool) -> String {
             if !dir.is_empty() {
                 return dir;
             }
-            if video_dir.exists() {
-                return video_dir.to_string_lossy().to_string();
+
+            // Windows Controlled Folder Access can make the Videos known
+            // folder look like a normal directory while rejecting every file
+            // creation attempt. Prefer Downloads because it is user-visible
+            // and is not normally protected by Controlled Folder Access.
+            #[cfg(windows)]
+            if let Some(download_dir) = user.download_dir() {
+                let path = download_dir.join(&appname).join("recording");
+                let dir = try_create(&path);
+                if !dir.is_empty() {
+                    log::warn!(
+                        "Using Downloads recording directory because Videos is unavailable: {}",
+                        path.display()
+                    );
+                    return dir;
+                }
+            }
+
+            // Keep the final fallback outside the application's update and
+            // extraction directory so an upgrade cannot remove recordings.
+            #[cfg(windows)]
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                let path = std::path::PathBuf::from(local_app_data)
+                    .join(format!("{appname}Data"))
+                    .join("recording");
+                let dir = try_create(&path);
+                if !dir.is_empty() {
+                    log::warn!(
+                        "Using LocalAppData recording directory because visible folders are unavailable: {}",
+                        path.display()
+                    );
+                    return dir;
+                }
+            }
+
+            let dir = try_create(video_dir);
+            if !dir.is_empty() {
+                return dir;
             }
         }
         if let Some(desktop_dir) = user.desktop_dir() {
-            if desktop_dir.exists() {
-                return desktop_dir.to_string_lossy().to_string();
+            let dir = try_create(desktop_dir);
+            if !dir.is_empty() {
+                return dir;
             }
         }
         let home = user.home_dir();
-        if home.exists() {
-            return home.to_string_lossy().to_string();
+        let dir = try_create(home);
+        if !dir.is_empty() {
+            return dir;
         }
     }
 
@@ -930,15 +1027,18 @@ pub fn video_save_directory(root: bool) -> String {
         if !dir.is_empty() {
             return dir;
         }
-        if video_dir.exists() {
-            return video_dir.to_string_lossy().to_string();
+        let dir = try_create(&video_dir);
+        if !dir.is_empty() {
+            return dir;
         }
         let desktop_dir = home.join("Desktop");
-        if desktop_dir.exists() {
-            return desktop_dir.to_string_lossy().to_string();
+        let dir = try_create(&desktop_dir);
+        if !dir.is_empty() {
+            return dir;
         }
-        if home.exists() {
-            return home.to_string_lossy().to_string();
+        let dir = try_create(&home);
+        if !dir.is_empty() {
+            return dir;
         }
     }
 
@@ -948,8 +1048,10 @@ pub fn video_save_directory(root: bool) -> String {
             if !dir.is_empty() {
                 return dir;
             }
-            // basically exist
-            return parent.to_string_lossy().to_string();
+            let dir = try_create(parent);
+            if !dir.is_empty() {
+                return dir;
+            }
         }
     }
     Default::default()

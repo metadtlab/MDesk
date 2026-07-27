@@ -1066,15 +1066,25 @@ fn get_recorder(
         } else {
             None
         };
-        Recorder::new(RecorderContext {
+        let dir = crate::ui_interface::video_save_directory(root);
+        match Recorder::new(RecorderContext {
             server: true,
             id: Config::get_id(),
-            dir: crate::ui_interface::video_save_directory(root),
+            device_name: String::new(),
+            dir: dir.clone(),
             display_idx,
             camera,
             tx,
-        })
-        .map_or(Default::default(), |r| Arc::new(Mutex::new(Some(r))))
+        }) {
+            Ok(recorder) => Arc::new(Mutex::new(Some(recorder))),
+            Err(err) => {
+                log::error!(
+                    "Failed to initialize incoming session recorder in '{}': {err:#}",
+                    dir
+                );
+                Default::default()
+            }
+        }
     } else {
         Default::default()
     };

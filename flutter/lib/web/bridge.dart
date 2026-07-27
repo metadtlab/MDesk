@@ -188,6 +188,14 @@ class RustdeskImpl {
     return false;
   }
 
+  Future<String> sessionSaveRecordingNote(
+      {required UuidValue sessionId,
+      required String title,
+      required String comment,
+      dynamic hint}) {
+    throw UnimplementedError("sessionSaveRecordingNote");
+  }
+
   Future<void> sessionReconnect(
       {required UuidValue sessionId, required bool forceRelay, dynamic hint}) {
     return Future(() => js.context.callMethod('setByName', ['reconnect']));

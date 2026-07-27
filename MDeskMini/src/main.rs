@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hbb_common::config::{self, Config};
 #[cfg(target_os = "windows")]
 use librustdesk::platform;
-use librustdesk::{common, flutter_ffi, portable_service, start_server, VERSION};
+use librustdesk::{
+    common, flutter_ffi, is_rendezvous_registered, portable_service, start_server, VERSION,
+};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -55,6 +57,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const DEFAULT_CERT_VERIFY_URL: &str = "https://admin.787.kr/api/certno/verify";
 const DEFAULT_AGENTNUMUPDATE_BASE_URL: &str = "https://787.kr";
 const DEFAULT_API_HINT: &str = "https://admin.787.kr";
+const READINESS_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+const RENDEZVOUS_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
@@ -375,10 +379,21 @@ fn run_serve(options: ServeOptions) {
         "MDesk 준비중",
         "인증번호를 확인하고 있습니다.",
     );
-    if let Err(err) = apply_clipboard_cert_bootstrap(&options) {
-        // 인증 실패 메시지박스는 사용자에게 노출하지 않고 로그만 남긴다.
-        // verify 자체는 Flutter UI / 후속 인스턴스에서 다시 시도되므로 그대로 진행한다.
-        eprintln!("cert bootstrap failed (ignored): {err}");
+    let cert_verification = match apply_clipboard_cert_bootstrap(&options) {
+        Ok(verification) => verification,
+        Err(err) => {
+            // 인증 실패 메시지박스는 사용자에게 노출하지 않고 로그만 남긴다.
+            // verify 자체는 Flutter UI / 후속 인스턴스에서 다시 시도되므로 그대로 진행한다.
+            eprintln!("cert bootstrap failed (ignored): {err}");
+            None
+        }
+    };
+    if let Some(verification) = cert_verification.clone() {
+        report_readiness_stage_async(
+            verification,
+            options.api.clone().unwrap_or_default(),
+            "preparing",
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -410,6 +425,13 @@ fn run_serve(options: ServeOptions) {
         "연결 관리자를 시작하고 있습니다.",
     );
     flutter_ffi::cm_init();
+    if let Some(verification) = cert_verification.clone() {
+        report_readiness_stage_async(
+            verification,
+            options.api.clone().unwrap_or_default(),
+            "service_ready",
+        );
+    }
 
     #[cfg(target_os = "windows")]
     update_startup_progress(
@@ -431,6 +453,9 @@ fn run_serve(options: ServeOptions) {
     let server_thread = thread::spawn(|| {
         start_server(true, false);
     });
+    if let Some(verification) = cert_verification {
+        spawn_rendezvous_ready_reporter(verification, options.api.clone().unwrap_or_default());
+    }
 
     #[cfg(target_os = "windows")]
     update_startup_progress(
@@ -521,9 +546,11 @@ fn apply_host_policy(options: &ServeOptions) {
     }
 }
 
-fn apply_clipboard_cert_bootstrap(options: &ServeOptions) -> Result<(), String> {
+fn apply_clipboard_cert_bootstrap(
+    options: &ServeOptions,
+) -> Result<Option<CertVerification>, String> {
     let Some(certnum) = clipboard_certnum() else {
-        return Ok(());
+        return Ok(None);
     };
 
     println!("clipboard certno detected: {certnum}");
@@ -534,14 +561,6 @@ fn apply_clipboard_cert_bootstrap(options: &ServeOptions) -> Result<(), String> 
             Config::set_option("custom-certno".to_owned(), "true".to_owned());
             Config::set_option("custom-agentid".to_owned(), "0".to_owned());
             Config::set_option("custom-id".to_owned(), verification.customer_id.clone());
-            match call_agentnumupdate(&verification, options.api.as_deref().unwrap_or_default()) {
-                Ok(agent_url) => {
-                    println!("agentnumupdate success: url={agent_url}");
-                }
-                Err(err) => {
-                    eprintln!("agentnumupdate failed: {err}");
-                }
-            }
             println!(
                 "cert verify success: customer_id={} peer_id={} verified_peer_id={} cert_code={} url={}",
                 verification.customer_id,
@@ -550,7 +569,7 @@ fn apply_clipboard_cert_bootstrap(options: &ServeOptions) -> Result<(), String> 
                 verification.cert_code,
                 verification.verify_url
             );
-            Ok(())
+            Ok(Some(verification))
         }
         Err(err) => Err(err),
     }
@@ -742,7 +761,10 @@ fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerificatio
     }
 
     let owner_mdesk_id = parsed.owner_mdesk_id.trim();
-    if owner_mdesk_id.is_empty() || parsed.session_id <= 0 || parsed.connection_token.trim().is_empty() {
+    if owner_mdesk_id.is_empty()
+        || parsed.session_id <= 0
+        || parsed.connection_token.trim().is_empty()
+    {
         return Err(format!(
             "{verify_url}: success=true but the cert session binding is incomplete"
         ));
@@ -774,6 +796,145 @@ fn build_cert_verify_url(api_hint: &str) -> String {
     } else {
         format!("{trimmed}/api/certno/verify")
     }
+}
+
+#[derive(Debug)]
+enum ReadinessPostResult {
+    Success(String),
+    LegacyEndpointUnavailable,
+}
+
+fn report_readiness_stage_async(
+    verification: CertVerification,
+    api_hint: String,
+    stage: &'static str,
+) {
+    thread::spawn(move || {
+        match post_cert_readiness(&verification, &api_hint, "progress", Some(stage), 2) {
+            Ok(ReadinessPostResult::Success(url)) => {
+                println!("readiness progress success: stage={stage} url={url}");
+            }
+            Ok(ReadinessPostResult::LegacyEndpointUnavailable) => {
+                println!("readiness progress endpoint unavailable: stage={stage}");
+            }
+            Err(err) => {
+                eprintln!("readiness progress failed: stage={stage} error={err}");
+            }
+        }
+    });
+}
+
+fn spawn_rendezvous_ready_reporter(verification: CertVerification, api_hint: String) {
+    thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut next_wait_log = Duration::from_secs(5);
+        while !is_rendezvous_registered() {
+            if started_at.elapsed() >= next_wait_log {
+                println!(
+                    "waiting for rendezvous registration before ready signal: elapsed={}s",
+                    started_at.elapsed().as_secs()
+                );
+                next_wait_log += Duration::from_secs(10);
+            }
+            thread::sleep(RENDEZVOUS_READY_POLL_INTERVAL);
+        }
+
+        println!(
+            "rendezvous registration confirmed; reporting remote ready: peer_id={}",
+            verification.verified_peer_id
+        );
+        match post_cert_readiness(&verification, &api_hint, "ready", None, 5) {
+            Ok(ReadinessPostResult::Success(url)) => {
+                println!("remote ready success: url={url}");
+            }
+            Ok(ReadinessPostResult::LegacyEndpointUnavailable) => {
+                println!("ready endpoint unavailable; using legacy agentnumupdate fallback");
+                match call_agentnumupdate(&verification, &api_hint) {
+                    Ok(agent_url) => {
+                        println!("legacy agentnumupdate success after ready: url={agent_url}");
+                    }
+                    Err(err) => {
+                        eprintln!("legacy agentnumupdate failed after ready: {err}");
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("remote ready report failed: {err}");
+            }
+        }
+    });
+}
+
+fn post_cert_readiness(
+    verification: &CertVerification,
+    api_hint: &str,
+    endpoint: &str,
+    stage: Option<&str>,
+    attempts: usize,
+) -> Result<ReadinessPostResult, String> {
+    let url = build_cert_readiness_url(api_hint, endpoint);
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(READINESS_HTTP_TIMEOUT)
+        .build()
+        .map_err(|err| format!("http client build failed: {err}"))?;
+    let body = if let Some(stage) = stage {
+        json!({
+            "session_id": verification.session_id,
+            "owner_mdesk_id": verification.owner_mdesk_id,
+            "peer_id": verification.verified_peer_id,
+            "connection_token": verification.connection_token,
+            "stage": stage,
+        })
+    } else {
+        json!({
+            "session_id": verification.session_id,
+            "owner_mdesk_id": verification.owner_mdesk_id,
+            "peer_id": verification.verified_peer_id,
+            "connection_token": verification.connection_token,
+        })
+    };
+
+    let max_attempts = attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 1..=max_attempts {
+        match client.post(&url).json(&body).send() {
+            Ok(response) => {
+                let status = response.status();
+                let response_body = response.text().unwrap_or_default();
+                if status.is_success() {
+                    return Ok(ReadinessPostResult::Success(url));
+                }
+                if status.as_u16() == 404 || status.as_u16() == 405 {
+                    return Ok(ReadinessPostResult::LegacyEndpointUnavailable);
+                }
+                last_error = format!(
+                    "{url}: unexpected status {status} on attempt {attempt} body={response_body}"
+                );
+                if status.is_client_error() {
+                    break;
+                }
+            }
+            Err(err) => {
+                last_error = format!("{url}: request failed on attempt {attempt}: {err}");
+            }
+        }
+
+        if attempt < max_attempts {
+            let shift = (attempt - 1).min(3) as u32;
+            thread::sleep(Duration::from_millis(250_u64 << shift));
+        }
+    }
+    Err(last_error)
+}
+
+fn build_cert_readiness_url(api_hint: &str, endpoint: &str) -> String {
+    let verify_url = build_cert_verify_url(api_hint);
+    let cert_api_base = verify_url
+        .strip_suffix("/verify")
+        .unwrap_or(verify_url.as_str())
+        .trim_end_matches('/');
+    format!("{cert_api_base}/{}", endpoint.trim_matches('/'))
 }
 
 fn call_agentnumupdate(verification: &CertVerification, api_hint: &str) -> Result<String, String> {
@@ -1549,4 +1710,33 @@ fn to_wide(value: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_urls_follow_the_certificate_api_host() {
+        assert_eq!(
+            build_cert_readiness_url("https://admin.787.kr/api/certno/verify", "progress"),
+            "https://admin.787.kr/api/certno/progress"
+        );
+        assert_eq!(
+            build_cert_readiness_url("https://admin.787.kr", "ready"),
+            "https://admin.787.kr/api/certno/ready"
+        );
+    }
+
+    #[test]
+    fn legacy_agent_update_still_uses_the_public_api_host() {
+        assert_eq!(
+            build_agentnumupdate_url(
+                "https://admin.787.kr/api/certno/verify",
+                "imedix",
+                "123456789"
+            ),
+            "https://787.kr/api/agentnumupdate/imedix/123456789?agentid=0"
+        );
+    }
 }

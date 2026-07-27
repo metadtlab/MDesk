@@ -73,6 +73,7 @@ const String kWindowEventGetRemoteList = "get_remote_list";
 const String kWindowEventGetSessionIdList = "get_session_id_list";
 const String kWindowEventRemoteWindowCoords = "remote_window_coords";
 const String kWindowEventSetFullscreen = "set_fullscreen";
+const String kWindowEventRemoteConnected = "remote_connected";
 
 const String kWindowEventMoveTabToNewWindow = "move_tab_to_new_window";
 const String kWindowEventGetCachedSessionData = "get_cached_session_data";
@@ -100,6 +101,7 @@ const String kOptionAutoDisconnectTimeout = "auto-disconnect-timeout";
 const String kOptionEnableHwcodec = "enable-hwcodec";
 const String kOptionAllowAutoRecordIncoming = "allow-auto-record-incoming";
 const String kOptionAllowAutoRecordOutgoing = "allow-auto-record-outgoing";
+const String kOptionRecordingNoteOnEnd = "recording-note-on-end";
 const String kOptionVideoSaveDirectory = "video-save-directory";
 const String kOptionAccessMode = "access-mode";
 const String kOptionEnableKeyboard = "enable-keyboard";

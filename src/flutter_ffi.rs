@@ -106,6 +106,7 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
         apply_android_app_role_config(conn_type, app_name);
     }
     config::apply_product_default_settings();
+    config::persist_recording_options();
     #[cfg(target_os = "android")]
     {
         // flexi_logger can't work when android_logger initialized.
@@ -157,6 +158,15 @@ pub enum EventToUI {
 pub fn host_stop_system_key_propagate(_stopped: bool) {
     #[cfg(windows)]
     crate::platform::windows::stop_system_key_propagate(_stopped);
+}
+
+pub fn host_activate_korean_input() -> bool {
+    #[cfg(windows)]
+    {
+        return crate::platform::windows::activate_korean_input_for_foreground_window();
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 // This function is only used to count the number of control sessions.
@@ -393,6 +403,18 @@ pub fn session_get_is_recording(session_id: SessionID) -> SyncReturn<bool> {
         SyncReturn(session.is_recording())
     } else {
         SyncReturn(false)
+    }
+}
+
+pub fn session_save_recording_note(
+    session_id: SessionID,
+    title: String,
+    comment: String,
+) -> String {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.save_recording_note(title, comment)
+    } else {
+        "녹화 세션을 찾을 수 없습니다.".to_owned()
     }
 }
 

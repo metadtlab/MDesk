@@ -1620,6 +1620,8 @@ pub struct VideoHandler {
     pub texture: ImageTexture,
     recorder: Arc<Mutex<Option<Recorder>>>,
     record: bool,
+    record_active: bool,
+    record_status_changed: Option<(bool, Option<String>)>,
     _display: usize, // useful for debug
     fail_counter: usize,
     first_frame: bool,
@@ -1652,6 +1654,8 @@ impl VideoHandler {
             texture: Default::default(),
             recorder: Default::default(),
             record: false,
+            record_active: false,
+            record_status_changed: None,
             _display,
             fail_counter: 0,
             first_frame: true,
@@ -1697,14 +1701,35 @@ impl VideoHandler {
                 }
                 self.first_frame = false;
                 if self.record {
-                    self.recorder.lock().unwrap().as_mut().map(|r| {
+                    let write_result = self.recorder.lock().unwrap().as_mut().map(|r| {
                         let (w, h) = if *pixelbuffer {
                             (self.rgb.w, self.rgb.h)
                         } else {
                             (self.texture.w, self.texture.h)
                         };
-                        r.write_frame(frame, w, h).ok();
+                        let result = r.write_frame(frame, w, h);
+                        let filename = r.current_filename();
+                        (result, filename)
                     });
+                    match write_result {
+                        Some((Ok(()), filename)) => {
+                            if !self.record_active {
+                                self.record_active = true;
+                                self.record_status_changed = Some((true, filename));
+                            }
+                        }
+                        Some((Err(err), _)) => {
+                            log::error!(
+                                "Screen recording failed for display #{}: {err:#}",
+                                self._display
+                            );
+                            self.record = false;
+                            self.record_active = false;
+                            self.recorder = Default::default();
+                            self.record_status_changed = Some((false, None));
+                        }
+                        None => {}
+                    }
                 }
                 res
             }
@@ -1728,23 +1753,48 @@ impl VideoHandler {
     }
 
     /// Start or stop screen record.
-    pub fn record_screen(&mut self, start: bool, id: String, display_idx: usize, camera: bool) {
+    pub fn record_screen(
+        &mut self,
+        start: bool,
+        id: String,
+        device_name: String,
+        display_idx: usize,
+        camera: bool,
+    ) {
+        let was_active = self.record_active;
         self.record = false;
+        self.record_active = false;
         if start {
-            self.recorder = Recorder::new(RecorderContext {
+            let dir = crate::ui_interface::video_save_directory(false);
+            self.recorder = match Recorder::new(RecorderContext {
                 server: false,
                 id,
-                dir: crate::ui_interface::video_save_directory(false),
+                device_name,
+                dir: dir.clone(),
                 display_idx,
                 camera,
                 tx: None,
-            })
-            .map_or(Default::default(), |r| Arc::new(Mutex::new(Some(r))));
+            }) {
+                Ok(recorder) => {
+                    self.record = true;
+                    Arc::new(Mutex::new(Some(recorder)))
+                }
+                Err(err) => {
+                    log::error!("Failed to initialize screen recorder in '{}': {err:#}", dir);
+                    self.record_status_changed = Some((false, None));
+                    Default::default()
+                }
+            };
         } else {
             self.recorder = Default::default();
+            if was_active {
+                self.record_status_changed = Some((false, None));
+            }
         }
+    }
 
-        self.record = start;
+    pub fn take_record_status_changed(&mut self) -> Option<(bool, Option<String>)> {
+        self.record_status_changed.take()
     }
 }
 
@@ -1832,9 +1882,12 @@ pub struct LoginConfigHandler {
     pub peer_info: Option<PeerInfo>,
     password_source: PasswordSource, // where the sent password comes from
     shared_password: Option<String>, // Store the shared password
+    reuse_authenticated_session: bool,
     pub enable_trusted_devices: bool,
     pub record_state: bool,
+    pub record_active: bool,
     pub record_permission: bool,
+    pub recording_files: Vec<String>,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1908,6 +1961,8 @@ impl LoginConfigHandler {
         let conn_token = conn_token
             .map(|x| serde_json::from_str::<ConnToken>(&x).ok())
             .flatten();
+        self.reuse_authenticated_session =
+            self.conn_type == ConnType::FILE_TRANSFER && conn_token.is_some();
         let mut sid = 0;
         if let Some(token) = conn_token {
             sid = token.session_id;
@@ -1943,7 +1998,9 @@ impl LoginConfigHandler {
         self.selected_windows_session_id = None;
         self.shared_password = shared_password;
         self.record_state = false;
+        self.record_active = false;
         self.record_permission = true;
+        self.recording_files.clear();
 
         // `std::env::remove_var("IS_TERMINAL_ADMIN");` is called in `session_add_sync()` - `flutter_ffi.rs`.
         let is_terminal_admin = conn_type == ConnType::TERMINAL
@@ -2535,6 +2592,23 @@ impl LoginConfigHandler {
         }
     }
 
+    pub fn recording_device_name(&self) -> String {
+        let config = self.load_config();
+        let alias = config
+            .options
+            .get("alias")
+            .map(|value| value.trim())
+            .unwrap_or_default();
+        if !alias.is_empty() {
+            return alias.to_owned();
+        }
+        let hostname = self.info.hostname.trim();
+        if !hostname.is_empty() && hostname != self.id {
+            return hostname.to_owned();
+        }
+        String::new()
+    }
+
     #[inline]
     pub fn get_custom_resolution(&self, display: i32) -> Option<(i32, i32)> {
         self.config
@@ -2815,9 +2889,9 @@ impl LoginConfigHandler {
     }
 
     pub fn get_conn_token(&self) -> Option<String> {
-        if self.password.is_empty() {
-            return None;
-        }
+        // This is emitted only by an established session. Keep the token even
+        // when the peer was accepted without a password so a child file
+        // transfer can reuse the authenticated session without a local prompt.
         serde_json::to_string(&ConnToken {
             password: self.password.clone(),
             password_source: self.password_source.clone(),
@@ -2912,9 +2986,18 @@ pub fn start_video_thread<F, T>(
                             let mut handler = VideoHandler::new(format, display);
                             let record_state = session.lc.read().unwrap().record_state;
                             let record_permission = session.lc.read().unwrap().record_permission;
-                            let id = session.lc.read().unwrap().id.clone();
+                            let (id, device_name) = {
+                                let lc = session.lc.read().unwrap();
+                                (lc.id.clone(), lc.recording_device_name())
+                            };
                             if record_state && record_permission {
-                                handler.record_screen(true, id, display, is_view_camera);
+                                handler.record_screen(
+                                    true,
+                                    id,
+                                    device_name,
+                                    display,
+                                    is_view_camera,
+                                );
                             }
                             video_handler = Some(handler);
                         }
@@ -2964,6 +3047,9 @@ pub fn start_video_thread<F, T>(
                                 }
                                 _ => {}
                             }
+                            if let Some((active, filename)) = handler.take_record_status_changed() {
+                                session.send(Data::RecordStatus((display, active, filename)));
+                            }
                         }
 
                         // check invalid decoders
@@ -2993,9 +3079,15 @@ pub fn start_video_thread<F, T>(
                         }
                     }
                     MediaData::RecordScreen(start) => {
-                        let id = session.lc.read().unwrap().id.clone();
+                        let (id, device_name) = {
+                            let lc = session.lc.read().unwrap();
+                            (lc.id.clone(), lc.recording_device_name())
+                        };
                         if let Some(handler) = video_handler.as_mut() {
-                            handler.record_screen(start, id, display, is_view_camera);
+                            handler.record_screen(start, id, device_name, display, is_view_camera);
+                            if let Some((active, filename)) = handler.take_record_status_changed() {
+                                session.send(Data::RecordStatus((display, active, filename)));
+                            }
                         }
                     }
                     _ => {}
@@ -3437,6 +3529,8 @@ pub fn handle_login_error(
     }
 }
 
+const MDESK_MINI_AUTO_CONNECT_PASSWORD_PRESET: &str = "__MDESKMINI_AUTO_CONNECT_V1__";
+
 /// Handle hash message sent by peer.
 /// Hash will be used for login.
 ///
@@ -3454,6 +3548,7 @@ pub async fn handle_hash(
     peer: &mut Stream,
 ) {
     lc.write().unwrap().hash = hash.clone();
+    let is_mdesk_mini_auto_connect = password_preset == MDESK_MINI_AUTO_CONNECT_PASSWORD_PRESET;
     // Take care of password application order
 
     // switch_uuid
@@ -3469,7 +3564,7 @@ pub async fn handle_hash(
     let mut password = lc.read().unwrap().password.clone();
     // preset password
     if password.is_empty() {
-        if !password_preset.is_empty() {
+        if !password_preset.is_empty() && !is_mdesk_mini_auto_connect {
             let mut hasher = Sha256::new();
             hasher.update(password_preset);
             hasher.update(&hash.salt);
@@ -3529,29 +3624,32 @@ pub async fn handle_hash(
         return;
     }
 
-    let password = if password.is_empty() {
-        // login without password, the remote side can click accept
-        interface.msgbox("input-password", "Password Required", "", "");
-        Vec::new()
-    } else {
-        let mut hasher = Sha256::new();
-        hasher.update(&password);
-        hasher.update(&hash.challenge);
-        hasher.finalize()[..].into()
-    };
-
-    let is_terminal = lc.read().unwrap().conn_type.eq(&ConnType::TERMINAL);
-    let (os_username, os_password) = if is_terminal {
-        ("".to_owned(), "".to_owned())
-    } else {
-        (
+    let reuse_authenticated_session = lc.read().unwrap().reuse_authenticated_session;
+    if is_mdesk_mini_auto_connect || reuse_authenticated_session {
+        // MDeskMini already has an explicit ready/accept step. File transfer
+        // opened from an authenticated remote session carries that session's
+        // connection token. Both can submit the prepared credential without
+        // asking the controller to confirm the password again.
+        let password = if password.is_empty() {
+            Vec::new()
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(&password);
+            hasher.update(&hash.challenge);
+            hasher.finalize()[..].into()
+        };
+        let (os_username, os_password) = (
             lc.read().unwrap().get_option("os-username"),
             lc.read().unwrap().get_option("os-password"),
-        )
-    };
+        );
+        send_login(lc.clone(), os_username, os_password, password, peer).await;
+        return;
+    }
 
-    send_login(lc.clone(), os_username, os_password, password, peer).await;
-    lc.write().unwrap().hash = hash;
+    // Always require an explicit confirmation before submitting a credential.
+    // If a credential is already available, the dialog can submit an empty
+    // password and `handle_login_from_ui` will reuse the prepared hash.
+    interface.msgbox("input-password", "Password Required", "", "");
 }
 
 #[inline]
@@ -3620,22 +3718,26 @@ pub async fn handle_login_from_ui(
     remember: bool,
     peer: &mut Stream,
 ) {
+    lc.write().unwrap().remember = remember;
     let mut hash_password = if password.is_empty() {
-        let mut password2 = lc.read().unwrap().password.clone();
-        if password2.is_empty() {
-            password2 = lc.read().unwrap().config.password.clone();
-            if !password2.is_empty() {
-                lc.write().unwrap().password_source = Default::default();
+        if remember {
+            let mut password2 = lc.read().unwrap().password.clone();
+            if password2.is_empty() {
+                password2 = lc.read().unwrap().config.password.clone();
+                if !password2.is_empty() {
+                    lc.write().unwrap().password_source = Default::default();
+                }
             }
+            password2
+        } else {
+            Vec::new()
         }
-        password2
     } else {
         lc.write().unwrap().password_source = Default::default();
         let mut hasher = Sha256::new();
         hasher.update(password);
         hasher.update(&lc.read().unwrap().hash.salt);
         let res = hasher.finalize();
-        lc.write().unwrap().remember = remember;
         res[..].into()
     };
     lc.write().unwrap().password = hash_password.clone();
@@ -3766,6 +3868,7 @@ pub enum Data {
     AddJob((i32, JobType, String, String, i32, bool, bool)),
     ResumeJob((i32, bool)),
     RecordScreen(bool),
+    RecordStatus((usize, bool, Option<String>)),
     ElevateDirect,
     ElevateWithLogon(String, String),
     NewVoiceCall,
