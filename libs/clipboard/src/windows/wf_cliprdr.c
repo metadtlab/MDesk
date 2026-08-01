@@ -44,6 +44,54 @@
 /* Maximum number of clipboard streams accepted from a remote peer. */
 #define WF_CLIPRDR_MAX_STREAMS 16384
 
+/*
+ * Current Windows SDK import libraries forward CoTaskMemAlloc/Free to
+ * combase.dll, which is unavailable on Windows 7. Resolve the documented
+ * ole32.dll exports at runtime to keep the executable loadable on Win7.
+ */
+static HMODULE wf_cliprdr_get_ole32(void)
+{
+	static HMODULE module = NULL;
+
+	if (!module)
+		module = GetModuleHandleW(L"ole32.dll");
+	if (!module)
+		module = LoadLibraryW(L"ole32.dll");
+
+	return module;
+}
+
+static void *wf_cliprdr_co_task_mem_alloc(SIZE_T size)
+{
+	typedef LPVOID(WINAPI * CoTaskMemAllocFn)(SIZE_T);
+	HMODULE module = wf_cliprdr_get_ole32();
+	CoTaskMemAllocFn alloc_fn;
+
+	if (!module)
+		return NULL;
+
+	alloc_fn = (CoTaskMemAllocFn)GetProcAddress(module, "CoTaskMemAlloc");
+	return alloc_fn ? alloc_fn(size) : NULL;
+}
+
+static void wf_cliprdr_co_task_mem_free(void *memory)
+{
+	typedef VOID(WINAPI * CoTaskMemFreeFn)(LPVOID);
+	HMODULE module;
+	CoTaskMemFreeFn free_fn;
+
+	if (!memory)
+		return;
+
+	module = wf_cliprdr_get_ole32();
+	if (!module)
+		return;
+
+	free_fn = (CoTaskMemFreeFn)GetProcAddress(module, "CoTaskMemFree");
+	if (free_fn)
+		free_fn(memory);
+}
+
 static BOOL wf_cliprdr_file_group_descriptor_size_valid(SIZE_T size, UINT count)
 {
 	SIZE_T header_size = offsetof(FILEGROUPDESCRIPTORW, fgd);
@@ -1146,7 +1194,7 @@ static void cliprdr_format_deep_copy(FORMATETC *dest, FORMATETC *source)
 
 	if (source->ptd)
 	{
-		dest->ptd = (DVTARGETDEVICE *)CoTaskMemAlloc(sizeof(DVTARGETDEVICE));
+		dest->ptd = (DVTARGETDEVICE *)wf_cliprdr_co_task_mem_alloc(sizeof(DVTARGETDEVICE));
 
 		if (dest->ptd)
 			*(dest->ptd) = *(source->ptd);
@@ -1328,7 +1376,7 @@ void CliprdrEnumFORMATETC_Delete(CliprdrEnumFORMATETC *instance)
 			for (i = 0; i < instance->m_nNumFormats; i++)
 			{
 				if (instance->m_pFormatEtc[i].ptd)
-					CoTaskMemFree(instance->m_pFormatEtc[i].ptd);
+					wf_cliprdr_co_task_mem_free(instance->m_pFormatEtc[i].ptd);
 			}
 
 			free(instance->m_pFormatEtc);

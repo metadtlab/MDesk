@@ -19,27 +19,26 @@ use std::ffi::c_void;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicIsize, Ordering};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, GetStockObject, GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor,
     COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_GUI_FONT, HDC, TRANSPARENT,
 };
 #[cfg(target_os = "windows")]
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
+};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, PROCESS_PER_MONITOR_DPI_AWARE,
-};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -49,18 +48,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, IsWindow,
     LoadCursorW, LoadIconW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, IDC_ARROW, IDI_APPLICATION, IDYES,
-    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG, SM_CXSCREEN,
-    SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED,
-    WS_SYSMENU, WS_VISIBLE,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 const DEFAULT_CERT_VERIFY_URL: &str = "https://admin.787.kr/api/certno/verify";
 const DEFAULT_AGENTNUMUPDATE_BASE_URL: &str = "https://787.kr";
 const DEFAULT_API_HINT: &str = "https://admin.787.kr";
 const READINESS_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 const RENDEZVOUS_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
 const WAITING_WINDOW_WIDTH: i32 = 360;
 #[cfg(target_os = "windows")]
@@ -79,6 +76,10 @@ const PROGRESS_HEIGHT: i32 = 10;
 const REMOTE_EXIT_IDLE_TICKS: u32 = 20;
 #[cfg(target_os = "windows")]
 const PORTABLE_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "windows")]
+const INSTALLED_MDESK_READY_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(target_os = "windows")]
+const INSTALLED_MDESK_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "windows")]
 const TRAY_ICON_ID: u32 = 1;
 #[cfg(target_os = "windows")]
@@ -259,12 +260,49 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn enable_per_monitor_dpi_awareness() {
-    // Keep whiteboard/process coordinates in physical pixels to avoid DPI virtualization offsets.
-    if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_ok()
-    {
-        return;
+    type SetProcessDpiAwarenessContextFn = unsafe extern "system" fn(isize) -> i32;
+    type SetProcessDpiAwarenessFn = unsafe extern "system" fn(i32) -> i32;
+    type SetProcessDpiAwareFn = unsafe extern "system" fn() -> i32;
+
+    unsafe extern "system" {
+        fn LoadLibraryW(file_name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
     }
-    let _ = unsafe { SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) };
+
+    unsafe fn load_proc(dll_name: &str, proc_name: &'static [u8]) -> *mut c_void {
+        let dll_name: Vec<u16> = dll_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let module = unsafe { LoadLibraryW(dll_name.as_ptr()) };
+        if module.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { GetProcAddress(module, proc_name.as_ptr()) }
+    }
+
+    // Keep coordinates in physical pixels. Resolve newer DPI APIs at runtime
+    // so the executable loader can still start on Windows 7.
+    let proc = unsafe { load_proc("user32.dll", b"SetProcessDpiAwarenessContext\0") };
+    if !proc.is_null() {
+        let set_context: SetProcessDpiAwarenessContextFn = unsafe { std::mem::transmute(proc) };
+        const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+        if unsafe { set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } != 0 {
+            return;
+        }
+    }
+
+    let proc = unsafe { load_proc("shcore.dll", b"SetProcessDpiAwareness\0") };
+    if !proc.is_null() {
+        let set_awareness: SetProcessDpiAwarenessFn = unsafe { std::mem::transmute(proc) };
+        const PROCESS_PER_MONITOR_DPI_AWARE: i32 = 2;
+        if unsafe { set_awareness(PROCESS_PER_MONITOR_DPI_AWARE) } >= 0 {
+            return;
+        }
+    }
+
+    let proc = unsafe { load_proc("user32.dll", b"SetProcessDPIAware\0") };
+    if !proc.is_null() {
+        let set_aware: SetProcessDpiAwareFn = unsafe { std::mem::transmute(proc) };
+        let _ = unsafe { set_aware() };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +398,32 @@ fn run_serve(options: ServeOptions) {
         );
         std::process::exit(1);
     }
+
+    #[cfg(target_os = "windows")]
+    if let Some(installed_exe) = installed_mdesk_executable() {
+        let result = run_installed_mdesk_handoff(&options, waiting_window.as_ref(), &installed_exe);
+        if let Err(err) = result {
+            eprintln!("installed MDesk handoff failed: {err}");
+            update_startup_progress(
+                waiting_window.as_ref(),
+                100,
+                "MDesk 연결 준비 실패",
+                "설치된 MDesk의 원격 준비 상태를 확인하지 못했습니다.",
+            );
+            show_error_popup(
+                "MDeskMini",
+                &format!(
+                    "설치된 MDesk를 실행했지만 원격 연결 준비를 완료하지 못했습니다.\n\n{err}"
+                ),
+            );
+        }
+        if let Some(window) = waiting_window.take() {
+            window.close();
+        }
+        common::global_clean();
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     platform::unregister_explorer_send_to_controller_menu();
 
@@ -521,6 +585,264 @@ fn init_runtime_for_serve() -> bool {
     true
 }
 
+#[cfg(target_os = "windows")]
+fn installed_mdesk_executable() -> Option<String> {
+    let (_, _, _, installed_exe) = platform::windows::get_install_info();
+    let installed_path = std::path::Path::new(&installed_exe);
+    if !installed_path.is_file() {
+        return None;
+    }
+
+    let current_exe = std::env::current_exe().ok()?;
+    if same_windows_path(installed_path, &current_exe) {
+        return None;
+    }
+
+    Some(installed_exe)
+}
+
+#[cfg(target_os = "windows")]
+fn same_windows_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(target_os = "windows")]
+fn run_installed_mdesk_handoff(
+    options: &ServeOptions,
+    waiting_window: Option<&WaitingWindow>,
+    installed_exe: &str,
+) -> Result<(), String> {
+    update_startup_progress(
+        waiting_window,
+        15,
+        "설치된 MDesk 확인",
+        "설치된 MDesk를 사용하여 원격 연결을 준비합니다.",
+    );
+    show_information_popup(
+        "MDeskMini",
+        "MDesk가 이미 설치되어 있습니다.\n설치된 MDesk를 실행하여 원격 연결을 준비합니다.",
+    );
+
+    Command::new(installed_exe)
+        .spawn()
+        .map_err(|err| format!("설치된 MDesk를 실행할 수 없습니다: {err}"))?;
+
+    update_startup_progress(
+        waiting_window,
+        30,
+        "설치된 MDesk 실행 중",
+        "인증번호와 원격 연결 정책을 확인하고 있습니다.",
+    );
+    apply_host_policy(options);
+    let verification = apply_clipboard_cert_bootstrap(options)?
+        .ok_or_else(|| "클립보드에서 유효한 인증번호를 찾지 못했습니다.".to_owned())?;
+    report_readiness_stage(
+        &verification,
+        options.api.as_deref().unwrap_or_default(),
+        "preparing",
+    )?;
+
+    ensure_host_accepting_mode();
+    update_startup_progress(
+        waiting_window,
+        55,
+        "설치된 MDesk 연결 중",
+        "설치된 서비스가 응답할 때까지 기다리고 있습니다.",
+    );
+
+    wait_for_installed_mdesk_ready(
+        options,
+        &verification,
+        options.api.as_deref().unwrap_or_default(),
+        waiting_window,
+    )?;
+
+    update_startup_progress(
+        waiting_window,
+        100,
+        "원격 연결 준비 완료",
+        "설치된 MDesk가 준비되었습니다. 원격 연결을 시작할 수 있습니다.",
+    );
+    thread::sleep(Duration::from_millis(700));
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_installed_mdesk_ready(
+    options: &ServeOptions,
+    verification: &CertVerification,
+    api_hint: &str,
+    waiting_window: Option<&WaitingWindow>,
+) -> Result<(), String> {
+    let runtime = hbb_common::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("설치된 MDesk 상태 확인기를 만들 수 없습니다: {err}"))?;
+    let started_at = Instant::now();
+    let mut configuration_synced = false;
+    let mut service_reported = false;
+    let mut last_status = "설치된 MDesk 서비스의 응답을 기다리는 중".to_owned();
+
+    while started_at.elapsed() < INSTALLED_MDESK_READY_TIMEOUT {
+        match query_installed_mdesk_online_status(&runtime) {
+            Ok((online, confirmed)) => {
+                if !configuration_synced {
+                    match sync_installed_mdesk_host_config(&runtime, options) {
+                        Ok(()) => {
+                            configuration_synced = true;
+                        }
+                        Err(err) => {
+                            last_status = err;
+                            thread::sleep(INSTALLED_MDESK_READY_POLL_INTERVAL);
+                            continue;
+                        }
+                    }
+                }
+
+                if !service_reported {
+                    report_readiness_stage(verification, api_hint, "service_ready")?;
+                    service_reported = true;
+                    update_startup_progress(
+                        waiting_window,
+                        75,
+                        "설치된 MDesk 서비스 확인",
+                        "원격 서버 등록이 완료될 때까지 기다리고 있습니다.",
+                    );
+                }
+
+                last_status = format!("설치된 MDesk 상태: online={online}, confirmed={confirmed}");
+                if online > 0 {
+                    report_remote_ready(verification, api_hint)?;
+                    println!(
+                        "installed MDesk is online; remote ready reported: online={online} confirmed={confirmed}"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                last_status = err;
+            }
+        }
+        thread::sleep(INSTALLED_MDESK_READY_POLL_INTERVAL);
+    }
+
+    Err(format!(
+        "{}초 동안 설치된 MDesk의 온라인 상태를 확인하지 못했습니다. 마지막 상태: {last_status}",
+        INSTALLED_MDESK_READY_TIMEOUT.as_secs()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn query_installed_mdesk_online_status(
+    runtime: &hbb_common::tokio::runtime::Runtime,
+) -> Result<(i64, bool), String> {
+    runtime.block_on(async {
+        let mut connection = librustdesk::ipc::connect(1_200, "")
+            .await
+            .map_err(|err| format!("설치된 MDesk 서비스에 연결할 수 없습니다: {err}"))?;
+        connection
+            .send(&librustdesk::ipc::Data::OnlineStatus(None))
+            .await
+            .map_err(|err| format!("설치된 MDesk에 상태 확인을 보낼 수 없습니다: {err}"))?;
+        match connection
+            .next_timeout(1_200)
+            .await
+            .map_err(|err| format!("설치된 MDesk 상태 응답을 받을 수 없습니다: {err}"))?
+        {
+            Some(librustdesk::ipc::Data::OnlineStatus(Some(status))) => Ok(status),
+            Some(other) => Err(format!(
+                "설치된 MDesk가 예상하지 못한 상태를 보냈습니다: {other:?}"
+            )),
+            None => Err("설치된 MDesk가 빈 상태 응답을 보냈습니다.".to_owned()),
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn sync_installed_mdesk_host_config(
+    runtime: &hbb_common::tokio::runtime::Runtime,
+    options: &ServeOptions,
+) -> Result<(), String> {
+    runtime.block_on(async {
+        let mut connection = librustdesk::ipc::connect(1_200, "")
+            .await
+            .map_err(|err| format!("설치된 MDesk 설정 채널에 연결할 수 없습니다: {err}"))?;
+        connection
+            .send(&librustdesk::ipc::Data::Options(None))
+            .await
+            .map_err(|err| format!("설치된 MDesk 설정을 요청할 수 없습니다: {err}"))?;
+        let mut installed_options = match connection
+            .next_timeout(1_200)
+            .await
+            .map_err(|err| format!("설치된 MDesk 설정을 받을 수 없습니다: {err}"))?
+        {
+            Some(librustdesk::ipc::Data::Options(Some(options))) => options,
+            Some(other) => {
+                return Err(format!(
+                    "설치된 MDesk가 예상하지 못한 설정 응답을 보냈습니다: {other:?}"
+                ));
+            }
+            None => return Err("설치된 MDesk가 빈 설정 응답을 보냈습니다.".to_owned()),
+        };
+
+        for key in [
+            "approve-mode",
+            "api-server",
+            "custom-certno",
+            "custom-agentid",
+            "custom-id",
+            "stop-service",
+            "verification-method",
+        ] {
+            let value = Config::get_option(key);
+            if value.is_empty() {
+                installed_options.remove(key);
+            } else {
+                installed_options.insert(key.to_owned(), value);
+            }
+        }
+
+        connection
+            .send(&librustdesk::ipc::Data::Options(Some(installed_options)))
+            .await
+            .map_err(|err| format!("설치된 MDesk 설정을 적용할 수 없습니다: {err}"))?;
+        match connection
+            .next_timeout(1_200)
+            .await
+            .map_err(|err| format!("설치된 MDesk 설정 적용 응답을 받을 수 없습니다: {err}"))?
+        {
+            Some(librustdesk::ipc::Data::Options(None)) => {}
+            Some(other) => {
+                return Err(format!(
+                    "설치된 MDesk가 예상하지 못한 설정 적용 응답을 보냈습니다: {other:?}"
+                ));
+            }
+            None => return Err("설치된 MDesk가 설정 적용을 확인하지 않았습니다.".to_owned()),
+        }
+
+        if let Some(password) = options.password.as_deref() {
+            let password = password.trim();
+            if !password.is_empty() {
+                connection
+                    .send(&librustdesk::ipc::Data::Config((
+                        "permanent-password".to_owned(),
+                        Some(password.to_owned()),
+                    )))
+                    .await
+                    .map_err(|err| {
+                        format!("설치된 MDesk에 원격 비밀번호를 적용할 수 없습니다: {err}")
+                    })?;
+            }
+        }
+
+        println!("installed MDesk host configuration synchronized");
+        Ok(())
+    })
+}
+
 fn apply_host_policy(options: &ServeOptions) {
     Config::set_option(
         "approve-mode".to_owned(),
@@ -583,26 +905,7 @@ fn clipboard_certnum() -> Option<String> {
 fn clipboard_text() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW_FLAG)
-            .args([
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                "Get-Clipboard -Raw",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        read_windows_clipboard_text().ok()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -633,23 +936,84 @@ fn clear_clipboard_cert_if_matches(expected_certnum: &str) {
 
 #[cfg(target_os = "windows")]
 fn clear_windows_clipboard() -> Result<(), String> {
-    let status = Command::new("powershell")
-        .creation_flags(CREATE_NO_WINDOW_FLAG)
-        .args([
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            "Set-Clipboard -Value ''",
-        ])
-        .status()
-        .map_err(|err| format!("failed to run powershell Set-Clipboard: {err}"))?;
-    if status.success() {
-        Ok(())
+    let _clipboard = open_windows_clipboard()?;
+    unsafe { EmptyClipboard() }.map_err(|err| format!("EmptyClipboard failed: {err}"))
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsClipboardGuard;
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsClipboardGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseClipboard() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsGlobalLockGuard(HGLOBAL);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsGlobalLockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { GlobalUnlock(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_clipboard() -> Result<WindowsClipboardGuard, String> {
+    let mut last_error = String::new();
+    for attempt in 1..=20 {
+        match unsafe { OpenClipboard(None) } {
+            Ok(()) => return Ok(WindowsClipboardGuard),
+            Err(err) => {
+                last_error = err.to_string();
+                if attempt < 20 {
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+    Err(format!("OpenClipboard failed after retries: {last_error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_clipboard_text() -> Result<String, String> {
+    const CF_UNICODETEXT: u32 = 13;
+
+    let _clipboard = open_windows_clipboard()?;
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT) }
+        .map_err(|err| format!("GetClipboardData(CF_UNICODETEXT) failed: {err}"))?;
+    let global = HGLOBAL(handle.0);
+    let byte_len = unsafe { GlobalSize(global) };
+    if byte_len < std::mem::size_of::<u16>() {
+        return Err("clipboard Unicode text is empty".to_owned());
+    }
+
+    let pointer = unsafe { GlobalLock(global) };
+    if pointer.is_null() {
+        return Err("GlobalLock failed for clipboard Unicode text".to_owned());
+    }
+    let _lock = WindowsGlobalLockGuard(global);
+    let units = unsafe {
+        std::slice::from_raw_parts(pointer.cast::<u16>(), byte_len / std::mem::size_of::<u16>())
+    };
+    decode_windows_clipboard_text(units)
+}
+
+fn decode_windows_clipboard_text(units: &[u16]) -> Result<String, String> {
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    let text = String::from_utf16(&units[..end])
+        .map_err(|err| format!("clipboard contains invalid UTF-16 text: {err}"))?
+        .trim()
+        .to_owned();
+    if text.is_empty() {
+        Err("clipboard Unicode text is empty".to_owned())
     } else {
-        Err(format!(
-            "powershell Set-Clipboard failed with status {status}"
-        ))
+        Ok(text)
     }
 }
 
@@ -810,18 +1174,26 @@ fn report_readiness_stage_async(
     stage: &'static str,
 ) {
     thread::spawn(move || {
-        match post_cert_readiness(&verification, &api_hint, "progress", Some(stage), 2) {
-            Ok(ReadinessPostResult::Success(url)) => {
-                println!("readiness progress success: stage={stage} url={url}");
-            }
-            Ok(ReadinessPostResult::LegacyEndpointUnavailable) => {
-                println!("readiness progress endpoint unavailable: stage={stage}");
-            }
-            Err(err) => {
-                eprintln!("readiness progress failed: stage={stage} error={err}");
-            }
+        if let Err(err) = report_readiness_stage(&verification, &api_hint, stage) {
+            eprintln!("readiness progress failed: stage={stage} error={err}");
         }
     });
+}
+
+fn report_readiness_stage(
+    verification: &CertVerification,
+    api_hint: &str,
+    stage: &str,
+) -> Result<(), String> {
+    match post_cert_readiness(verification, api_hint, "progress", Some(stage), 2)? {
+        ReadinessPostResult::Success(url) => {
+            println!("readiness progress success: stage={stage} url={url}");
+        }
+        ReadinessPostResult::LegacyEndpointUnavailable => {
+            println!("readiness progress endpoint unavailable: stage={stage}");
+        }
+    }
+    Ok(())
 }
 
 fn spawn_rendezvous_ready_reporter(verification: CertVerification, api_hint: String) {
@@ -843,26 +1215,25 @@ fn spawn_rendezvous_ready_reporter(verification: CertVerification, api_hint: Str
             "rendezvous registration confirmed; reporting remote ready: peer_id={}",
             verification.verified_peer_id
         );
-        match post_cert_readiness(&verification, &api_hint, "ready", None, 5) {
-            Ok(ReadinessPostResult::Success(url)) => {
-                println!("remote ready success: url={url}");
-            }
-            Ok(ReadinessPostResult::LegacyEndpointUnavailable) => {
-                println!("ready endpoint unavailable; using legacy agentnumupdate fallback");
-                match call_agentnumupdate(&verification, &api_hint) {
-                    Ok(agent_url) => {
-                        println!("legacy agentnumupdate success after ready: url={agent_url}");
-                    }
-                    Err(err) => {
-                        eprintln!("legacy agentnumupdate failed after ready: {err}");
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("remote ready report failed: {err}");
-            }
+        if let Err(err) = report_remote_ready(&verification, &api_hint) {
+            eprintln!("remote ready report failed: {err}");
         }
     });
+}
+
+fn report_remote_ready(verification: &CertVerification, api_hint: &str) -> Result<(), String> {
+    match post_cert_readiness(verification, api_hint, "ready", None, 5)? {
+        ReadinessPostResult::Success(url) => {
+            println!("remote ready success: url={url}");
+            Ok(())
+        }
+        ReadinessPostResult::LegacyEndpointUnavailable => {
+            println!("ready endpoint unavailable; using legacy agentnumupdate fallback");
+            let agent_url = call_agentnumupdate(verification, api_hint)?;
+            println!("legacy agentnumupdate success after ready: url={agent_url}");
+            Ok(())
+        }
+    }
 }
 
 fn post_cert_readiness(
@@ -1705,6 +2076,20 @@ fn show_error_popup(title: &str, body: &str) {
 }
 
 #[cfg(target_os = "windows")]
+fn show_information_popup(title: &str, body: &str) {
+    let title_w = to_wide(title);
+    let body_w = to_wide(body);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn to_wide(value: &str) -> Vec<u16> {
     std::ffi::OsStr::new(value)
         .encode_wide()
@@ -1738,5 +2123,30 @@ mod tests {
             ),
             "https://787.kr/api/agentnumupdate/imedix/123456789?agentid=0"
         );
+    }
+
+    #[test]
+    fn native_clipboard_text_stops_at_utf16_null() {
+        let units = "certno:3276"
+            .encode_utf16()
+            .chain([0, b'X' as u16])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_windows_clipboard_text(&units).unwrap(),
+            "certno:3276"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn installed_mdesk_path_comparison_is_case_insensitive() {
+        assert!(same_windows_path(
+            std::path::Path::new(r"C:\Program Files\MDesk\MDesk.exe"),
+            std::path::Path::new(r"c:\program files\mdesk\mdesk.EXE")
+        ));
+        assert!(!same_windows_path(
+            std::path::Path::new(r"C:\Program Files\MDesk\MDesk.exe"),
+            std::path::Path::new(r"C:\Users\owner\Downloads\MDeskMini.exe")
+        ));
     }
 }
