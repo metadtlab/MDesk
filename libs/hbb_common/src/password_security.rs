@@ -20,6 +20,20 @@ pub enum ApproveMode {
     Click,
 }
 
+impl ApproveMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Password => "password",
+            Self::Click => "click",
+        }
+    }
+}
+
+pub fn requires_manual_approval(mode: ApproveMode, has_valid_password: bool) -> bool {
+    mode == ApproveMode::Click || mode == ApproveMode::Both && !has_valid_password
+}
+
 fn get_auto_password() -> String {
     let len = temporary_password_length();
     if Config::get_bool_option(crate::config::keys::OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD) {
@@ -197,6 +211,18 @@ pub fn symmetric_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
 }
 
 mod test {
+
+    #[test]
+    fn manual_approval_policy_is_fail_closed() {
+        use super::*;
+
+        assert!(requires_manual_approval(ApproveMode::Click, false));
+        assert!(requires_manual_approval(ApproveMode::Click, true));
+        assert!(requires_manual_approval(ApproveMode::Both, false));
+        assert!(!requires_manual_approval(ApproveMode::Both, true));
+        assert!(!requires_manual_approval(ApproveMode::Password, false));
+        assert!(!requires_manual_approval(ApproveMode::Password, true));
+    }
 
     #[test]
     fn test() {

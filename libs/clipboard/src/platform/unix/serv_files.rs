@@ -90,7 +90,10 @@ impl ClipFiles {
                 if files.is_empty() {
                     return None;
                 } else {
-                    return Some(ClipboardFile::Files { files });
+                    return Some(ClipboardFile::Files {
+                        files,
+                        source_application: 0,
+                    });
                 }
             }
         }

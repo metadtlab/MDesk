@@ -134,6 +134,10 @@ pub enum ClipboardFile {
     TryEmpty,
     Files {
         files: Vec<(String, u64)>,
+        // message.proto: ClipboardSourceApplication. Only a closed enum value
+        // may be assigned by the interactive-session caller.
+        #[serde(default)]
+        source_application: i32,
     },
 }
 

@@ -19,6 +19,7 @@ import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/platform_channel.dart';
+import 'package:flutter_hbb/utils/update_grace_period.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
 import 'package:get/get_rx/src/rx_workers/utils/debouncer.dart';
@@ -3903,7 +3904,7 @@ Future<void> loadFavPeers() async {
     accessToken: accessToken,
   );
   if (response.isUnauthorized) {
-    await gFFI.userModel.reset(resetOther: true);
+    await gFFI.userModel.recoverUnauthorized();
   }
   final peers = favoriteService.favoritesToPeers(response.data);
   final peerMaps = peers.map((p) => p.toJson()).toList();
@@ -3922,49 +3923,154 @@ void checkUpdate() {
   }
 }
 
+const _kMDeskUpdateVersion = 'mdesk_update_grace_version';
+const _kMDeskUpdateReleasedAt = 'mdesk_update_released_at';
+const _kMDeskUpdateDeadline = 'mdesk_update_deadline';
+Timer? _mdeskAutomaticUpdateTimer;
+bool _mdeskAutomaticUpdateStarted = false;
+
+DateTime? _dateTimeFromEpochOption(String key) {
+  final epochMilliseconds = int.tryParse(bind.mainGetLocalOption(key: key));
+  if (epochMilliseconds == null) return null;
+  return DateTime.fromMillisecondsSinceEpoch(epochMilliseconds);
+}
+
+Future<DateTime> _saveMDeskUpdateSchedule(
+  String latestVersion,
+  DateTime? serverReleasedAt,
+) async {
+  final savedVersion = bind.mainGetLocalOption(key: _kMDeskUpdateVersion);
+  final savedReleasedAt = _dateTimeFromEpochOption(_kMDeskUpdateReleasedAt);
+
+  final releasedAt = serverReleasedAt ??
+      (savedVersion == latestVersion ? savedReleasedAt : null) ??
+      DateTime.now();
+  final deadline = calculateMDeskAutomaticUpdateAt(releasedAt);
+
+  await bind.mainSetLocalOption(
+    key: _kMDeskUpdateVersion,
+    value: latestVersion,
+  );
+  await bind.mainSetLocalOption(
+    key: _kMDeskUpdateReleasedAt,
+    value: releasedAt.millisecondsSinceEpoch.toString(),
+  );
+  await bind.mainSetLocalOption(
+    key: _kMDeskUpdateDeadline,
+    value: deadline.millisecondsSinceEpoch.toString(),
+  );
+  return deadline;
+}
+
+Future<void> _clearMDeskUpdateSchedule() async {
+  _mdeskAutomaticUpdateTimer?.cancel();
+  _mdeskAutomaticUpdateTimer = null;
+  _mdeskAutomaticUpdateStarted = false;
+  await bind.mainSetLocalOption(key: _kMDeskUpdateVersion, value: '');
+  await bind.mainSetLocalOption(key: _kMDeskUpdateReleasedAt, value: '');
+  await bind.mainSetLocalOption(key: _kMDeskUpdateDeadline, value: '');
+}
+
+void _startMDeskAutomaticUpdate(
+  String downloadUrl,
+  String latestVersion,
+  String currentVersion,
+) {
+  if (_mdeskAutomaticUpdateStarted || downloadUrl.isEmpty) return;
+  _mdeskAutomaticUpdateStarted = true;
+  stateGlobal.forceUpdate.value = true;
+  stateGlobal.forceUpdateMessage.value =
+      '새로운 버전($latestVersion)의 10일 업데이트 유예기간이 종료되었습니다.\n'
+      '현재 버전($currentVersion)을 지금 자동 업데이트합니다.';
+  debugPrint(
+      'MDesk Update Check: Grace period expired. Starting automatic update.');
+
+  if (isWindows) {
+    handleDirectDownloadUpdate(downloadUrl, allowCancel: false);
+  } else {
+    launchUrl(Uri.parse(downloadUrl));
+  }
+}
+
+void _scheduleMDeskAutomaticUpdate(
+  DateTime deadline,
+  String downloadUrl,
+  String latestVersion,
+  String currentVersion,
+) {
+  _mdeskAutomaticUpdateTimer?.cancel();
+  final remaining = deadline.difference(DateTime.now());
+  if (isMDeskAutomaticUpdateDue(deadline)) {
+    _startMDeskAutomaticUpdate(
+      downloadUrl,
+      latestVersion,
+      currentVersion,
+    );
+    return;
+  }
+
+  stateGlobal.forceUpdate.value = false;
+  _mdeskAutomaticUpdateTimer = Timer(remaining, () {
+    _startMDeskAutomaticUpdate(
+      downloadUrl,
+      latestVersion,
+      currentVersion,
+    );
+  });
+  debugPrint(
+      'MDesk Update Check: Automatic update scheduled for ${deadline.toIso8601String()}');
+}
+
 /// MDesk 버전 체크 - admin.787.kr API 사용
 /// 반환: 새 버전 있음 `true`, 이미 최신 `false`, 실패·응답 오류 `null`
 Future<bool?> checkMDeskUpdate() async {
   try {
     final currentVersion = await bind.mainGetVersion();
     debugPrint('MDesk Update Check: Current version = $currentVersion');
-    
+
     final uri = Uri.parse('https://admin.787.kr/api/version/latest');
-    final response = await http.HttpService().sendRequest(uri, http.HttpMethod.get);
-    
+    final response =
+        await http.HttpService().sendRequest(uri, http.HttpMethod.get);
+
     if (response.statusCode == 200) {
       final jsonData = jsonDecode(response.body);
-      
+
       if (jsonData['code'] == 1 && jsonData['data'] != null) {
         final data = jsonData['data'];
         final latestVersion = data['file_version'] as String? ?? '';
-        
+        final releasedAt = DateTime.tryParse(
+          data['released_at'] as String? ?? '',
+        )?.toLocal();
+
         debugPrint('MDesk Update Check: Latest version = $latestVersion');
-        
-        if (latestVersion.isNotEmpty && _isNewerVersion(latestVersion, currentVersion)) {
+
+        if (latestVersion.isNotEmpty &&
+            _isNewerVersion(latestVersion, currentVersion)) {
           // 새 버전이 있으면 업데이트 URL 설정 (항상 고정 URL 사용)
-          final downloadUrl = 'https://admin.787.kr/executables/MDesk-install.exe';
+          final downloadUrl =
+              'https://admin.787.kr/executables/MDesk-install.exe';
           stateGlobal.updateUrl.value = downloadUrl;
           stateGlobal.latestVersion.value = latestVersion;
-          debugPrint('MDesk Update Check: New version available! $latestVersion > $currentVersion');
+          debugPrint(
+              'MDesk Update Check: New version available! $latestVersion > $currentVersion');
           debugPrint('MDesk Update Check: Download URL = $downloadUrl');
-          
-          // 메이저/마이너 버전이 변경되었으면 강제 업데이트
-          if (_isMajorMinorNewer(latestVersion, currentVersion)) {
-            stateGlobal.forceUpdate.value = true;
-            stateGlobal.forceUpdateMessage.value = 
-                '새로운 버전($latestVersion)이 출시되었습니다.\n'
-                '현재 버전($currentVersion)은 더 이상 지원되지 않습니다.\n'
-                '업데이트 후 사용해 주세요.';
-            debugPrint('MDesk Update Check: FORCE UPDATE REQUIRED! Major/Minor version changed');
-          } else {
-            stateGlobal.forceUpdate.value = false;
-          }
+
+          final automaticUpdateAt = await _saveMDeskUpdateSchedule(
+            latestVersion,
+            releasedAt,
+          );
+          _scheduleMDeskAutomaticUpdate(
+            automaticUpdateAt,
+            downloadUrl,
+            latestVersion,
+            currentVersion,
+          );
           return true;
         } else {
           debugPrint('MDesk Update Check: Already up to date');
           stateGlobal.updateUrl.value = '';
           stateGlobal.forceUpdate.value = false;
+          await _clearMDeskUpdateSchedule();
           return false;
         }
       }
@@ -4144,37 +4250,6 @@ bool _isNewerVersion(String newVersion, String currentVersion) {
     return false; // 같은 버전
   } catch (e) {
     debugPrint('Version compare error: $e');
-    return false;
-  }
-}
-
-/// 메이저 또는 마이너 버전이 더 높으면 true (강제 업데이트 필요)
-/// 예: 1.4.5 -> 1.5.0 = true (마이너 버전 증가)
-/// 예: 1.4.5 -> 1.4.8 = false (패치 버전만 증가)
-/// 예: 1.4.5 -> 2.0.0 = true (메이저 버전 증가)
-bool _isMajorMinorNewer(String newVersion, String currentVersion) {
-  try {
-    final newParts = newVersion.split('.').map((e) => int.tryParse(e) ?? 0).toList();
-    final currentParts = currentVersion.split('.').map((e) => int.tryParse(e) ?? 0).toList();
-    
-    // 버전 파트 수를 맞춤
-    while (newParts.length < 2) newParts.add(0);
-    while (currentParts.length < 2) currentParts.add(0);
-    
-    final newMajor = newParts[0];
-    final newMinor = newParts[1];
-    final currentMajor = currentParts[0];
-    final currentMinor = currentParts[1];
-    
-    // 메이저 버전이 더 높으면 강제 업데이트
-    if (newMajor > currentMajor) return true;
-    
-    // 메이저 버전이 같고 마이너 버전이 더 높으면 강제 업데이트
-    if (newMajor == currentMajor && newMinor > currentMinor) return true;
-    
-    return false;
-  } catch (e) {
-    debugPrint('Major/Minor version compare error: $e');
     return false;
   }
 }

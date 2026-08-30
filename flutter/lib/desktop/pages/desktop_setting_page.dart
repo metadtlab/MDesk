@@ -1139,6 +1139,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       apiServer: apiServer,
       userId: userId,
       remoteId: remoteId,
+      remoteRegistration: true,
     );
 
     debugPrint(
@@ -1312,16 +1313,16 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
 
                       try {
                         final userId = idController.text.trim();
-                        final canRegister =
-                            await _canRegisterDeviceForRemoteUser(userId);
-                        if (!canRegister) return;
-
                         final result = await _loginRemoteUserWithAuth(
                           userId,
                           passwordController.text,
                         );
 
                         if (result['success'] == true) {
+                          final canRegister =
+                              await _canRegisterDeviceForRemoteUser(userId);
+                          if (!canRegister) return;
+
                           // 별칭이 입력되면 별칭 사용, 없으면 API에서 받아온 name 사용
                           final alias = aliasController.text.trim();
                           final userName = alias.isNotEmpty
@@ -1330,14 +1331,14 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                           final connPassword =
                               connectionPasswordController.text;
 
-                          // 저장 (내부적으로 목록 업데이트 및 저장)
-                          await _addOrUpdateRemoteUser(
-                              userId, userName, connPassword);
-
                           // 기기 등록 API 호출
                           final registered =
                               await _registerDeviceToServer(userId, userName);
                           if (!registered) return;
+
+                          // 서버 등록이 성공한 경우에만 로컬 목록에 저장
+                          await _addOrUpdateRemoteUser(
+                              userId, userName, connPassword);
 
                           setState(() {});
 

@@ -522,26 +522,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  /// 파일명에서 userId 파싱
-  String _parseUserId() {
-    String filename = Platform.environment['MDESK_APPNAME'] ??
-        Platform.environment['RUSTDESK_APPNAME'] ??
-        '';
-
-    if (filename.isEmpty) {
-      filename = Platform.resolvedExecutable.split(Platform.pathSeparator).last;
-    }
-
-    // id= 파싱
-    final idMatch = RegExp(r'id=([^,\s]+)').firstMatch(filename);
-    return idMatch?.group(1) ?? '';
-  }
-
   Widget buildLinkSection(BuildContext context) {
-    // 1순위: 로그인한 사용자 이름, 2순위: 파일명에서 파싱
-    final loggedInUser = gFFI.userModel.userName.value;
-    final fileUserId = _parseUserId();
-    final userId = loggedInUser.isNotEmpty ? loggedInUser : fileUserId;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
 
     return Padding(
@@ -552,16 +533,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         children: [
           Obx(() {
             final isLoggedIn = gFFI.userModel.userName.value.isNotEmpty;
-            final userName = gFFI.userModel.userName.value;
 
-            // 로그인된 경우: username 기준 접속 URL
+            // 로그인 여부와 관계없이 공개 홈페이지 루트만 연다.
             if (isLoggedIn) {
-              final usernameUrl = 'https://787.kr/$userName';
+              const usernameUrl = 'https://787.kr';
 
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // username 링크 (표시: 베이스 URL, 이동/복사: 전체 URL)
+                  // 표시·이동·복사 주소를 모두 공개 홈페이지 루트로 고정한다.
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -609,10 +589,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               );
             }
 
-            // 로그인 안된 경우: 파일명에서 파싱한 userId 사용
-            final url = fileUserId.isNotEmpty
-                ? 'https://787.kr/$fileUserId'
-                : 'https://787.kr';
+            const url = 'https://787.kr';
             return Row(
               mainAxisSize: MainAxisSize.min,
               children: [

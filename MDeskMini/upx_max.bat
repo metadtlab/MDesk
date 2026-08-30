@@ -3,6 +3,7 @@ setlocal
 
 set "PROJECT_DIR=%~dp0"
 set "TARGET_EXE=%PROJECT_DIR%target\release\mdeskmini.exe"
+set "ADMIN_VERIFY_SCRIPT=%PROJECT_DIR%verify_admin_manifest.ps1"
 
 where upx >nul 2>nul
 if errorlevel 1 (
@@ -24,6 +25,12 @@ upx --best --lzma "%TARGET_EXE%"
 if errorlevel 1 (
   echo ERROR: UPX compression failed.
   echo If the file is already packed, rebuild with build_release.bat and run this again.
+  exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%TARGET_EXE%"
+if errorlevel 1 (
+  echo ERROR: UPX output is missing the administrator manifest.
   exit /b 1
 )
 

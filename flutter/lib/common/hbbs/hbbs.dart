@@ -34,18 +34,40 @@ class UserPayload {
   String userPkid = '';
 
   UserPayload.fromJson(Map<String, dynamic> json)
-      : name = (json['user'] != null ? json['user']['name'] : (json['name'] ?? json['username'])) ?? '',
-        email = (json['user'] != null ? json['user']['email'] : json['email']) ?? '',
-        note = (json['user'] != null ? json['user']['note'] : json['note']) ?? '',
-        verifier = json['user'] != null ? json['user']['verifier'] : json['verifier'],
-        status = (json['user'] != null ? json['user']['status'] : json['status']) == 0
-            ? UserStatus.kDisabled
-            : (json['user'] != null ? json['user']['status'] : json['status']) == -1
-                ? UserStatus.kUnverified
-                : UserStatus.kNormal,
-        isAdmin = (json['user'] != null ? json['user']['is_admin'] : json['is_admin']) == true,
-        membershipLevel = (json['user'] != null ? json['user']['membership_level'] : json['membership_level']) ?? 'free',
-        userPkid = ((json['user'] != null ? json['user']['user_pkid'] : json['user_pkid']) ?? '').toString();
+      : name = (json['user'] != null
+                ? json['user']['name']
+                : (json['name'] ?? json['username'])) ??
+            '',
+        email =
+            (json['user'] != null ? json['user']['email'] : json['email']) ??
+                '',
+        note =
+            (json['user'] != null ? json['user']['note'] : json['note']) ?? '',
+        verifier =
+            json['user'] != null ? json['user']['verifier'] : json['verifier'],
+        status =
+            (json['user'] != null ? json['user']['status'] : json['status']) ==
+                    0
+                ? UserStatus.kDisabled
+                : (json['user'] != null
+                            ? json['user']['status']
+                            : json['status']) ==
+                        -1
+                    ? UserStatus.kUnverified
+                    : UserStatus.kNormal,
+        isAdmin = (json['user'] != null
+                ? json['user']['is_admin']
+                : json['is_admin']) ==
+            true,
+        membershipLevel = (json['user'] != null
+                ? json['user']['membership_level']
+                : json['membership_level']) ??
+            'free',
+        userPkid = ((json['user'] != null
+                    ? json['user']['user_pkid']
+                    : json['user_pkid']) ??
+                '')
+            .toString();
 
   Map<String, dynamic> toJson() {
     final Map<String, dynamic> map = {
@@ -174,6 +196,9 @@ class LoginRequest {
 
 class LoginResponse {
   String? access_token;
+  String? refresh_token;
+  int? expires_in;
+  int? session_expires_in;
   String? type;
   String? tfa_type;
   String? secret;
@@ -186,11 +211,23 @@ class LoginResponse {
   String? tfaMessage;
 
   LoginResponse(
-      {this.access_token, this.type, this.tfa_type, this.secret, this.user,
-      this.tfaKey, this.tfaMethods, this.tfaMessage});
+      {this.access_token,
+      this.refresh_token,
+      this.expires_in,
+      this.session_expires_in,
+      this.type,
+      this.tfa_type,
+      this.secret,
+      this.user,
+      this.tfaKey,
+      this.tfaMethods,
+      this.tfaMessage});
 
   LoginResponse.fromJson(Map<String, dynamic> json) {
     access_token = json['access_token'];
+    refresh_token = json['refresh_token'];
+    expires_in = (json['expires_in'] as num?)?.toInt();
+    session_expires_in = (json['session_expires_in'] as num?)?.toInt();
     type = json['type'];
     tfa_type = json['tfa_type'];
     secret = json['secret'];
@@ -198,8 +235,8 @@ class LoginResponse {
     tfaRequired = json['tfa_required'] == true;
     tfaKey = json['tfa_key'];
     tfaMethods = json['tfa_methods'] != null
-        ? List<Map<String, dynamic>>.from(
-            (json['tfa_methods'] as List).map((e) => Map<String, dynamic>.from(e as Map)))
+        ? List<Map<String, dynamic>>.from((json['tfa_methods'] as List)
+            .map((e) => Map<String, dynamic>.from(e as Map)))
         : null;
     tfaMessage = json['tfa_message'];
   }

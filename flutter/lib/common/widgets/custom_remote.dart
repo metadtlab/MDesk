@@ -194,8 +194,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
   bool get _needsFastCertStatusRefresh =>
       _certCode.isNotEmpty &&
-      _certReadinessStage != 'ready' &&
-      _certReadinessStage != 'connecting';
+      (_certReadinessStage != 'ready' ||
+          _certReadinessRemoteId.trim().isEmpty) &&
+      _certReadinessStage != 'connecting' &&
+      _certReadinessStage != 'connected';
 
   void _startCertStatusRefresh() {
     if (!_needsFastCertStatusRefresh || _certStatusRefreshTimer != null) {
@@ -216,10 +218,27 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   }
 
   void _resetCertReadinessState() {
+    _cancelDirectAutoConnectSchedule();
     _certReadinessStage = 'waiting';
     _certReadinessProgress = 0;
     _certReadinessMessage = '인증번호 생성을 기다리는 중입니다.';
     _certReadinessRemoteId = '';
+  }
+
+  void _cancelDirectAutoConnectSchedule() {
+    _directAutoConnectTimer?.cancel();
+    _directAutoConnectTimer = null;
+    _scheduledDirectRemoteId = '';
+  }
+
+  bool _isConfirmedReadyRemoteId(String remoteId) {
+    final cleanId = remoteId.replaceAll(' ', '').trim();
+    final readyId = _certReadinessRemoteId.replaceAll(' ', '').trim();
+    return cleanId.isNotEmpty &&
+        _certCode.isNotEmpty &&
+        _certReadinessStage == 'ready' &&
+        readyId.isNotEmpty &&
+        cleanId == readyId;
   }
 
   void _handleRemoteConnectionCompleted(String peerId) {
@@ -338,6 +357,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   Future<void> _handleUnauthorized() async {
     debugPrint('CustomRemote: 401 Unauthorized - Token invalidated');
 
+    if (await gFFI.userModel.recoverUnauthorized()) {
+      debugPrint('CustomRemote: Session refreshed or temporarily retained');
+      return;
+    }
+
     // 자동 새로고침 중지
     _autoRefreshTimer?.cancel();
     _autoRefreshTimer = null;
@@ -346,9 +370,6 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     _directAutoConnectTimer = null;
     _certDisplayExpiryTimer?.cancel();
     _certDisplayExpiryTimer = null;
-
-    // 사용자 로그아웃 처리
-    await gFFI.userModel.reset(resetOther: true);
 
     // 사용자에게 알림
     if (mounted) {
@@ -442,16 +463,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
           final readyDirectRemoteId = _findReadyDirectRemoteId(newCounselors);
           setState(() {
             _counselors = newCounselors;
-            if (_certCode.isNotEmpty && readyDirectRemoteId.isNotEmpty) {
-              _certReadinessStage = 'ready';
-              _certReadinessProgress = 85;
-              _certReadinessMessage = '원격 연결 준비가 완료되었습니다.';
-              _certReadinessRemoteId = readyDirectRemoteId;
-            }
           });
           if (readyDirectRemoteId.isNotEmpty) {
             _rememberDirectRemoteId(readyDirectRemoteId);
-            _stopCertStatusRefresh();
           }
           _scheduleDirectRemoteAutoConnect(newCounselors);
         }
@@ -816,11 +830,18 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                 _rememberDirectRemoteId(remoteId);
               }
               if (stage == 'ready') {
-                _stopCertStatusRefresh();
-                if (!wasReady) {
+                if (remoteId.isNotEmpty) {
+                  _stopCertStatusRefresh();
+                  _scheduleDirectRemoteAutoConnect(_counselors);
+                } else {
+                  _startCertStatusRefresh();
+                }
+                if (!wasReady ||
+                    !_containsReadyDirectRemoteId(_counselors, remoteId)) {
                   unawaited(_fetchCounselors());
                 }
               } else {
+                _cancelDirectAutoConnectSchedule();
                 _startCertStatusRefresh();
               }
             }
@@ -2249,14 +2270,31 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     return '';
   }
 
+  bool _containsReadyDirectRemoteId(
+    List<Map<String, dynamic>> counselors,
+    String remoteId,
+  ) {
+    final cleanId = remoteId.replaceAll(' ', '').trim();
+    return cleanId.isNotEmpty &&
+        counselors.any((agent) =>
+            _isCurrentMdeskDirectRemote(agent) &&
+            _getMdeskId(agent).replaceAll(' ', '').trim() == cleanId);
+  }
+
   void _scheduleDirectRemoteAutoConnect(List<Map<String, dynamic>> counselors) {
-    final remoteId = _findReadyDirectRemoteId(counselors);
-    if (remoteId.isEmpty) {
-      _directAutoConnectTimer?.cancel();
-      _directAutoConnectTimer = null;
-      _scheduledDirectRemoteId = '';
+    final remoteId = _certReadinessRemoteId.replaceAll(' ', '').trim();
+    final hasAnyDirectRemote = _findReadyDirectRemoteId(counselors).isNotEmpty;
+    if (!hasAnyDirectRemote) {
+      _cancelDirectAutoConnectSchedule();
       _lastAutoConnectedRemoteId = '';
       _lastPromptedDirectRemoteId = '';
+      return;
+    }
+    if (!_isConfirmedReadyRemoteId(remoteId) ||
+        !_containsReadyDirectRemoteId(counselors, remoteId)) {
+      _cancelDirectAutoConnectSchedule();
+      debugPrint(
+          'Direct Remote: Waiting for confirmed API ready state for $remoteId');
       return;
     }
     _rememberDirectRemoteId(remoteId);
@@ -2274,7 +2312,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       final scheduledId = _scheduledDirectRemoteId;
       _scheduledDirectRemoteId = '';
       if (!mounted || scheduledId.isEmpty) return;
-      if (_findReadyDirectRemoteId(_counselors) != scheduledId) return;
+      if (!_containsReadyDirectRemoteId(_counselors, scheduledId)) return;
+      if (!_isConfirmedReadyRemoteId(scheduledId)) return;
       _showDirectRemoteReadyDialog(scheduledId);
     });
   }
@@ -2283,6 +2322,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     final cleanId = remoteId.replaceAll(' ', '');
     if (cleanId.isEmpty ||
         !mounted ||
+        !_isConfirmedReadyRemoteId(cleanId) ||
         _directRemotePromptId.isNotEmpty ||
         cleanId == _lastPromptedDirectRemoteId) {
       return;
@@ -2322,7 +2362,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       debugPrint('Direct Remote: Ready prompt dismissed for $cleanId');
       return;
     }
-    if (_findReadyDirectRemoteId(_counselors) != cleanId) {
+    if (!_containsReadyDirectRemoteId(_counselors, cleanId) ||
+        !_isConfirmedReadyRemoteId(cleanId)) {
       _lastPromptedDirectRemoteId = '';
       showToast('피원격자의 원격 준비가 해제되었습니다');
       return;
@@ -2334,11 +2375,14 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   void _connectToDirectRemote(String remoteId, {required bool automatically}) {
     final cleanId = remoteId.replaceAll(' ', '');
     if (cleanId.isEmpty || !mounted) return;
+    if (automatically && !_isConfirmedReadyRemoteId(cleanId)) {
+      debugPrint(
+          'Direct Remote: Automatic connect blocked until confirmed API ready for $cleanId');
+      return;
+    }
 
     _rememberDirectRemoteId(cleanId);
-    _directAutoConnectTimer?.cancel();
-    _directAutoConnectTimer = null;
-    _scheduledDirectRemoteId = '';
+    _cancelDirectAutoConnectSchedule();
     _lastAutoConnectedRemoteId = cleanId;
     _stopCertStatusRefresh();
     setState(() {
@@ -2348,7 +2392,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
       _certReadinessRemoteId = cleanId;
     });
     debugPrint(
-        'Direct Remote: ${automatically ? 'Connecting after ready confirmation' : 'Connecting'} to $cleanId via relay');
+        'Direct Remote: ${automatically ? 'Connecting after ready confirmation' : 'Connecting'} to MDeskMini $cleanId via relay');
     connect(
       context,
       cleanId,

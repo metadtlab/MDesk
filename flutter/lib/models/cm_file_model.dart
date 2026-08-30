@@ -12,8 +12,7 @@ class CmFileModel {
   final WeakReference<FFI> parent;
   final currentJobTable = RxList<CmFileLog>();
   final _jobTables = HashMap<int, RxList<CmFileLog>>.fromEntries([]);
-  Stopwatch stopwatch = Stopwatch();
-  int _lastElapsed = 0;
+  final Stopwatch stopwatch = Stopwatch();
 
   CmFileModel(this.parent);
 
@@ -42,16 +41,13 @@ class CmFileModel {
     try {
       dynamic d = jsonDecode(log);
       if (!stopwatch.isRunning) stopwatch.start();
-      bool calcSpeed = stopwatch.elapsedMilliseconds - _lastElapsed >= 1000;
-      if (calcSpeed) {
-        _lastElapsed = stopwatch.elapsedMilliseconds;
-      }
+      final now = stopwatch.elapsedMilliseconds;
       if (d is List<dynamic>) {
         for (var l in d) {
-          _dealOneJob(l, calcSpeed);
+          _dealOneJob(l, now);
         }
       } else {
-        _dealOneJob(d, calcSpeed);
+        _dealOneJob(d, now);
       }
       currentJobTable.refresh();
     } catch (e) {
@@ -59,7 +55,7 @@ class CmFileModel {
     }
   }
 
-  _dealOneJob(dynamic l, bool calcSpeed) {
+  _dealOneJob(dynamic l, int now) {
     final data = TransferJobSerdeData.fromJson(l);
     var jobTable = _jobTables[data.connId];
     if (jobTable == null) {
@@ -98,9 +94,20 @@ class CmFileModel {
       job.state = JobState.error;
       job.err = data.error;
     }
-    if (calcSpeed) {
-      job.speed = (data.transferred - job.lastTransferredSize) * 1.0;
-      job.lastTransferredSize = data.transferred;
+    if (job.lastSampleElapsed < 0 || job.finishedSize < job.lastFinishedSize) {
+      job.lastFinishedSize = job.finishedSize;
+      job.lastSampleElapsed = now;
+    } else {
+      final elapsed = now - job.lastSampleElapsed;
+      if (elapsed >= 1000) {
+        final processed = job.finishedSize - job.lastFinishedSize;
+        job.speed = processed * 1000.0 / elapsed;
+        job.lastFinishedSize = job.finishedSize;
+        job.lastSampleElapsed = now;
+      }
+    }
+    if (job.state == JobState.done || job.state == JobState.error) {
+      job.speed = 0;
     }
     jobTable.refresh();
   }
@@ -231,7 +238,8 @@ class CmFileLog {
   CmFileAction action = CmFileAction.none;
   var fileName = "";
   var err = "";
-  int lastTransferredSize = 0;
+  int lastFinishedSize = 0;
+  int lastSampleElapsed = -1;
 
   String display() {
     if (state == JobState.done && err == "skipped") {

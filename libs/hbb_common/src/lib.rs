@@ -73,6 +73,10 @@ pub use users;
 
 pub type SessionID = uuid::Uuid;
 
+#[cfg(not(all(debug_assertions, any(target_os = "android", target_os = "ios"))))]
+static FILE_LOGGER_HANDLE: std::sync::OnceLock<flexi_logger::LoggerHandle> =
+    std::sync::OnceLock::new();
+
 #[inline]
 pub async fn sleep(sec: f32) {
     tokio::time::sleep(time::Duration::from_secs_f32(sec)).await;
@@ -387,7 +391,10 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         #[cfg(not(all(debug_assertions, any(target_os = "android", target_os = "ios"))))]
         {
             // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
-            let mut path = config::Config::log_path();
+            let mut path = std::env::var_os("HBB_LOG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(config::Config::log_path);
             #[cfg(target_os = "android")]
             if !config::Config::get_home().exists() {
                 return;
@@ -435,6 +442,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 };
                 match logger.start() {
                     Ok(handle) => {
+                        let _ = FILE_LOGGER_HANDLE.set(handle.clone());
                         logger_holder = Some(handle);
                     }
                     Err(e) => {
@@ -452,6 +460,29 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         }
     });
     logger_holder
+}
+
+/// Stops the process-local file logger and returns only the files that belong to it.
+/// Callers can then remove those files after the writer has released its handles.
+pub fn shutdown_log_and_get_files() -> Vec<std::path::PathBuf> {
+    #[cfg(not(all(debug_assertions, any(target_os = "android", target_os = "ios"))))]
+    {
+        let Some(handle) = FILE_LOGGER_HANDLE.get() else {
+            return Vec::new();
+        };
+        let selector = flexi_logger::LogfileSelector::default()
+            .with_r_current()
+            .with_compressed_files();
+        let files = handle.existing_log_files(&selector).unwrap_or_default();
+        log::logger().flush();
+        handle.shutdown();
+        files
+    }
+
+    #[cfg(all(debug_assertions, any(target_os = "android", target_os = "ios")))]
+    {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

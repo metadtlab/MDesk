@@ -103,7 +103,7 @@ impl Interface for Session {
         remember: bool,
         peer: &mut Stream,
     ) {
-        handle_login_from_ui(
+        if let Err(err) = handle_login_from_ui(
             self.lc.clone(),
             os_username,
             os_password,
@@ -111,7 +111,15 @@ impl Interface for Session {
             remember,
             peer,
         )
-        .await;
+        .await
+        {
+            self.msgbox(
+                "error",
+                "File Transfer Audit Required",
+                &err.to_string(),
+                "",
+            );
+        }
     }
 
     async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {

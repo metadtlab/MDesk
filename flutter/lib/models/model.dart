@@ -382,6 +382,8 @@ class FfiModel with ChangeNotifier {
         parent.target?.fileModel.receiveEmptyDirs(evt);
       } else if (name == 'job_progress') {
         parent.target?.fileModel.jobController.tryUpdateJobProgress(evt);
+      } else if (name == 'direct_file_transfer_started') {
+        parent.target?.fileModel.jobController.addDirectDownloadJob(evt);
       } else if (name == 'job_done') {
         bool? refresh =
             await parent.target?.fileModel.jobController.jobDone(evt);
@@ -504,6 +506,7 @@ class FfiModel with ChangeNotifier {
     final id = evt['id']?.toString() ?? '';
     if (id.isEmpty) return;
     final dir = evt['dir']?.toString();
+    final localDir = evt['localDir']?.toString();
     final selectedName = evt['selectedName']?.toString();
     final connTokenValue = evt['connToken']?.toString();
     final connToken = connTokenValue == null || connTokenValue.isEmpty
@@ -512,6 +515,7 @@ class FfiModel with ChangeNotifier {
     await rustDeskWinManager.newFileTransfer(
       id,
       connToken: connToken,
+      initialLocalDir: localDir == null || localDir.isEmpty ? null : localDir,
       initialRemoteDir: dir,
       initialRemoteSelectedName:
           selectedName == null || selectedName.isEmpty ? null : selectedName,

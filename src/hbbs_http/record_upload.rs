@@ -60,7 +60,7 @@ pub fn run(rx: Receiver<RecordState>) {
                             Ok(())
                         }
                     }
-                    RecordState::RemoveFile => {
+                    RecordState::RemoveFile(_) => {
                         if uploader.running {
                             uploader.handle_remove()
                         } else {

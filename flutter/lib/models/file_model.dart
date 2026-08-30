@@ -68,6 +68,7 @@ class FileModel {
   SessionID get sessionId => getSessionID();
   late final FileDialogEventLoop evtLoop;
   bool _transferEventLoopReady = false;
+  String? initialLocalDir;
   String? initialRemoteDir;
   String? initialRemoteSelectedName;
 
@@ -111,7 +112,15 @@ class FileModel {
 
   Future<void> onReady() async {
     await ensureTransferEventLoopReady();
-    if (!isWeb) await localController.onReady();
+    if (!isWeb) {
+      final requestedLocalDir = initialLocalDir;
+      initialLocalDir = null;
+      await localController.onReady(
+        initialDirectory: requestedLocalDir,
+        preserveSavedDirectory:
+            requestedLocalDir != null && requestedLocalDir.isNotEmpty,
+      );
+    }
     await remoteController.onReady();
     final requestedRemoteDir = initialRemoteDir;
     final requestedRemoteSelectedName = initialRemoteSelectedName;
@@ -123,6 +132,24 @@ class FileModel {
     } else if (requestedRemoteSelectedName != null &&
         requestedRemoteSelectedName.isNotEmpty) {
       remoteController.requestSelectName(requestedRemoteSelectedName);
+    }
+  }
+
+  Future<void> openExplorerTransferRequest({
+    String? localDir,
+    String? remoteDir,
+    String? remoteSelectedName,
+  }) async {
+    if (localDir != null && localDir.isNotEmpty) {
+      await localController.openTemporaryDirectory(localDir);
+    }
+    if (remoteDir != null && remoteDir.isNotEmpty) {
+      await remoteController.openDirectory(
+        remoteDir,
+        selectName: remoteSelectedName,
+      );
+    } else if (remoteSelectedName != null && remoteSelectedName.isNotEmpty) {
+      remoteController.requestSelectName(remoteSelectedName);
     }
   }
 
@@ -357,6 +384,7 @@ class FileController {
   late final SelectedItems selectedItems = SelectedItems(isLocal: isLocal);
   String? _pendingSelectedName;
   String? _pendingSelectedDirectory;
+  String? _directoryToPersistOnClose;
 
   FileController(
       {required this.isLocal,
@@ -389,7 +417,10 @@ class FileController {
     return DirectoryData(directory.value, options.value);
   }
 
-  Future<void> onReady() async {
+  Future<void> onReady({
+    String? initialDirectory,
+    bool preserveSavedDirectory = false,
+  }) async {
     if (isLocal) {
       options.value.home = await bind.mainGetHomeDir();
     }
@@ -405,7 +436,13 @@ class FileController {
 
     final dir = (await bind.sessionGetPeerOption(
         sessionId: sessionId, name: isLocal ? "local_dir" : "remote_dir"));
-    openDirectory(dir.isEmpty ? options.value.home : dir);
+    final requestedDirectory = initialDirectory?.trim() ?? '';
+    if (preserveSavedDirectory && requestedDirectory.isNotEmpty) {
+      _directoryToPersistOnClose = dir;
+    }
+    await openDirectory(requestedDirectory.isNotEmpty
+        ? requestedDirectory
+        : (dir.isEmpty ? options.value.home : dir));
 
     await Future.delayed(Duration(seconds: 1));
 
@@ -417,7 +454,8 @@ class FileController {
   Future<void> close() async {
     // save config
     Map<String, String> msgMap = {};
-    msgMap[isLocal ? "local_dir" : "remote_dir"] = directory.value.path;
+    msgMap[isLocal ? "local_dir" : "remote_dir"] =
+        _directoryToPersistOnClose ?? directory.value.path;
     msgMap[isLocal ? "local_show_hidden" : "remote_show_hidden"] =
         options.value.showHidden ? "Y" : "";
     for (final msg in msgMap.entries) {
@@ -426,6 +464,12 @@ class FileController {
     }
     directory.value.clear();
     options.value.clear();
+    _directoryToPersistOnClose = null;
+  }
+
+  Future<void> openTemporaryDirectory(String path, {String? selectName}) async {
+    _directoryToPersistOnClose ??= directory.value.path;
+    await openDirectory(path, selectName: selectName);
   }
 
   void toggleShowHidden({bool? showHidden}) {
@@ -1023,6 +1067,30 @@ class JobController {
     return jobID;
   }
 
+  void addDirectDownloadJob(Map<String, dynamic> evt) {
+    try {
+      final id = int.parse(evt['id'].toString());
+      if (getJob(id) >= 0) return;
+      final rootName = evt['root_name']?.toString() ?? '';
+      final totalSize = int.parse(evt['total_size'].toString());
+      final fileCount = int.parse(evt['file_count'].toString());
+      jobTable.add(JobProgress()
+        ..type = JobType.transfer
+        ..fileName = rootName
+        ..jobName = rootName
+        ..totalSize = totalSize
+        ..fileCount = fileCount
+        ..state = JobState.inProgress
+        ..id = id
+        ..isRemoteToLocal = true
+        ..isDirectDownload = true
+        ..remote = rootName
+        ..to = 'Downloads');
+    } catch (e) {
+      debugPrint('Failed to add direct download job: $evt, error: $e');
+    }
+  }
+
   int addDeleteFileJob(Entry file, bool isRemote) {
     final jobID = JobController.jobID.next();
     jobTable.add(JobProgress()
@@ -1583,6 +1651,7 @@ class JobProgress {
   var showHidden = false;
   var err = "";
   var isRemoteDropDownload = false;
+  var isDirectDownload = false;
   int lastTransferredSize = 0;
 
   clear() {
@@ -1600,6 +1669,7 @@ class JobProgress {
     to = "";
     err = "";
     isRemoteDropDownload = false;
+    isDirectDownload = false;
   }
 
   String display() {

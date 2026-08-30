@@ -101,6 +101,63 @@ pub fn create_http_client(tls_type: TlsType, danger_accept_invalid_cert: bool) -
     configure_http_client!(builder, tls_type, danger_accept_invalid_cert, SyncClient)
 }
 
+/// Client for requests that carry user/device capabilities. It uses the
+/// configured proxy but never accepts an invalid certificate or follows an
+/// HTTP redirect that could replay a sensitive request body to another URL.
+pub fn create_secure_http_client() -> Result<SyncClient, String> {
+    let mut builder = SyncClient::builder()
+        .no_proxy()
+        .use_rustls_tls()
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(conf) = Config::get_socks() {
+        let proxy = Proxy::from_conf(&conf, None).map_err(|err| err.to_string())?;
+        let proxy_setup = match &proxy.intercept {
+            ProxyScheme::Http { host, .. } => reqwest::Proxy::all(format!("http://{}", host)),
+            ProxyScheme::Https { host, .. } => reqwest::Proxy::all(format!("https://{}", host)),
+            ProxyScheme::Socks5 { addr, .. } => reqwest::Proxy::all(format!("socks5://{}", addr)),
+        }
+        .map_err(|err| err.to_string())?;
+        let proxy_setup = if let Some(auth) = proxy.intercept.maybe_auth() {
+            if !auth.username().is_empty() && !auth.password().is_empty() {
+                proxy_setup.basic_auth(auth.username(), auth.password())
+            } else {
+                proxy_setup
+            }
+        } else {
+            proxy_setup
+        };
+        builder = builder.proxy(proxy_setup);
+    }
+    builder.build().map_err(|err| err.to_string())
+}
+
+pub fn create_secure_http_client_async() -> Result<AsyncClient, String> {
+    let mut builder = AsyncClient::builder()
+        .no_proxy()
+        .use_rustls_tls()
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(conf) = Config::get_socks() {
+        let proxy = Proxy::from_conf(&conf, None).map_err(|err| err.to_string())?;
+        let proxy_setup = match &proxy.intercept {
+            ProxyScheme::Http { host, .. } => reqwest::Proxy::all(format!("http://{}", host)),
+            ProxyScheme::Https { host, .. } => reqwest::Proxy::all(format!("https://{}", host)),
+            ProxyScheme::Socks5 { addr, .. } => reqwest::Proxy::all(format!("socks5://{}", addr)),
+        }
+        .map_err(|err| err.to_string())?;
+        let proxy_setup = if let Some(auth) = proxy.intercept.maybe_auth() {
+            if !auth.username().is_empty() && !auth.password().is_empty() {
+                proxy_setup.basic_auth(auth.username(), auth.password())
+            } else {
+                proxy_setup
+            }
+        } else {
+            proxy_setup
+        };
+        builder = builder.proxy(proxy_setup);
+    }
+    builder.build().map_err(|err| err.to_string())
+}
+
 pub fn create_http_client_async(
     tls_type: TlsType,
     danger_accept_invalid_cert: bool,

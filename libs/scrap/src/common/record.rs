@@ -15,11 +15,9 @@ use std::{
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::mpsc::Sender,
-    time::Instant,
 };
 use webm::mux::{self, Segment, Track, VideoTrack, Writer};
 
-const MIN_SECS: u64 = 1;
 const MAX_FILENAME_COMPONENT_CHARS: usize = 48;
 
 fn sanitize_file_component(value: &str) -> String {
@@ -122,7 +120,7 @@ pub enum RecordState {
     NewFile(String),
     NewFrame,
     WriteTail,
-    RemoveFile,
+    RemoveFile(String),
 }
 
 pub struct Recorder {
@@ -332,7 +330,6 @@ struct WebmRecorder {
     ctx2: RecorderContext2,
     key: bool,
     written: bool,
-    start: Instant,
 }
 
 impl RecorderApi for WebmRecorder {
@@ -381,7 +378,6 @@ impl RecorderApi for WebmRecorder {
             ctx2,
             key: false,
             written: false,
-            start: Instant::now(),
         })
     }
 
@@ -453,9 +449,12 @@ impl Drop for WebmRecorder {
     fn drop(&mut self) {
         let _ = std::mem::replace(&mut self.webm, None).map_or(false, |webm| webm.finalize(None));
         let mut state = RecordState::WriteTail;
-        if !self.written || self.start.elapsed().as_secs() < MIN_SECS {
+        // Enterprise recording must not discard a valid segment merely
+        // because the recorder was rotated or stopped within one wall-clock
+        // second. A fast encoder can already have written useful frames.
+        if !self.written {
             std::fs::remove_file(&self.ctx2.filename).ok();
-            state = RecordState::RemoveFile;
+            state = RecordState::RemoveFile(self.ctx2.filename.clone());
         }
         self.ctx.tx.as_ref().map(|tx| tx.send(state));
     }
@@ -468,7 +467,6 @@ struct HwRecorder {
     ctx2: RecorderContext2,
     written: bool,
     key: bool,
-    start: Instant,
 }
 
 #[cfg(feature = "hwcodec")]
@@ -488,7 +486,6 @@ impl RecorderApi for HwRecorder {
             ctx2,
             written: false,
             key: false,
-            start: Instant::now(),
         })
     }
 
@@ -517,11 +514,14 @@ impl Drop for HwRecorder {
     fn drop(&mut self) {
         self.muxer.as_mut().map(|m| m.write_tail().ok());
         let mut state = RecordState::WriteTail;
-        if !self.written || self.start.elapsed().as_secs() < MIN_SECS {
+        // Preserve every segment that contains encoded frames. Rotation can
+        // legitimately create a sub-second segment and it still belongs to
+        // the audited session.
+        if !self.written {
             // The process cannot access the file because it is being used by another process
             self.muxer = None;
             std::fs::remove_file(&self.ctx2.filename).ok();
-            state = RecordState::RemoveFile;
+            state = RecordState::RemoveFile(self.ctx2.filename.clone());
         }
         self.ctx.tx.as_ref().map(|tx| tx.send(state));
     }

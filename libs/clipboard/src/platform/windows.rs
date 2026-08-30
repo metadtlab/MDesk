@@ -1080,7 +1080,10 @@ extern "C" fn handle_clipboard_files(
             return 0;
         }
 
-        ClipboardFile::Files { files }
+        ClipboardFile::Files {
+            files,
+            source_application: 0,
+        }
     };
     // no need to handle result here
     allow_err!(send_data(conn_id as _, data));

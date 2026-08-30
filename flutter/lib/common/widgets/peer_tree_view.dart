@@ -197,7 +197,8 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     );
 
     if (response.isUnauthorized) {
-      await gFFI.userModel.reset(resetOther: true);
+      final sessionKept = await gFFI.userModel.recoverUnauthorized();
+      if (sessionKept) return;
       if (mounted) {
         showToast('비밀번호가 변경되어 다시 로그인해주세요');
         Future.delayed(const Duration(milliseconds: 500), () {
@@ -299,7 +300,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         return;
       }
 
-      final response = await recentSessionService.getRecentSessions(
+      var response = await recentSessionService.getRecentSessions(
         apiServer: apiServer,
         accessToken: accessToken,
         userId: userId,
@@ -309,8 +310,19 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       // 401 응답 처리 (토큰 무효화)
       if (response.isUnauthorized) {
         debugPrint('PeerTreeView: 401 Unauthorized on recent sessions');
-        await gFFI.userModel.reset(resetOther: true);
-        if (mounted) {
+        final sessionKept = await gFFI.userModel.recoverUnauthorized();
+        if (sessionKept) {
+          final retryToken = bind.mainGetLocalOption(key: 'access_token');
+          if (retryToken.isNotEmpty) {
+            response = await recentSessionService.getRecentSessions(
+              apiServer: apiServer,
+              accessToken: retryToken,
+              userId: userId,
+              limit: 5,
+            );
+          }
+        }
+        if (response.isUnauthorized && !sessionKept && mounted) {
           showToast('비밀번호가 변경되어 다시 로그인해주세요');
           Future.delayed(const Duration(milliseconds: 500), () {
             if (mounted) {
@@ -318,12 +330,13 @@ class _PeerTreeViewState extends State<PeerTreeView> {
             }
           });
         }
-        setState(() {
-          _recentSessions = [];
-          _recentSessionsLoading = false;
-          _recentSessionsLoaded = false;
-        });
-        return;
+        if (response.isUnauthorized) {
+          setState(() {
+            _recentSessions = [];
+            _recentSessionsLoaded = false;
+          });
+          return;
+        }
       }
 
       if (response.success) {
@@ -353,9 +366,12 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       debugPrint('PeerTreeView: Error loading recent sessions: $e');
       setState(() {
         _recentSessions = [];
-        _recentSessionsLoading = false;
         _recentSessionsLoaded = false;
       });
+    } finally {
+      if (mounted && _recentSessionsLoading) {
+        setState(() => _recentSessionsLoading = false);
+      }
     }
   }
 
@@ -427,7 +443,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         return;
       }
 
-      final response = await deviceRegisterService.getRegisteredDevices(
+      var response = await deviceRegisterService.getRegisteredDevices(
         apiServer: apiServer,
         accessToken: accessToken,
         userPkid: userPkid,
@@ -436,8 +452,18 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       // 401 응답 처리 (토큰 무효화)
       if (response.isUnauthorized) {
         debugPrint('PeerTreeView: 401 Unauthorized - Token invalidated');
-        await gFFI.userModel.reset(resetOther: true);
-        if (mounted) {
+        final sessionKept = await gFFI.userModel.recoverUnauthorized();
+        if (sessionKept) {
+          final retryToken = bind.mainGetLocalOption(key: 'access_token');
+          if (retryToken.isNotEmpty) {
+            response = await deviceRegisterService.getRegisteredDevices(
+              apiServer: apiServer,
+              accessToken: retryToken,
+              userPkid: userPkid,
+            );
+          }
+        }
+        if (response.isUnauthorized && !sessionKept && mounted) {
           showToast('비밀번호가 변경되어 다시 로그인해주세요');
           Future.delayed(const Duration(milliseconds: 500), () {
             if (mounted) {
@@ -445,13 +471,14 @@ class _PeerTreeViewState extends State<PeerTreeView> {
             }
           });
         }
-        setState(() {
-          _myDevices = [];
-          _myDevicesLoading = false;
-          _myDevicesLoaded = false;
-          _lastUserPkid = null;
-        });
-        return;
+        if (response.isUnauthorized) {
+          setState(() {
+            _myDevices = [];
+            _myDevicesLoaded = false;
+            _lastUserPkid = null;
+          });
+          return;
+        }
       }
 
       if (response.success && response.data.isNotEmpty) {
@@ -513,10 +540,13 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       debugPrint('Error loading my devices: $e');
       setState(() {
         _myDevices = [];
-        _myDevicesLoading = false;
         _myDevicesLoaded = false;
         _lastUserPkid = null;
       });
+    } finally {
+      if (mounted && _myDevicesLoading) {
+        setState(() => _myDevicesLoading = false);
+      }
     }
   }
 

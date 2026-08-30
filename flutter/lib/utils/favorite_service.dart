@@ -155,7 +155,8 @@ class FavoriteService {
       final url = '$baseUrl/api/favorites';
       final body = jsonEncode({
         'peer_id': peerId,
-        if (displayName != null && displayName.isNotEmpty) 'display_name': displayName,
+        if (displayName != null && displayName.isNotEmpty)
+          'display_name': displayName,
       });
 
       debugPrint('FavoriteService: addFavorite $peerId');

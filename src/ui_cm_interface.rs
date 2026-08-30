@@ -27,10 +27,14 @@ use hbb_common::{config::keys::*, tokio::sync::Mutex as TokioMutex, ResultType};
 use serde_derive::Serialize;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 use std::iter::FromIterator;
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::MetadataExt;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::Arc;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -57,6 +61,17 @@ pub struct Client {
     pub clipboard: bool,
     pub audio: bool,
     pub file: bool,
+    /// Effective file-transfer capability for this connection. This remains
+    /// false until the connection reports both host and peer permission as
+    /// enabled, so Explorer direct-send fails closed during login races.
+    #[serde(skip)]
+    #[cfg(target_os = "windows")]
+    pub effective_file_transfer_enabled: bool,
+    /// Explicit protocol capability reported by the controller. Never infer
+    /// this from a version string because unknown peers must fail closed.
+    #[serde(skip)]
+    #[cfg(target_os = "windows")]
+    pub direct_file_receive_supported: bool,
     pub restart: bool,
     pub recording: bool,
     pub block_input: bool,
@@ -88,6 +103,8 @@ lazy_static::lazy_static! {
 }
 
 static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const FILE_PROGRESS_UI_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(target_os = "windows")]
 static EXPLORER_SEND_MENU_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -103,11 +120,19 @@ fn is_default_remote_client(client: &Client) -> bool {
 
 #[cfg(target_os = "windows")]
 fn refresh_explorer_send_to_controller_menu() {
-    let should_register = CLIENTS
-        .read()
-        .unwrap()
-        .values()
-        .any(is_default_remote_client);
+    let should_register = {
+        let clients = CLIENTS.read().unwrap();
+        let mut active_clients = clients
+            .values()
+            .filter(|client| is_default_remote_client(client));
+        active_clients
+            .next()
+            .map(|client| {
+                client.direct_file_receive_supported && client.effective_file_transfer_enabled
+            })
+            .unwrap_or(false)
+            && active_clients.next().is_none()
+    };
 
     if should_register {
         if !EXPLORER_SEND_MENU_REGISTERED.swap(true, Ordering::SeqCst) {
@@ -175,6 +200,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
         clipboard: bool,
         audio: bool,
         file: bool,
+        direct_file_receive_supported: bool,
         restart: bool,
         recording: bool,
         block_input: bool,
@@ -196,6 +222,10 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             clipboard,
             audio,
             file,
+            #[cfg(target_os = "windows")]
+            effective_file_transfer_enabled: false,
+            #[cfg(target_os = "windows")]
+            direct_file_receive_supported,
             restart,
             recording,
             block_input,
@@ -261,6 +291,14 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
         }
 
         self.ui_handler.remove_connection(id, close);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn update_effective_file_transfer_permission(&self, id: i32, enabled: bool) {
+        if let Some(client) = CLIENTS.write().unwrap().get_mut(&id) {
+            client.effective_file_transfer_enabled = enabled;
+        }
+        refresh_explorer_send_to_controller_menu();
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -348,9 +386,20 @@ pub fn send_chat(id: i32, text: String) {
 #[inline]
 #[cfg(not(any(target_os = "ios")))]
 pub fn switch_permission(id: i32, name: String, enabled: bool) {
-    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
+    let mut clients = CLIENTS.write().unwrap();
+    if let Some(client) = clients.get_mut(&id) {
+        #[cfg(target_os = "windows")]
+        if name == "file" {
+            client.file = enabled;
+            if !enabled {
+                client.effective_file_transfer_enabled = false;
+            }
+        }
         allow_err!(client.tx.send(Data::SwitchPermission { name, enabled }));
     };
+    drop(clients);
+    #[cfg(target_os = "windows")]
+    refresh_explorer_send_to_controller_menu();
 }
 
 #[cfg(all(target_os = "windows", not(any(target_os = "ios"))))]
@@ -376,6 +425,62 @@ pub fn open_file_transfer_folder(
             .map_err(|err| err.to_string()),
         _ => Err("Multiple remote controllers are connected.".to_owned()),
     }
+}
+
+#[cfg(all(target_os = "windows", not(any(target_os = "ios"))))]
+pub fn start_direct_file_transfer(source_path: String) -> Result<(), String> {
+    let source_path = validate_direct_transfer_source(&source_path)?;
+    let clients = CLIENTS.read().unwrap();
+    let active_clients = clients
+        .values()
+        .filter(|client| is_default_remote_client(client))
+        .collect::<Vec<_>>();
+
+    match active_clients.as_slice() {
+        [] => Err("No active remote controller.".to_owned()),
+        [client] if !client.direct_file_receive_supported => {
+            Err("The active remote controller does not support direct file receive.".to_owned())
+        }
+        [client] if !client.effective_file_transfer_enabled => {
+            Err("File transfer is disabled for the active remote controller.".to_owned())
+        }
+        [client] => client
+            .tx
+            .send(Data::DirectFileTransfer {
+                source_path,
+                result: None,
+            })
+            .map_err(|err| err.to_string()),
+        _ => Err("Multiple remote controllers are connected.".to_owned()),
+    }
+}
+
+#[cfg(all(target_os = "windows", not(any(target_os = "ios"))))]
+fn validate_direct_transfer_source(source_path: &str) -> Result<String, String> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let source = PathBuf::from(source_path);
+    if !source.is_absolute() {
+        return Err("The selected path must be absolute.".to_owned());
+    }
+    let source_metadata = std::fs::symlink_metadata(&source)
+        .map_err(|err| format!("The selected file or folder is unavailable: {err}"))?;
+    if source_metadata.file_type().is_symlink()
+        || source_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("Symbolic links and reparse points cannot be transferred directly.".to_owned());
+    }
+    let source = std::fs::canonicalize(source)
+        .map_err(|err| format!("The selected file or folder is unavailable: {err}"))?;
+    let metadata = std::fs::metadata(&source)
+        .map_err(|err| format!("The selected file or folder is unavailable: {err}"))?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("Only a regular file or folder can be transferred.".to_owned());
+    }
+    source
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "The selected path contains unsupported characters.".to_owned())
 }
 
 #[inline]
@@ -465,6 +570,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
             }
         }
         let (tx_log, mut rx_log) = mpsc::unbounded_channel::<String>();
+        let mut last_file_progress_ui = Instant::now();
 
         self.running = false;
         loop {
@@ -477,9 +583,9 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                         }
                         Ok(Some(data)) => {
                             match data {
-                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, ip, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, from_switch} => {
+                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, ip, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, direct_file_receive_supported, restart, recording, block_input, from_switch} => {
                                     log::debug!("conn_id: {}", id);
-                                    self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, ip, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, from_switch, self.tx.clone());
+                                    self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, ip, authorized, keyboard, clipboard, audio, file, direct_file_receive_supported, restart, recording, block_input, from_switch, self.tx.clone());
                                     self.conn_id = id;
                                     #[cfg(target_os = "windows")]
                                     {
@@ -526,7 +632,22 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                             .await
                                     );
                                 }
+                                #[cfg(target_os = "windows")]
+                                Data::DirectFileTransfer { source_path, .. } => {
+                                    let result = start_direct_file_transfer(source_path)
+                                        .map(|_| String::new())
+                                        .unwrap_or_else(|err| err);
+                                    allow_err!(
+                                        self.stream
+                                            .send(&Data::DirectFileTransfer {
+                                                source_path: String::new(),
+                                                result: Some(result),
+                                            })
+                                            .await
+                                    );
+                                }
                                 Data::FS(mut fs) => {
+                                    let is_write_block = matches!(&fs, ipc::FS::WriteBlock { .. });
                                     if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
                                         if let Ok(bytes) = self.stream.next_raw().await {
                                             fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};
@@ -535,8 +656,11 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     } else {
                                         handle_fs(fs, &mut write_jobs, &self.tx, Some(&tx_log)).await;
                                     }
-                                    let log = fs::serialize_transfer_jobs(&write_jobs);
-                                    self.cm.ui_handler.file_transfer_log("transfer", &log);
+                                    if !is_write_block || last_file_progress_ui.elapsed() >= FILE_PROGRESS_UI_INTERVAL {
+                                        let log = fs::serialize_transfer_jobs(&write_jobs);
+                                        self.cm.ui_handler.file_transfer_log("transfer", &log);
+                                        last_file_progress_ui = Instant::now();
+                                    }
                                 }
                                 Data::FileTransferLog((action, log)) => {
                                     self.cm.ui_handler.file_transfer_log(&action, &log);
@@ -568,6 +692,10 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     #[cfg(target_os = "windows")]
                                     {
                                         self.file_transfer_enabled_peer = _enabled;
+                                        self.cm.update_effective_file_transfer_permission(
+                                            self.conn_id,
+                                            _enabled,
+                                        );
                                     }
                                 }
                                 Data::Theme(dark) => {
@@ -593,6 +721,10 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 Data::ClipboardNonFile(_) => {
                                     match crate::clipboard::check_clipboard_cm() {
                                         Ok(multi_clipoards) => {
+                                            // This process owns the interactive user session. Classify
+                                            // the clipboard owner immediately after reading the final
+                                            // snapshot, then send only the closed enum over IPC.
+                                            let source_application = crate::clipboard_audit::current_clipboard_source_application();
                                             let mut raw_contents = bytes::BytesMut::new();
                                             let mut main_data = vec![];
                                             for c in multi_clipoards.clipboards.into_iter() {
@@ -615,6 +747,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                                     height: c.height,
                                                     format: c.format.value(),
                                                     special_name: c.special_name,
+                                                    source_application,
                                                 });
                                             }
                                             allow_err!(self.stream.send(&Data::ClipboardNonFile(Some(("".to_owned(), main_data)))).await);
@@ -657,9 +790,12 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                     }
                 },
                 clip_file = rx_clip.recv() => match clip_file {
-                    Some(_clip) => {
+                    Some(mut _clip) => {
                         #[cfg(target_os = "windows")]
                         {
+                            if let clipboard::ClipboardFile::Files { source_application, .. } = &mut _clip {
+                                *source_application = crate::clipboard_audit::current_clipboard_source_application().to_proto() as i32;
+                            }
                             let is_stopping_allowed = _clip.is_stopping_allowed();
                             let is_clipboard_enabled = ContextSend::is_enabled();
                             let file_transfer_enabled = self.file_transfer_enabled;
@@ -776,6 +912,7 @@ pub async fn start_listen<T: InvokeUiCM>(
                 clipboard,
                 audio,
                 file,
+                direct_file_receive_supported,
                 restart,
                 recording,
                 block_input,
@@ -797,6 +934,7 @@ pub async fn start_listen<T: InvokeUiCM>(
                     clipboard,
                     audio,
                     file,
+                    direct_file_receive_supported,
                     restart,
                     recording,
                     block_input,
@@ -972,13 +1110,29 @@ async fn handle_fs(
             }
         }
         ipc::FS::WriteDone { id, file_num } => {
-            if let Some(job) = fs::remove_job(id, write_jobs) {
-                job.modify_time();
-                let folder_to_open = job.folder_to_open_on_done();
-                send_raw(fs::new_done(id, file_num), tx);
-                tx_log.map(|tx| tx.send(serialize_transfer_job(&job, true, false, "")));
-                if let Some(folder) = folder_to_open {
-                    open_remote_drop_download_folder(folder);
+            if let Some(mut job) = fs::remove_job(id, write_jobs) {
+                match job.finalize_write().await {
+                    Ok(()) => {
+                        allow_err!(tx.send(ipc::Data::FileTransferAuditOutcome {
+                            id,
+                            succeeded: job.audit_error().is_none(),
+                        }));
+                        let folder_to_open = job.folder_to_open_on_done();
+                        send_raw(fs::new_done(id, file_num), tx);
+                        tx_log.map(|tx| tx.send(serialize_transfer_job(&job, true, false, "")));
+                        if let Some(folder) = folder_to_open {
+                            open_remote_drop_download_folder(folder);
+                        }
+                    }
+                    Err(err) => {
+                        let err = err.to_string();
+                        allow_err!(tx.send(ipc::Data::FileTransferAuditOutcome {
+                            id,
+                            succeeded: false,
+                        }));
+                        tx_log.map(|tx| tx.send(serialize_transfer_job(&job, false, false, &err)));
+                        send_raw(fs::new_error(id, err, file_num), tx);
+                    }
                 }
             }
         }
@@ -1039,6 +1193,7 @@ async fn handle_fs(
                                 job.set_digest(file_size, last_modified);
                                 match digest_result {
                                     DigestCheckResult::IsSame => {
+                                        job.mark_audit_file_skipped();
                                         req.set_skip(true);
                                         let msg_out = new_send_confirm(req);
                                         send_raw(msg_out, &tx);
@@ -1069,6 +1224,12 @@ async fn handle_fs(
         ipc::FS::SendConfirm(bytes) => {
             if let Ok(r) = FileTransferSendConfirmRequest::parse_from_bytes(&bytes) {
                 if let Some(job) = fs::get_job(r.id, write_jobs) {
+                    if matches!(
+                        r.union,
+                        Some(file_transfer_send_confirm_request::Union::Skip(true))
+                    ) {
+                        job.mark_audit_file_skipped();
+                    }
                     job.confirm(&r).await;
                 }
             }

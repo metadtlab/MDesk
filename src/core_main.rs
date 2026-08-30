@@ -32,12 +32,15 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(windows)]
     {
         // 관리자 권한 확인 (자동 권한 상승은 하지 않음)
-        if let Ok(elevated) = crate::platform::windows::is_elevated(None) {
-            if elevated {
-                // 관리자 권한이 있으면 즉시 방화벽 규칙 추가 (네트워크 사용 전)
-                crate::platform::windows::try_add_firewall_rule_on_first_run();
-                // Windows 방화벽 알림 비활성화
-                crate::platform::windows::disable_firewall_notifications();
+        if crate::common::should_run_startup_firewall_bootstrap() {
+            if let Ok(elevated) = crate::platform::windows::is_elevated(None) {
+                if elevated {
+                    // 관리자 권한이 있으면 즉시 방화벽 규칙 추가 (네트워크 사용 전)
+                    crate::platform::windows::try_add_firewall_rule_on_first_run();
+                    // Windows 방화벽 알림 비활성화
+                    crate::platform::windows::disable_firewall_notifications();
+                    crate::common::mark_startup_firewall_bootstrapped();
+                }
             }
         }
     }
@@ -254,10 +257,12 @@ pub fn core_main() -> Option<Vec<String>> {
                     if let Err(err) =
                         platform::send_explorer_path_to_controller(args[1].clone(), select_path)
                     {
-                        log::error!("Failed to request file transfer from Explorer: {err}");
+                        log::error!("Failed to start direct file transfer from Explorer: {err}");
                     }
                 } else {
-                    log::error!("Failed to request file transfer from Explorer: no path selected");
+                    log::error!(
+                        "Failed to start direct file transfer from Explorer: no path selected"
+                    );
                 }
                 return None;
             } else if args[0] == "--silent-install" {

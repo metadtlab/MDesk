@@ -69,6 +69,15 @@ message OSLogin {
   string password = 2;
 }
 
+// Short-lived, server-issued capability proving which authenticated account
+// initiated this connection. The controller's raw access token is never sent
+// to the remote host.
+message AuditContext {
+  uint32 protocol_version = 1;
+  string source_connection_id = 2;
+  string connection_ticket = 3;
+}
+
 message LoginRequest {
   string username = 1;
   bytes password = 2;
@@ -89,6 +98,10 @@ message LoginRequest {
   bytes hwid = 14;
   // 제어 클라이언트가 보고하는 LAN/사설 IP (소켓 peer 주소는 릴레이·NAT로 공인과 다를 수 있음)
   string client_local_ip = 17;
+  AuditContext audit_context = 18;
+  // Explicit controller capability for receiving a controlled-host initiated
+  // transfer directly into its local Downloads folder.
+  bool supports_direct_file_receive = 19;
 }
 
 message Terminal {
@@ -334,6 +347,10 @@ message CursorPosition {
 message Hash {
   string salt = 1;
   string challenge = 2;
+  // Authentication-mode hint for controller UI. "click" means the
+  // controller should submit an empty login request and wait for the
+  // controlled host's explicit approval instead of prompting for a password.
+  string approve_mode = 3;
 }
 
 enum ClipboardFormat {
@@ -344,6 +361,20 @@ enum ClipboardFormat {
   ImagePng = 22;
   ImageSvg = 23;
   Special = 31;
+}
+
+// Privacy-safe application category for clipboard audit metadata. The source
+// process basename is classified locally and is never serialized.
+enum ClipboardSourceApplication {
+  ClipboardSourceUnknown = 0;
+  ClipboardSourceExcel = 1;
+  ClipboardSourcePowerpoint = 2;
+  ClipboardSourceWord = 3;
+  ClipboardSourceBrowser = 4;
+  ClipboardSourceFileManager = 5;
+  ClipboardSourceImageEditor = 6;
+  ClipboardSourcePdfViewer = 7;
+  ClipboardSourceOther = 8;
 }
 
 message Clipboard {
@@ -358,6 +389,7 @@ message Clipboard {
   // sessions (multi-session clipboard sync), not a direct/intended transfer.
   // Used to skip audit logging on the receiving host to avoid phantom records.
   bool relayed = 7;
+  ClipboardSourceApplication source_application = 8;
 }
 
 message MultiClipboards {
@@ -428,7 +460,28 @@ message FileAction {
     FileTransferSendConfirmRequest send_confirm = 9;
     FileRename rename = 10;
     ReadEmptyDirs read_empty_dirs = 11;
+    // Controlled host initiated push into the authenticated controller's
+    // Downloads folder. Unlike FileTransferReceiveRequest this never carries
+    // an arbitrary destination path.
+    DirectFileTransferReceiveRequest direct_receive = 12;
   }
+}
+
+message DirectFileTransferReceiveRequest {
+  enum Destination {
+    Unspecified = 0;
+    Downloads = 1;
+  }
+
+  int32 id = 1;
+  Destination destination = 2;
+  // One safe path component (the selected file/folder basename).
+  string root_name = 3;
+  bool is_directory = 4;
+  // File names and empty directory names are relative to root_name.
+  repeated FileEntry files = 5;
+  repeated string empty_dirs = 6;
+  uint64 total_size = 7;
 }
 
 message FileTransferCancel { int32 id = 1; }
@@ -583,6 +636,7 @@ message CliprdrFile {
 
 message CliprdrFiles {
   repeated CliprdrFile files = 1;
+  ClipboardSourceApplication source_application = 2;
 }
 
 message Cliprdr {

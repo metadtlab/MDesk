@@ -3,6 +3,7 @@ setlocal EnableExtensions
 
 set "PROJECT_DIR=%~dp0"
 set "TARGET_EXE=%PROJECT_DIR%target\i686-pc-windows-msvc\release\mdeskmini.exe"
+set "ADMIN_VERIFY_SCRIPT=%PROJECT_DIR%verify_admin_manifest.ps1"
 
 where upx >nul 2>nul
 if errorlevel 1 (
@@ -23,6 +24,8 @@ echo EXE: %TARGET_EXE%
 upx -t "%TARGET_EXE%" >nul 2>nul
 if not errorlevel 1 (
   echo [OK] The executable is already UPX-compressed and passed the integrity test.
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%TARGET_EXE%"
+  if errorlevel 1 exit /b 1
   exit /b 0
 )
 
@@ -35,6 +38,12 @@ if errorlevel 1 (
 upx -t "%TARGET_EXE%"
 if errorlevel 1 (
   echo ERROR: UPX integrity verification failed.
+  exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%TARGET_EXE%"
+if errorlevel 1 (
+  echo ERROR: UPX output is missing the administrator manifest.
   exit /b 1
 )
 

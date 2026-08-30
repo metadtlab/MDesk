@@ -75,7 +75,7 @@ use hbb_common::{
 pub use helper::*;
 use scrap::{
     codec::Decoder,
-    record::{Recorder, RecorderContext},
+    record::{RecordState, Recorder, RecorderContext},
     CodecFormat, ImageFormat, ImageRgb, ImageTexture,
 };
 
@@ -96,6 +96,8 @@ pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
+const FORCE_RELAY_OFFLINE_GRACE: Duration = Duration::from_secs(5);
+const FORCE_RELAY_OFFLINE_RETRY_INTERVAL_SECS: f32 = 0.3;
 pub const VIDEO_QUEUE_SIZE: usize = 120;
 const MAX_DECODE_FAIL_COUNTER: usize = 3;
 
@@ -171,6 +173,8 @@ lazy_static::lazy_static! {
 
 const PUBLIC_SERVER: &str = "public";
 const FAST_RELAY_FALLBACK_TIMEOUT: u64 = 3_000;
+const DIRECT_SECURE_HANDSHAKE_TIMEOUT: u64 = 1_000;
+const MAX_PUNCH_ATTEMPTS_WITHOUT_RELAY: u64 = 3;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_key_state(key: enigo::Key) -> bool {
@@ -469,9 +473,17 @@ impl Client {
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             ..Default::default()
         });
+        let relay_after_first_direct_failure =
+            Self::relay_fallback_available(&fallback_relay_server, interface.is_force_relay());
+        let max_punch_attempts = if relay_after_first_direct_failure {
+            1
+        } else {
+            MAX_PUNCH_ATTEMPTS_WITHOUT_RELAY
+        };
         let mut i = 0;
         let mut offline_grace_retry = true;
-        while i < 3 {
+        let mut force_relay_offline_deadline = None;
+        while i < max_punch_attempts {
             i += 1;
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
@@ -496,6 +508,23 @@ impl Client {
                                     bail!("ID does not exist");
                                 }
                                 Ok(punch_hole_response::Failure::OFFLINE) => {
+                                    if interface.is_force_relay() {
+                                        let deadline = *force_relay_offline_deadline
+                                            .get_or_insert_with(|| {
+                                                Instant::now() + FORCE_RELAY_OFFLINE_GRACE
+                                            });
+                                        if Instant::now() < deadline {
+                                            log::info!(
+                                                "Peer offline on rendezvous; waiting 300ms in force-relay grace queue"
+                                            );
+                                            hbb_common::sleep(
+                                                FORCE_RELAY_OFFLINE_RETRY_INTERVAL_SECS,
+                                            )
+                                            .await;
+                                            i -= 1;
+                                            continue;
+                                        }
+                                    }
                                     if offline_grace_retry {
                                         offline_grace_retry = false;
                                         log::info!(
@@ -519,7 +548,11 @@ impl Client {
                             peer_nat_type = ph.nat_type();
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
-                            relay_server = ph.relay_server;
+                            relay_server = if ph.relay_server.is_empty() {
+                                fallback_relay_server.clone()
+                            } else {
+                                ph.relay_server
+                            };
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             let s = udp.0.take();
@@ -597,22 +630,18 @@ impl Client {
                         log::error!("Unexpected protobuf msg received: {:?}", msg_in);
                     }
                 }
-            } else if i == 1
-                && Self::fast_relay_fallback_enabled(
-                    conn_type,
-                    &fallback_relay_server,
-                    false,
-                    interface.is_force_relay(),
-                )
-            {
+            }
+        }
+        drop(socket);
+        if peer_addr.port() == 0 {
+            if relay_after_first_direct_failure {
                 log::info!(
-                    "fast relay fallback: no punch response after {} ms, requesting relay_server: {}",
-                    FAST_RELAY_FALLBACK_TIMEOUT,
+                    "direct punch attempt failed; switching to relay without retry: {}",
                     fallback_relay_server
                 );
                 let mut conn = Self::request_relay(
                     &peer,
-                    fallback_relay_server.clone(),
+                    fallback_relay_server,
                     &rendezvous_server,
                     false,
                     &key,
@@ -627,9 +656,6 @@ impl Client {
                     true,
                 ));
             }
-        }
-        drop(socket);
-        if peer_addr.port() == 0 {
             bail!("Failed to connect via rendezvous server");
         }
         let time_used = start.elapsed().as_millis() as u64;
@@ -728,12 +754,8 @@ impl Client {
                 connect_timeout = MIN;
             }
         }
-        if Self::fast_relay_fallback_enabled(
-            conn_type,
-            relay_server,
-            is_local,
-            interface.is_force_relay(),
-        ) && connect_timeout > FAST_RELAY_FALLBACK_TIMEOUT
+        if Self::relay_fallback_available(relay_server, interface.is_force_relay())
+            && connect_timeout > FAST_RELAY_FALLBACK_TIMEOUT
         {
             log::info!(
                 "fast relay fallback: cap direct timeout from {} to {} ms",
@@ -745,29 +767,37 @@ impl Client {
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
 
-        let mut connect_futures = Vec::new();
-        let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-        connect_futures.push(
-            async move {
-                let conn = fut.await?;
-                Ok((conn, None, "TCP"))
+        let force_relay = interface.is_force_relay();
+        let (mut conn, mut kcp, mut typ) = if force_relay {
+            log::info!("P2P attempt skipped for relay-only connection");
+            (Err(anyhow!("relay-only connection requested")), None, "")
+        } else {
+            let mut connect_futures = Vec::new();
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP"))
+                }
+                .boxed(),
+            );
+            if let Some(udp_socket_nat) = udp_socket_nat {
+                connect_futures
+                    .push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
             }
-            .boxed(),
-        );
-        if let Some(udp_socket_nat) = udp_socket_nat {
-            connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
-        }
-        if let Some(udp_socket_v6) = udp_socket_v6 {
-            connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
-        }
-        // Run all connection attempts concurrently, return the first successful one
-        let (mut conn, kcp, mut typ) = match select_ok(connect_futures).await {
-            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-            Err(e) => (Err(e), None, ""),
+            if let Some(udp_socket_v6) = udp_socket_v6 {
+                connect_futures
+                    .push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
+            }
+            // Run all direct connection attempts concurrently and use the first success.
+            match select_ok(connect_futures).await {
+                Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
+                Err(e) => (Err(e), None, ""),
+            }
         };
 
         let mut direct = !conn.is_err();
-        if interface.is_force_relay() || conn.is_err() {
+        if force_relay || conn.is_err() {
             if !relay_server.is_empty() {
                 conn = Self::request_relay(
                     peer_id,
@@ -796,9 +826,73 @@ impl Client {
             start.elapsed(),
             punch_type
         );
-        let res = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await;
+        let relay_after_direct_handshake_failure =
+            direct && Self::relay_fallback_available(relay_server, force_relay);
+        let secure_timeout = if relay_after_direct_handshake_failure {
+            DIRECT_SECURE_HANDSHAKE_TIMEOUT
+        } else {
+            READ_TIMEOUT
+        };
+        let res = Self::secure_connection_with_timeout(
+            peer_id,
+            signed_id_pk.clone(),
+            key,
+            &mut conn,
+            secure_timeout,
+        )
+        .await;
         let pk: Option<Vec<u8>> = match res {
             Ok(pk) => pk,
+            Err(direct_err) if relay_after_direct_handshake_failure => {
+                log::info!(
+                    "direct secure handshake failed within {} ms; switching to relay without restarting session: {}",
+                    DIRECT_SECURE_HANDSHAKE_TIMEOUT,
+                    direct_err
+                );
+                drop(conn);
+                let relay_start = Instant::now();
+                conn = match Self::request_relay(
+                    peer_id,
+                    relay_server.to_owned(),
+                    rendezvous_server,
+                    !signed_id_pk.is_empty(),
+                    key,
+                    token,
+                    conn_type,
+                )
+                .await
+                {
+                    Ok(conn) => conn,
+                    Err(relay_err) => {
+                        interface.update_direct(Some(false));
+                        bail!(
+                            "Direct secure handshake failed: {}; relay fallback failed: {}",
+                            direct_err,
+                            relay_err
+                        );
+                    }
+                };
+                let pk = match Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await
+                {
+                    Ok(pk) => pk,
+                    Err(relay_err) => {
+                        interface.update_direct(Some(false));
+                        bail!(
+                            "Direct secure handshake failed: {}; relay secure handshake failed: {}",
+                            direct_err,
+                            relay_err
+                        );
+                    }
+                };
+                log::info!(
+                    "{:?} used to establish Relay connection after direct secure handshake failure",
+                    relay_start.elapsed()
+                );
+                direct = false;
+                kcp = None;
+                typ = "Relay";
+                pk
+            }
             Err(e) => {
                 // this direct is mainly used by on_establish_connection_error, so we update it here before bail
                 interface.update_direct(Some(direct));
@@ -809,17 +903,8 @@ impl Client {
         Ok((conn, direct, pk, kcp, typ))
     }
 
-    fn fast_relay_fallback_enabled(
-        conn_type: ConnType,
-        relay_server: &str,
-        is_local: bool,
-        force_relay: bool,
-    ) -> bool {
-        conn_type == ConnType::DEFAULT_CONN
-            && !relay_server.is_empty()
-            && !is_local
-            && !force_relay
-            && Config::get_bool_option(keys::OPTION_ALLOW_FAST_RELAY_FALLBACK)
+    fn relay_fallback_available(relay_server: &str, force_relay: bool) -> bool {
+        !relay_server.is_empty() && !force_relay
     }
 
     fn fallback_relay_server(rendezvous_server: &str) -> String {
@@ -837,6 +922,16 @@ impl Client {
         signed_id_pk: Vec<u8>,
         key: &str,
         conn: &mut Stream,
+    ) -> ResultType<Option<Vec<u8>>> {
+        Self::secure_connection_with_timeout(peer_id, signed_id_pk, key, conn, READ_TIMEOUT).await
+    }
+
+    async fn secure_connection_with_timeout(
+        peer_id: &str,
+        signed_id_pk: Vec<u8>,
+        key: &str,
+        conn: &mut Stream,
+        read_timeout: u64,
     ) -> ResultType<Option<Vec<u8>>> {
         let rs_pk = get_rs_pk(if key.is_empty() {
             config::RS_PUB_KEY
@@ -866,7 +961,7 @@ impl Client {
                 return Ok(option_pk);
             }
         };
-        match timeout(READ_TIMEOUT, conn.next()).await? {
+        match timeout(read_timeout, conn.next()).await? {
             Some(res) => {
                 let bytes = res?;
                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
@@ -1622,9 +1717,15 @@ pub struct VideoHandler {
     record: bool,
     record_active: bool,
     record_status_changed: Option<(bool, Option<String>)>,
+    last_recording_filename: Option<String>,
+    record_state_rx: Option<mpsc::Receiver<RecordState>>,
     _display: usize, // useful for debug
     fail_counter: usize,
     first_frame: bool,
+}
+
+fn is_new_recording_filename(previous: &Option<String>, current: &Option<String>) -> bool {
+    current.is_some() && current != previous
 }
 
 impl VideoHandler {
@@ -1656,6 +1757,8 @@ impl VideoHandler {
             record: false,
             record_active: false,
             record_status_changed: None,
+            last_recording_filename: None,
+            record_state_rx: None,
             _display,
             fail_counter: 0,
             first_frame: true,
@@ -1713,9 +1816,17 @@ impl VideoHandler {
                     });
                     match write_result {
                         Some((Ok(()), filename)) => {
+                            let filename_changed =
+                                is_new_recording_filename(&self.last_recording_filename, &filename);
+                            if filename_changed {
+                                self.last_recording_filename = filename.clone();
+                                self.record_status_changed = Some((true, filename.clone()));
+                            }
                             if !self.record_active {
                                 self.record_active = true;
-                                self.record_status_changed = Some((true, filename));
+                                if !filename_changed {
+                                    self.record_status_changed = Some((true, filename));
+                                }
                             }
                         }
                         Some((Err(err), _)) => {
@@ -1725,6 +1836,7 @@ impl VideoHandler {
                             );
                             self.record = false;
                             self.record_active = false;
+                            self.last_recording_filename = None;
                             self.recorder = Default::default();
                             self.record_status_changed = Some((false, None));
                         }
@@ -1764,8 +1876,10 @@ impl VideoHandler {
         let was_active = self.record_active;
         self.record = false;
         self.record_active = false;
+        self.last_recording_filename = None;
         if start {
             let dir = crate::ui_interface::video_save_directory(false);
+            let (record_state_tx, record_state_rx) = mpsc::channel();
             self.recorder = match Recorder::new(RecorderContext {
                 server: false,
                 id,
@@ -1773,13 +1887,15 @@ impl VideoHandler {
                 dir: dir.clone(),
                 display_idx,
                 camera,
-                tx: None,
+                tx: Some(record_state_tx),
             }) {
                 Ok(recorder) => {
                     self.record = true;
+                    self.record_state_rx = Some(record_state_rx);
                     Arc::new(Mutex::new(Some(recorder)))
                 }
                 Err(err) => {
+                    self.record_state_rx = None;
                     log::error!("Failed to initialize screen recorder in '{}': {err:#}", dir);
                     self.record_status_changed = Some((false, None));
                     Default::default()
@@ -1795,6 +1911,18 @@ impl VideoHandler {
 
     pub fn take_record_status_changed(&mut self) -> Option<(bool, Option<String>)> {
         self.record_status_changed.take()
+    }
+
+    pub fn take_removed_recording_files(&mut self) -> Vec<String> {
+        let mut removed = Vec::new();
+        if let Some(receiver) = self.record_state_rx.as_ref() {
+            while let Ok(state) = receiver.try_recv() {
+                if let RecordState::RemoveFile(path) = state {
+                    removed.push(path);
+                }
+            }
+        }
+        removed
     }
 }
 
@@ -1852,6 +1980,142 @@ struct ConnToken {
     session_id: u64,
 }
 
+fn attach_audit_context(
+    login_request: &mut LoginRequest,
+    source_connection_id: &str,
+    connection_ticket: &str,
+) {
+    if source_connection_id.is_empty() || connection_ticket.is_empty() {
+        return;
+    }
+    login_request.audit_context = MessageField::some(AuditContext {
+        protocol_version: 1,
+        source_connection_id: source_connection_id.to_owned(),
+        connection_ticket: connection_ticket.to_owned(),
+        ..Default::default()
+    });
+}
+
+fn enterprise_connection_type(conn_type: ConnType) -> &'static str {
+    match conn_type {
+        ConnType::FILE_TRANSFER => "FILE_TRANSFER",
+        ConnType::PORT_FORWARD | ConnType::RDP => "PORT_FORWARD",
+        ConnType::VIEW_CAMERA => "VIEW_CAMERA",
+        ConnType::TERMINAL => "TERMINAL",
+        _ => "REMOTE",
+    }
+}
+
+fn requires_verified_enterprise_audit(conn_type: ConnType, access_token: &str) -> bool {
+    matches!(conn_type, ConnType::DEFAULT_CONN | ConnType::FILE_TRANSFER)
+        && !access_token.trim().is_empty()
+}
+
+#[cfg(test)]
+mod enterprise_audit_context_tests {
+    use super::*;
+
+    #[test]
+    fn attaches_only_the_short_lived_ticket_to_login_request() {
+        let mut login_request = LoginRequest::new();
+        attach_audit_context(&mut login_request, "source-uuid", "opaque-ticket");
+
+        let context = login_request.audit_context.as_ref().unwrap();
+        assert_eq!(context.protocol_version, 1);
+        assert_eq!(context.source_connection_id, "source-uuid");
+        assert_eq!(context.connection_ticket, "opaque-ticket");
+    }
+
+    #[test]
+    fn skips_incomplete_audit_context() {
+        let mut login_request = LoginRequest::new();
+        attach_audit_context(&mut login_request, "source-uuid", "");
+        assert!(login_request.audit_context.is_none());
+    }
+
+    #[test]
+    fn controller_and_host_use_the_same_connection_type_names() {
+        assert_eq!(enterprise_connection_type(ConnType::DEFAULT_CONN), "REMOTE");
+        assert_eq!(
+            enterprise_connection_type(ConnType::FILE_TRANSFER),
+            "FILE_TRANSFER"
+        );
+        assert_eq!(enterprise_connection_type(ConnType::RDP), "PORT_FORWARD");
+        assert_eq!(
+            enterprise_connection_type(ConnType::VIEW_CAMERA),
+            "VIEW_CAMERA"
+        );
+        assert_eq!(enterprise_connection_type(ConnType::TERMINAL), "TERMINAL");
+    }
+
+    #[test]
+    fn signed_in_remote_and_file_transfer_are_fail_closed_without_audit_ticket() {
+        assert!(requires_verified_enterprise_audit(
+            ConnType::FILE_TRANSFER,
+            "access-token"
+        ));
+        assert!(!requires_verified_enterprise_audit(
+            ConnType::FILE_TRANSFER,
+            "  "
+        ));
+        assert!(requires_verified_enterprise_audit(
+            ConnType::DEFAULT_CONN,
+            "access-token"
+        ));
+        assert!(!requires_verified_enterprise_audit(
+            ConnType::VIEW_CAMERA,
+            "access-token"
+        ));
+    }
+
+    #[test]
+    fn recording_files_keep_the_connection_round_that_created_them() {
+        let mut lc = LoginConfigHandler::default();
+        lc.audit_source_connection_id = "45bc3c20-4bc4-4ea5-945d-3b62c061d04b".to_owned();
+        lc.audit_connection_ticket = "round-one-ticket".to_owned();
+        lc.track_recording_file("round-one.webm".to_owned());
+        let round_one_source = lc.audit_source_connection_id.clone();
+        let round_one_ticket = lc.audit_connection_ticket.clone();
+
+        lc.rotate_enterprise_audit_context();
+        lc.audit_connection_ticket = "round-two-ticket".to_owned();
+        lc.track_recording_file_for_context(
+            "round-one-delayed.webm".to_owned(),
+            round_one_source,
+            round_one_ticket,
+        );
+        lc.track_recording_file("round-two.webm".to_owned());
+
+        assert_eq!(lc.recording_files.len(), 3);
+        assert_eq!(
+            lc.recording_files[0].source_connection_id,
+            "45bc3c20-4bc4-4ea5-945d-3b62c061d04b"
+        );
+        assert_eq!(lc.recording_files[0].connection_ticket, "round-one-ticket");
+        assert_eq!(
+            lc.recording_files[1].source_connection_id,
+            "45bc3c20-4bc4-4ea5-945d-3b62c061d04b"
+        );
+        assert_eq!(lc.recording_files[1].connection_ticket, "round-one-ticket");
+        assert_ne!(
+            lc.recording_files[0].source_connection_id,
+            lc.recording_files[2].source_connection_id
+        );
+        assert_eq!(lc.recording_files[2].connection_ticket, "round-two-ticket");
+    }
+
+    #[test]
+    fn recording_segment_filename_changes_are_emitted_while_recording_stays_active() {
+        let first = Some("segment-one.webm".to_owned());
+        let second = Some("segment-two.webm".to_owned());
+
+        assert!(is_new_recording_filename(&None, &first));
+        assert!(!is_new_recording_filename(&first, &first));
+        assert!(is_new_recording_filename(&first, &second));
+        assert!(!is_new_recording_filename(&second, &None));
+    }
+}
+
 /// Login config handler for [`Client`].
 #[derive(Default)]
 pub struct LoginConfigHandler {
@@ -1887,7 +2151,9 @@ pub struct LoginConfigHandler {
     pub record_state: bool,
     pub record_active: bool,
     pub record_permission: bool,
-    pub recording_files: Vec<String>,
+    pub recording_files: Vec<crate::recording_note::RecordingUploadFile>,
+    audit_source_connection_id: String,
+    audit_connection_ticket: String,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1977,13 +2243,19 @@ impl LoginConfigHandler {
             }
         }
         self.session_id = sid;
+        self.audit_source_connection_id = Uuid::new_v4().to_string();
+        self.audit_connection_ticket.clear();
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
-        self.force_relay =
-            config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
-                || force_relay
-                || use_ws()
-                || Config::is_proxy();
+        // Routing policy:
+        // - installed clients try P2P first and fall back to relay;
+        // - callers explicitly mark certificate-number MDeskMini sessions as relay-only;
+        // - `/r`, relay retries, WebSocket and proxy connections remain explicit relay paths.
+        //
+        // Ignore the legacy per-peer `force-always-relay` value here. Older builds
+        // persisted one-shot relay fallbacks into that option, which made later
+        // installed-client sessions skip P2P indefinitely.
+        self.force_relay = force_relay || use_ws() || Config::is_proxy();
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
@@ -2697,11 +2969,8 @@ impl LoginConfigHandler {
                     .insert("other-server-key".to_owned(), c.clone());
             }
         }
-        if self.force_relay {
-            config
-                .options
-                .insert("force-always-relay".to_owned(), "Y".to_owned());
-        }
+        // `self.force_relay` covers relay-only Mini sessions, one-shot fallbacks and `/r`.
+        // None of these are persistent peer preferences under the routing policy above.
         #[cfg(feature = "flutter")]
         {
             // sync connected password to personal ab automatically if it is not shared password
@@ -2829,6 +3098,9 @@ impl LoginConfigHandler {
             session_id: self.session_id,
             version: crate::VERSION.to_string(),
             client_local_ip: crate::common::client_local_ip_for_login_request(),
+            // The current collision-free finalization contract relies on
+            // Windows rename semantics. Advertise only where it is enforced.
+            supports_direct_file_receive: cfg!(target_os = "windows"),
             os_login: Some(OSLogin {
                 username: os_username,
                 password: os_password,
@@ -2838,6 +3110,11 @@ impl LoginConfigHandler {
             hwid,
             ..Default::default()
         };
+        attach_audit_context(
+            &mut lr,
+            &self.audit_source_connection_id,
+            &self.audit_connection_ticket,
+        );
         match self.conn_type {
             ConnType::FILE_TRANSFER => lr.set_file_transfer(FileTransfer {
                 dir: self.get_remote_dir(),
@@ -2904,6 +3181,48 @@ impl LoginConfigHandler {
         &self.id
     }
 
+    pub fn enterprise_audit_context(&self) -> (String, String) {
+        (
+            self.audit_source_connection_id.clone(),
+            self.audit_connection_ticket.clone(),
+        )
+    }
+
+    pub fn track_recording_file(&mut self, path: String) {
+        self.track_recording_file_for_context(
+            path,
+            self.audit_source_connection_id.clone(),
+            self.audit_connection_ticket.clone(),
+        );
+    }
+
+    pub fn track_recording_file_for_context(
+        &mut self,
+        path: String,
+        source_connection_id: String,
+        connection_ticket: String,
+    ) {
+        if self.recording_files.iter().any(|file| file.path == path) {
+            return;
+        }
+        self.recording_files
+            .push(crate::recording_note::RecordingUploadFile {
+                path,
+                source_connection_id,
+                connection_ticket,
+            });
+    }
+
+    pub fn untrack_recording_file_for_context(&mut self, path: &str, source_connection_id: &str) {
+        self.recording_files
+            .retain(|file| file.path != path || file.source_connection_id != source_connection_id);
+    }
+
+    pub fn rotate_enterprise_audit_context(&mut self) {
+        self.audit_source_connection_id = Uuid::new_v4().to_string();
+        self.audit_connection_ticket.clear();
+    }
+
     pub fn get_key_terminal_service_id(&self) -> &'static str {
         if self.is_terminal_admin {
             "terminal-admin-service-id"
@@ -2921,6 +3240,7 @@ pub enum MediaData {
     AudioFormat(AudioFormat),
     Reset,
     RecordScreen(bool),
+    FinalizeRecording(std::sync::mpsc::Sender<()>),
 }
 
 pub type MediaSender = mpsc::Sender<MediaData>;
@@ -2933,6 +3253,8 @@ pub type MediaSender = mpsc::Sender<MediaData>;
 pub fn start_video_thread<F, T>(
     session: Session<T>,
     display: usize,
+    recording_source_connection_id: String,
+    recording_connection_ticket: String,
     video_receiver: mpsc::Receiver<MediaData>,
     video_queue: Arc<RwLock<ArrayQueue<VideoFrame>>>,
     fps: Arc<RwLock<Option<usize>>>,
@@ -3047,8 +3369,30 @@ pub fn start_video_thread<F, T>(
                                 }
                                 _ => {}
                             }
+                            for path in handler.take_removed_recording_files() {
+                                session
+                                    .lc
+                                    .write()
+                                    .unwrap()
+                                    .untrack_recording_file_for_context(
+                                        &path,
+                                        &recording_source_connection_id,
+                                    );
+                            }
                             if let Some((active, filename)) = handler.take_record_status_changed() {
-                                session.send(Data::RecordStatus((display, active, filename)));
+                                if let Some(path) = filename.as_ref() {
+                                    session.register_recording_file(
+                                        path.clone(),
+                                        recording_source_connection_id.clone(),
+                                        recording_connection_ticket.clone(),
+                                    );
+                                }
+                                session.send(Data::RecordStatus((
+                                    display,
+                                    active,
+                                    filename,
+                                    recording_source_connection_id.clone(),
+                                )));
                             }
                         }
 
@@ -3085,10 +3429,67 @@ pub fn start_video_thread<F, T>(
                         };
                         if let Some(handler) = video_handler.as_mut() {
                             handler.record_screen(start, id, device_name, display, is_view_camera);
+                            for path in handler.take_removed_recording_files() {
+                                session
+                                    .lc
+                                    .write()
+                                    .unwrap()
+                                    .untrack_recording_file_for_context(
+                                        &path,
+                                        &recording_source_connection_id,
+                                    );
+                            }
                             if let Some((active, filename)) = handler.take_record_status_changed() {
-                                session.send(Data::RecordStatus((display, active, filename)));
+                                if let Some(path) = filename.as_ref() {
+                                    session.register_recording_file(
+                                        path.clone(),
+                                        recording_source_connection_id.clone(),
+                                        recording_connection_ticket.clone(),
+                                    );
+                                }
+                                session.send(Data::RecordStatus((
+                                    display,
+                                    active,
+                                    filename,
+                                    recording_source_connection_id.clone(),
+                                )));
                             }
                         }
+                    }
+                    MediaData::FinalizeRecording(completion) => {
+                        if let Some(handler) = video_handler.as_mut() {
+                            let (id, device_name) = {
+                                let lc = session.lc.read().unwrap();
+                                (lc.id.clone(), lc.recording_device_name())
+                            };
+                            handler.record_screen(false, id, device_name, display, is_view_camera);
+                            for path in handler.take_removed_recording_files() {
+                                session
+                                    .lc
+                                    .write()
+                                    .unwrap()
+                                    .untrack_recording_file_for_context(
+                                        &path,
+                                        &recording_source_connection_id,
+                                    );
+                            }
+                            if let Some((active, filename)) = handler.take_record_status_changed() {
+                                if let Some(path) = filename.as_ref() {
+                                    session.register_recording_file(
+                                        path.clone(),
+                                        recording_source_connection_id.clone(),
+                                        recording_connection_ticket.clone(),
+                                    );
+                                }
+                                session.send(Data::RecordStatus((
+                                    display,
+                                    active,
+                                    filename,
+                                    recording_source_connection_id.clone(),
+                                )));
+                            }
+                        }
+                        completion.send(()).ok();
                     }
                     _ => {}
                 }
@@ -3612,6 +4013,18 @@ pub async fn handle_hash(
 
     lc.write().unwrap().password = password.clone();
 
+    if hash.approve_mode == "click" {
+        // Click-only mode authenticates exclusively through an explicit action
+        // on the controlled host. Submit no credential and let the server put
+        // this connection into its pending-approval state.
+        if let Err(err) =
+            send_login(lc.clone(), String::new(), String::new(), Vec::new(), peer).await
+        {
+            interface.msgbox("error", "Connection Error", &err.to_string(), "");
+        }
+        return;
+    }
+
     let is_terminal_admin = lc.read().unwrap().is_terminal_admin;
     let is_terminal = lc.read().unwrap().conn_type.eq(&ConnType::TERMINAL);
     if is_terminal && is_terminal_admin {
@@ -3642,7 +4055,14 @@ pub async fn handle_hash(
             lc.read().unwrap().get_option("os-username"),
             lc.read().unwrap().get_option("os-password"),
         );
-        send_login(lc.clone(), os_username, os_password, password, peer).await;
+        if let Err(err) = send_login(lc.clone(), os_username, os_password, password, peer).await {
+            interface.msgbox(
+                "error",
+                "File Transfer Audit Required",
+                &err.to_string(),
+                "",
+            );
+        }
         return;
     }
 
@@ -3692,12 +4112,77 @@ async fn send_login(
     os_password: String,
     password: Vec<u8>,
     peer: &mut Stream,
-) {
+) -> ResultType<()> {
+    prepare_connection_intent(lc.clone()).await?;
     let msg_out = lc
         .read()
         .unwrap()
         .create_login_msg(os_username, os_password, password);
-    allow_err!(peer.send(&msg_out).await);
+    peer.send(&msg_out).await?;
+    Ok(())
+}
+
+async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> ResultType<()> {
+    let (target_rid, source_connection_id, connection_type, already_issued, require_verified) = {
+        let lc = lc.read().unwrap();
+        (
+            lc.other_server
+                .as_ref()
+                .map(|(peer_id, _, _)| peer_id.clone())
+                .unwrap_or_else(|| lc.id.clone()),
+            lc.audit_source_connection_id.clone(),
+            enterprise_connection_type(lc.conn_type).to_owned(),
+            !lc.audit_connection_ticket.is_empty(),
+            requires_verified_enterprise_audit(
+                lc.conn_type,
+                &LocalConfig::get_option("access_token"),
+            ),
+        )
+    };
+    if already_issued || source_connection_id.is_empty() {
+        return Ok(());
+    }
+
+    match crate::hbbs_http::connection_intent::issue_connection_intent(
+        &target_rid,
+        &source_connection_id,
+        &connection_type,
+    )
+    .await
+    {
+        Ok(Some(intent)) => {
+            let mut lc = lc.write().unwrap();
+            if lc.audit_source_connection_id == intent.source_connection_id
+                && lc.audit_connection_ticket.is_empty()
+            {
+                lc.audit_connection_ticket = intent.ticket;
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            if require_verified {
+                bail!(
+                    "로그인 사용자의 {connection_type} 감사 이력을 확인할 수 없어 연결을 시작하지 않았습니다. API 서버 연결을 확인한 뒤 다시 시도하세요."
+                );
+            }
+            log::debug!(
+                "Connection intent skipped: controller is not signed in or API is unavailable"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            if require_verified {
+                bail!(
+                    "{connection_type} 감사 티켓을 발급하지 못했습니다. API 서버 연결을 확인한 뒤 다시 시도하세요: {err}"
+                );
+            }
+            // Ordinary unsigned and non-audited special sessions remain
+            // available. Signed-in REMOTE/FILE_TRANSFER sessions fail closed
+            // above so enterprise activity cannot silently bypass auditing.
+            log::warn!("Failed to issue connection intent: {err}");
+            Ok(())
+        }
+    }
 }
 
 /// Handle login request made from ui.
@@ -3717,7 +4202,7 @@ pub async fn handle_login_from_ui(
     password: String,
     remember: bool,
     peer: &mut Stream,
-) {
+) -> ResultType<()> {
     lc.write().unwrap().remember = remember;
     let mut hash_password = if password.is_empty() {
         if remember {
@@ -3746,7 +4231,7 @@ pub async fn handle_login_from_ui(
     hasher2.update(&lc.read().unwrap().hash.challenge);
     hash_password = hasher2.finalize()[..].to_vec();
 
-    send_login(lc.clone(), os_username, os_password, hash_password, peer).await;
+    send_login(lc.clone(), os_username, os_password, hash_password, peer).await
 }
 
 async fn send_switch_login_request(
@@ -3754,6 +4239,10 @@ async fn send_switch_login_request(
     peer: &mut Stream,
     uuid: Uuid,
 ) {
+    if let Err(err) = prepare_connection_intent(lc.clone()).await {
+        log::error!("Failed to prepare switch-side connection intent: {err}");
+        return;
+    }
     let mut msg_out = Message::new();
     msg_out.set_switch_sides_response(SwitchSidesResponse {
         uuid: Bytes::from(uuid.as_bytes().to_vec()),
@@ -3868,7 +4357,8 @@ pub enum Data {
     AddJob((i32, JobType, String, String, i32, bool, bool)),
     ResumeJob((i32, bool)),
     RecordScreen(bool),
-    RecordStatus((usize, bool, Option<String>)),
+    FinalizeRecording((u32, String, std::sync::mpsc::Sender<Result<(), String>>)),
+    RecordStatus((usize, bool, Option<String>, String)),
     ElevateDirect,
     ElevateWithLogon(String, String),
     NewVoiceCall,

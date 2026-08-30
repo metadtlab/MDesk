@@ -130,6 +130,29 @@ pub struct SimpleCallOnReturn {
     pub f: Box<dyn Fn() + Send + 'static>,
 }
 
+pub const MDESKMINI_PROCESS_MARKER_ENV: &str = "MDESKMINI_PORTABLE_PROCESS";
+pub const MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV: &str = "MDESKMINI_FIREWALL_BOOTSTRAPPED";
+
+pub fn mark_mdeskmini_process_tree() {
+    std::env::set_var(MDESKMINI_PROCESS_MARKER_ENV, "1");
+}
+
+pub fn is_mdeskmini_process() -> bool {
+    std::env::var_os(MDESKMINI_PROCESS_MARKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+pub fn should_run_startup_firewall_bootstrap() -> bool {
+    !is_mdeskmini_process()
+        || std::env::var_os(MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+}
+
+pub fn mark_startup_firewall_bootstrapped() {
+    if is_mdeskmini_process() {
+        std::env::set_var(MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV, "1");
+    }
+}
+
 impl Drop for SimpleCallOnReturn {
     fn drop(&mut self) {
         if self.b {
@@ -153,8 +176,11 @@ pub fn global_init() -> bool {
             clear_permanent_password_on_start();
         }
         // 관리자 권한이 있을 때만 방화벽 규칙 자동 추가
-        if crate::platform::windows::is_elevated(None).unwrap_or(false) {
+        if should_run_startup_firewall_bootstrap()
+            && crate::platform::windows::is_elevated(None).unwrap_or(false)
+        {
             crate::platform::windows::try_add_firewall_rule_on_first_run();
+            mark_startup_firewall_bootstrapped();
         }
     }
 
@@ -1208,6 +1234,52 @@ pub async fn post_request(url: String, body: String, header: &str) -> ResultType
     )
     .await?;
     Ok(response.text().await?)
+}
+
+/// Sends a security-sensitive POST request and rejects non-2xx responses.
+///
+/// The legacy helper above intentionally returns response bodies regardless of
+/// status because several compatibility endpoints inspect error payloads. Audit
+/// ingestion must not treat a 401/403/5xx body as a successful delivery.
+pub async fn post_request_checked(url: String, body: String, header: &str) -> ResultType<String> {
+    validate_secure_capability_url(&url)?;
+    // Intent/ticket traffic carries authentication capabilities. Never reuse
+    // the legacy invalid-certificate retry/cache for this path.
+    let client = crate::hbbs_http::create_secure_http_client_async()
+        .map_err(|err| anyhow!("Failed to prepare secure capability HTTP client: {err}"))?;
+    let mut request = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .timeout(std::time::Duration::from_secs(12));
+    if let Some((name, value)) = header.split_once(": ") {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {} from audit endpoint: {}", status, response_body);
+    }
+    Ok(response_body)
+}
+
+/// Capability-bearing requests may use plain HTTP only for direct loopback
+/// development without a configured proxy. Production endpoints must use TLS.
+pub fn validate_secure_capability_url(value: &str) -> ResultType<()> {
+    let parsed =
+        url::Url::parse(value.trim()).map_err(|_| anyhow!("Capability endpoint URL is invalid"))?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let local = matches!(
+        parsed.host_str().unwrap_or_default(),
+        "localhost" | "127.0.0.1" | "::1"
+    );
+    if parsed.scheme() == "http" && local && Config::get_socks().is_none() {
+        return Ok(());
+    }
+    bail!("Capability endpoint must use HTTPS (plain loopback is allowed only without a proxy)")
 }
 
 #[async_recursion]

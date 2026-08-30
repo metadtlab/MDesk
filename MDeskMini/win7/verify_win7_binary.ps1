@@ -1,6 +1,9 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Path
+    [string]$Path,
+
+    [ValidateSet('x86', 'x64')]
+    [string]$Architecture = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,11 +38,17 @@ $subsystemMajor = [BitConverter]::ToUInt16($bytes, $optionalHeader + 48)
 $subsystemMinor = [BitConverter]::ToUInt16($bytes, $optionalHeader + 50)
 $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
 
-if ($machine -ne 0x8664) {
-    throw ('Expected an AMD64 executable, but PE machine is 0x{0:X4}.' -f $machine)
+$expectedMachine = if ($Architecture -eq 'x86') { 0x014C } else { 0x8664 }
+$expectedMagic = if ($Architecture -eq 'x86') { 0x010B } else { 0x020B }
+$peKind = if ($Architecture -eq 'x86') { 'I386 PE32' } else { 'AMD64 PE32+' }
+$thunkSize = if ($Architecture -eq 'x86') { 4 } else { 8 }
+$importDirectoryOffset = if ($Architecture -eq 'x86') { 104 } else { 120 }
+
+if ($machine -ne $expectedMachine) {
+    throw ('Expected {0}, but PE machine is 0x{1:X4}.' -f $peKind, $machine)
 }
-if ($optionalMagic -ne 0x020B) {
-    throw ('Expected a PE32+ executable, but optional header is 0x{0:X4}.' -f $optionalMagic)
+if ($optionalMagic -ne $expectedMagic) {
+    throw ('Expected {0}, but optional header is 0x{1:X4}.' -f $peKind, $optionalMagic)
 }
 if ($osMajor -ne 6 -or $osMinor -ne 1) {
     throw "Expected minimum OS version 6.1, but found $osMajor.$osMinor."
@@ -99,8 +108,9 @@ for ($index = 0; $index -lt $sectionCount; $index++) {
 }
 $script:sections = $sections
 
-# PE32+ data directory entry 1 is the normal import directory.
-$importRva = [BitConverter]::ToUInt32($bytes, $optionalHeader + 120)
+# Data directory entry 1 is the normal import directory. Its offset differs
+# between PE32 (x86) and PE32+ (x64).
+$importRva = [BitConverter]::ToUInt32($bytes, $optionalHeader + $importDirectoryOffset)
 $importedDlls = @()
 $importedSymbols = @()
 if ($importRva -ne 0) {
@@ -127,18 +137,27 @@ if ($importRva -ne 0) {
         $thunkOffset = Convert-RvaToFileOffset $thunkRva
 
         for ($thunkIndex = 0; $thunkIndex -lt 65536; $thunkIndex++) {
-            $entryOffset = $thunkOffset + ($thunkIndex * 8)
-            if (($entryOffset + 8) -gt $bytes.Length) {
+            $entryOffset = $thunkOffset + ($thunkIndex * $thunkSize)
+            if (($entryOffset + $thunkSize) -gt $bytes.Length) {
                 throw "The PE import thunk table is truncated."
             }
 
-            $entry = [BitConverter]::ToUInt64($bytes, [int]$entryOffset)
+            $entry = if ($thunkSize -eq 8) {
+                [BitConverter]::ToUInt64($bytes, [int]$entryOffset)
+            } else {
+                [UInt64][BitConverter]::ToUInt32($bytes, [int]$entryOffset)
+            }
             if ($entry -eq 0) {
                 break
             }
 
-            # Bit 63 marks an import by ordinal rather than by name.
-            if (($entry -shr 63) -eq 0) {
+            # The high bit marks an import by ordinal rather than by name.
+            $isOrdinal = if ($thunkSize -eq 8) {
+                ($entry -shr 63) -ne 0
+            } else {
+                ($entry -shr 31) -ne 0
+            }
+            if (-not $isOrdinal) {
                 $symbolRva = [UInt32]$entry
                 $symbolOffset = (Convert-RvaToFileOffset $symbolRva) + 2
                 $importedSymbols += Read-AsciiZeroTerminated $symbolOffset
@@ -150,6 +169,7 @@ if ($importRva -ne 0) {
 $forbiddenDlls = @(
     'combase.dll',
     'api-ms-win-core-synch-l1-2-0.dll',
+    'shcore.dll',
     'vcruntime140.dll',
     'msvcp140.dll',
     'ucrtbase.dll'
@@ -161,7 +181,9 @@ $forbiddenSymbols = @(
     'ProcessPrng',
     'GetSystemTimePreciseAsFileTime',
     'SetThreadDescription',
-    'GetDpiForWindow'
+    'GetDpiForWindow',
+    'SetProcessDpiAwareness',
+    'SetProcessDpiAwarenessContext'
 )
 
 foreach ($name in $forbiddenDlls) {
@@ -177,6 +199,6 @@ foreach ($name in $forbiddenSymbols) {
 
 $file = Get-Item -LiteralPath $resolvedPath
 $hash = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
-Write-Host ('[OK] AMD64 PE32+, Windows GUI 6.1, {0:N0} bytes' -f $file.Length)
+Write-Host ('[OK] {0}, Windows GUI 6.1, {1:N0} bytes' -f $peKind, $file.Length)
 Write-Host ('[OK] {0} imported DLLs; no known Windows 8/10-only loader imports found.' -f $importedDlls.Count)
 Write-Host "SHA256: $hash"

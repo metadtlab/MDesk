@@ -782,6 +782,29 @@ impl InvokeUiSession for FlutterHandler {
         );
     }
 
+    fn direct_file_transfer_started(
+        &self,
+        id: i32,
+        root_name: &str,
+        file_count: usize,
+        total_size: u64,
+    ) {
+        let id = id.to_string();
+        let root_name = root_name.to_owned();
+        let file_count = file_count.to_string();
+        let total_size = total_size.to_string();
+        self.push_event(
+            "direct_file_transfer_started",
+            &[
+                ("id", &id),
+                ("root_name", &root_name),
+                ("file_count", &file_count),
+                ("total_size", &total_size),
+            ],
+            &[],
+        );
+    }
+
     // unused in flutter
     fn clear_all_jobs(&self) {}
 

@@ -22,6 +22,7 @@ use crossbeam_queue::ArrayQueue;
 use hbb_common::tokio::sync::mpsc::error::TryRecvError;
 use hbb_common::{
     allow_err,
+    anyhow::anyhow,
     config::{self, LocalConfig, PeerConfig, TransferSerde},
     fs::{
         self, can_enable_overwrite_detection, get_job, get_string, new_send_confirm,
@@ -63,9 +64,11 @@ pub struct Remote<T: InvokeUiSession> {
     voice_call_request_timestamp: Option<NonZeroI64>,
     read_jobs: Vec<fs::TransferJob>,
     write_jobs: Vec<fs::TransferJob>,
+    direct_download_jobs: HashMap<i32, DirectDownloadJob>,
+    direct_download_session_accepted_bytes: u64,
     remove_jobs: HashMap<i32, RemoveJob>,
     timer: crate::RustDeskInterval,
-    last_update_jobs_status: (Instant, HashMap<i32, u64>),
+    job_status_samples: HashMap<(bool, i32), JobStatusSample>,
     is_connected: bool,
     first_frame: bool,
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -78,7 +81,53 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     active_recording_displays: HashSet<usize>,
+    recording_source_connection_id: String,
+    recording_connection_ticket: String,
+    connection_round: u32,
     sent_close_reason: bool,
+}
+
+struct JobStatusSample {
+    updated_at: Instant,
+    finished_size: u64,
+}
+
+struct DirectDownloadJob {
+    destination: PathBuf,
+    is_directory: bool,
+    total_size: u64,
+}
+
+const DIRECT_DOWNLOAD_MAX_CONCURRENT: usize = 4;
+
+#[cfg(target_os = "windows")]
+fn open_direct_download_folder(destination: &std::path::Path) {
+    let Some(folder) = destination.parent().map(std::path::Path::to_path_buf) else {
+        log::warn!(
+            "Direct transfer destination has no Downloads parent: {}",
+            destination.display()
+        );
+        return;
+    };
+    if !folder.is_dir() {
+        log::warn!(
+            "Direct transfer Downloads folder does not exist: {}",
+            folder.display()
+        );
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Err(err) = std::process::Command::new("explorer.exe")
+            .arg(&folder)
+            .spawn()
+        {
+            log::error!(
+                "Failed to open direct transfer Downloads folder {}: {}",
+                folder.display(),
+                err
+            );
+        }
+    });
 }
 
 #[derive(Default)]
@@ -111,9 +160,11 @@ impl<T: InvokeUiSession> Remote<T> {
             sender,
             read_jobs: Vec::new(),
             write_jobs: Vec::new(),
+            direct_download_jobs: HashMap::new(),
+            direct_download_session_accepted_bytes: 0,
             remove_jobs: Default::default(),
             timer: crate::rustdesk_interval(time::interval(SEC30)),
-            last_update_jobs_status: (Instant::now(), Default::default()),
+            job_status_samples: Default::default(),
             is_connected: false,
             first_frame: false,
             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -128,11 +179,15 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             active_recording_displays: Default::default(),
+            recording_source_connection_id: String::new(),
+            recording_connection_ticket: String::new(),
+            connection_round: 0,
             sent_close_reason: false,
         }
     }
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
+        self.connection_round = round;
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -337,13 +392,36 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler.on_establish_connection_error(err.to_string());
             }
         }
+        let direct_job_ids = self
+            .direct_download_jobs
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in direct_job_ids {
+            if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
+                job.remove_download_file();
+            }
+            self.release_direct_download_job(id);
+        }
+
+        // Recorder flush can take several seconds on a slow disk. Do it
+        // outside the reconnect-state mutex so a new round and the UI remain
+        // responsive, then commit the result only if this round is current.
+        let finalize_result = self.finalize_recorders(true);
+        if let Err(err) = &finalize_result {
+            log::warn!("Failed to finalize session recordings during disconnect: {err}");
+        }
+        let connection_round_state = self.handler.connection_round_state.clone();
+        let mut round_state = connection_round_state.lock().unwrap();
+        let update_shared_recording_state = !round_state.is_round_gt(round);
+        if update_shared_recording_state {
+            let mut lc = self.handler.lc.write().unwrap();
+            lc.record_state = false;
+            lc.record_active = false;
+        }
         // set_disconnected_ok is used to check if new connection round is started.
-        let _set_disconnected_ok = self
-            .handler
-            .connection_round_state
-            .lock()
-            .unwrap()
-            .set_disconnected(round);
+        let _set_disconnected_ok = round_state.set_disconnected(round);
+        drop(round_state);
 
         #[cfg(not(target_os = "ios"))]
         if self.handler.is_default() && _set_disconnected_ok {
@@ -372,6 +450,16 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.msgbox(&r#type, &title, &text, "");
                 }
                 _ => {
+                    let mut clip = clip;
+                    #[cfg(target_os = "windows")]
+                    if let clipboard::ClipboardFile::Files {
+                        source_application, ..
+                    } = &mut clip
+                    {
+                        *source_application =
+                            crate::clipboard_audit::current_clipboard_source_application()
+                                .to_proto() as i32;
+                    }
                     let is_stopping_allowed = clip.is_stopping_allowed();
                     let server_file_transfer_enabled =
                         *self.handler.server_file_transfer_enabled.read().unwrap();
@@ -924,38 +1012,79 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
             }
             Data::RecordScreen(start) => {
+                if start {
+                    self.handler
+                        .connection_round_state
+                        .lock()
+                        .unwrap()
+                        .invalidate_recording_source_finalize(&self.recording_source_connection_id);
+                }
                 self.handler.lc.write().unwrap().record_state = start;
                 self.update_record_state();
             }
-            Data::RecordStatus((display, active, filename)) => {
-                if active {
-                    self.active_recording_displays.insert(display);
+            Data::FinalizeRecording((
+                expected_round,
+                expected_source_connection_id,
+                completion,
+            )) => {
+                if expected_round != self.connection_round
+                    || expected_source_connection_id != self.recording_source_connection_id
+                    || expected_source_connection_id.is_empty()
+                {
+                    completion
+                        .send(Err(
+                            "녹화 마감 요청이 현재 연결 세대와 일치하지 않습니다.".to_owned()
+                        ))
+                        .ok();
                 } else {
-                    self.active_recording_displays.remove(&display);
-                }
-                let active = !self.active_recording_displays.is_empty();
-                log::info!(
-                    "recording status: display={display}, active={active}, active_displays={:?}",
-                    self.active_recording_displays
-                );
-                let changed = {
-                    let mut lc = self.handler.lc.write().unwrap();
-                    if let Some(filename) = filename {
-                        if !lc.recording_files.contains(&filename) {
-                            lc.recording_files.push(filename);
-                        }
+                    // While connected, a timeout remains a hard failure for
+                    // this attempt. A user can retry and issue a new scoped
+                    // finalize request; a stale late ack must not bless a
+                    // recording that was resumed in the meantime.
+                    let result = self.finalize_recorders(false);
+                    let connection_round_state = self.handler.connection_round_state.clone();
+                    let round_state = connection_round_state.lock().unwrap();
+                    if !round_state.is_round_gt(self.connection_round) {
+                        let mut lc = self.handler.lc.write().unwrap();
+                        lc.record_state = false;
+                        lc.record_active = false;
                     }
-                    let changed = lc.record_active != active;
-                    lc.record_active = active;
-                    changed
-                };
-                if changed {
-                    self.handler.update_record_status(active);
-                    let mut misc = Misc::new();
-                    misc.set_client_record_status(active);
-                    let mut msg = Message::new();
-                    msg.set_misc(misc);
-                    self.sender.send(Data::Message(msg)).ok();
+                    drop(round_state);
+                    completion.send(result).ok();
+                }
+            }
+            Data::RecordStatus((display, active, _filename, source_connection_id)) => {
+                let current_source_connection_id =
+                    self.handler.lc.read().unwrap().enterprise_audit_context().0;
+                if source_connection_id == current_source_connection_id {
+                    if active {
+                        self.active_recording_displays.insert(display);
+                    } else {
+                        self.active_recording_displays.remove(&display);
+                    }
+                    let active = !self.active_recording_displays.is_empty();
+                    log::info!(
+                        "recording status: display={display}, active={active}, active_displays={:?}",
+                        self.active_recording_displays
+                    );
+                    let changed = {
+                        let mut lc = self.handler.lc.write().unwrap();
+                        let changed = lc.record_active != active;
+                        lc.record_active = active;
+                        changed
+                    };
+                    if changed {
+                        self.handler.update_record_status(active);
+                        let mut misc = Misc::new();
+                        misc.set_client_record_status(active);
+                        let mut msg = Message::new();
+                        msg.set_misc(misc);
+                        self.sender.send(Data::Message(msg)).ok();
+                    }
+                } else {
+                    log::debug!(
+                        "Ignoring recording status from previous connection round: source={source_connection_id}"
+                    );
                 }
             }
             Data::ElevateDirect => {
@@ -1028,47 +1157,233 @@ impl<T: InvokeUiSession> Remote<T> {
     #[inline]
     fn update_job_status(
         job: &fs::TransferJob,
-        elapsed: i32,
-        last_update_jobs_status: &mut (Instant, HashMap<i32, u64>),
+        is_read_job: bool,
+        samples: &mut HashMap<(bool, i32), JobStatusSample>,
         handler: &Session<T>,
     ) {
-        if elapsed <= 0 {
+        let now = Instant::now();
+        let finished_size = job.finished_size();
+        let sample_key = (is_read_job, job.id());
+        let Some(sample) = samples.get_mut(&sample_key) else {
+            samples.insert(
+                sample_key,
+                JobStatusSample {
+                    updated_at: now,
+                    finished_size,
+                },
+            );
+            let file_num = job.file_num() - 1;
+            handler.job_progress(job.id(), file_num, 0.0, finished_size as f64);
+            return;
+        };
+
+        let elapsed = now.duration_since(sample.updated_at);
+        if elapsed < Duration::from_secs(1) {
             return;
         }
-        let transferred = job.transferred();
-        let last_transferred = {
-            if let Some(v) = last_update_jobs_status.1.get(&job.id()) {
-                v.to_owned()
-            } else {
-                0
-            }
-        };
-        last_update_jobs_status.1.insert(job.id(), transferred);
-        let speed = (transferred - last_transferred) as f64 / (elapsed as f64 / 1000.);
+
+        let speed =
+            finished_size.saturating_sub(sample.finished_size) as f64 / elapsed.as_secs_f64();
+        sample.updated_at = now;
+        sample.finished_size = finished_size;
         let file_num = job.file_num() - 1;
-        handler.job_progress(job.id(), file_num, speed, job.finished_size() as f64);
+        handler.job_progress(job.id(), file_num, speed, finished_size as f64);
     }
 
     fn update_jobs_status(&mut self) {
-        let elapsed = self.last_update_jobs_status.0.elapsed().as_millis() as i32;
-        if elapsed >= 1000 {
-            for job in self.read_jobs.iter() {
-                Self::update_job_status(
-                    job,
-                    elapsed,
-                    &mut self.last_update_jobs_status,
-                    &self.handler,
-                );
+        for job in self.read_jobs.iter() {
+            Self::update_job_status(job, true, &mut self.job_status_samples, &self.handler);
+        }
+        for job in self.write_jobs.iter() {
+            Self::update_job_status(job, false, &mut self.job_status_samples, &self.handler);
+        }
+
+        let active_job_count = self.read_jobs.len() + self.write_jobs.len();
+        if self.job_status_samples.len() > active_job_count {
+            let active_job_keys: HashSet<(bool, i32)> = self
+                .read_jobs
+                .iter()
+                .map(|job| (true, job.id()))
+                .chain(self.write_jobs.iter().map(|job| (false, job.id())))
+                .collect();
+            self.job_status_samples
+                .retain(|key, _| active_job_keys.contains(key));
+        }
+    }
+
+    async fn reject_direct_download(
+        peer: &mut Stream,
+        id: i32,
+        file_num: i32,
+        error: impl ToString,
+    ) {
+        let error = error.to_string();
+        log::warn!("Reject direct Downloads transfer job {id}: {error}");
+        allow_err!(peer.send(&fs::new_error(id, error, file_num)).await);
+    }
+
+    fn direct_download_receive_enabled(&self) -> bool {
+        self.handler.is_default()
+            && *self.handler.server_file_transfer_enabled.read().unwrap()
+            && self.handler.lc.read().unwrap().enable_file_copy_paste.v
+    }
+
+    async fn handle_direct_download_request(
+        &mut self,
+        request: DirectFileTransferReceiveRequest,
+        peer: &mut Stream,
+    ) {
+        let id = request.id;
+        if !cfg!(windows) {
+            Self::reject_direct_download(
+                peer,
+                id,
+                0,
+                "direct Downloads receive is supported on Windows only",
+            )
+            .await;
+            return;
+        }
+        if id >= 0 {
+            Self::reject_direct_download(peer, id, 0, "invalid transfer id").await;
+            return;
+        }
+        if !self.direct_download_receive_enabled() {
+            Self::reject_direct_download(
+                peer,
+                id,
+                0,
+                "direct file receive is not permitted for this connection",
+            )
+            .await;
+            return;
+        }
+        if request.destination.enum_value()
+            != Ok(direct_file_transfer_receive_request::Destination::Downloads)
+        {
+            Self::reject_direct_download(peer, id, 0, "unsupported direct transfer destination")
+                .await;
+            return;
+        }
+        if self.read_jobs.iter().any(|job| job.id() == id)
+            || self.write_jobs.iter().any(|job| job.id() == id)
+            || self.direct_download_jobs.contains_key(&id)
+        {
+            Self::reject_direct_download(peer, id, 0, "duplicate transfer id").await;
+            return;
+        }
+        if self.direct_download_jobs.len() >= DIRECT_DOWNLOAD_MAX_CONCURRENT {
+            Self::reject_direct_download(peer, id, 0, "too many concurrent direct transfers").await;
+            return;
+        }
+        let accepted_direct_bytes = self
+            .direct_download_jobs
+            .values()
+            .try_fold(0u64, |total, job| total.checked_add(job.total_size));
+        if accepted_direct_bytes
+            .and_then(|total| total.checked_add(request.total_size))
+            .map_or(true, |total| total > fs::DIRECT_TRANSFER_MAX_TOTAL_BYTES)
+        {
+            Self::reject_direct_download(
+                peer,
+                id,
+                0,
+                "concurrent direct transfers exceed the unattended size limit",
+            )
+            .await;
+            return;
+        }
+        let session_accepted_bytes = self
+            .direct_download_session_accepted_bytes
+            .checked_add(request.total_size);
+        if session_accepted_bytes.map_or(true, |total| total > fs::DIRECT_TRANSFER_MAX_TOTAL_BYTES)
+        {
+            Self::reject_direct_download(
+                peer,
+                id,
+                0,
+                "REMOTE session direct transfer quota is exhausted",
+            )
+            .await;
+            return;
+        }
+        if let Err(err) = fs::validate_direct_transfer_layout(
+            &request.root_name,
+            request.is_directory,
+            &request.files,
+            &request.empty_dirs,
+            request.total_size,
+        ) {
+            Self::reject_direct_download(peer, id, 0, err).await;
+            return;
+        }
+
+        let destination =
+            match fs::reserve_direct_download_destination(&request.root_name, request.is_directory)
+            {
+                Ok(destination) => destination,
+                Err(err) => {
+                    Self::reject_direct_download(peer, id, 0, err).await;
+                    return;
+                }
+            };
+        if request.is_directory {
+            if let Err(err) = fs::create_direct_empty_directories(&destination, &request.empty_dirs)
+            {
+                fs::release_direct_download_reservation(&destination, true);
+                Self::reject_direct_download(peer, id, 0, err).await;
+                return;
             }
-            for job in self.write_jobs.iter() {
-                Self::update_job_status(
-                    job,
-                    elapsed,
-                    &mut self.last_update_jobs_status,
-                    &mut self.handler,
-                );
+        }
+
+        let root_name = request.root_name.clone();
+        let file_count = request.files.len();
+        let total_size = request.total_size;
+        let job = fs::TransferJob::new_write(
+            id,
+            fs::JobType::Generic,
+            request.root_name,
+            fs::DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(request.files);
+        let mut job = match job {
+            Ok(job) => job,
+            Err(err) => {
+                fs::release_direct_download_reservation(&destination, request.is_directory);
+                Self::reject_direct_download(peer, id, 0, err).await;
+                return;
             }
-            self.last_update_jobs_status.0 = Instant::now();
+        };
+        job.set_never_overwrite_destination(true);
+        job.set_strict_direct_transfer(true);
+
+        log::info!(
+            "Accept direct Downloads transfer job {} to {}",
+            id,
+            destination.display()
+        );
+        self.write_jobs.push(job);
+        self.direct_download_session_accepted_bytes =
+            session_accepted_bytes.unwrap_or(fs::DIRECT_TRANSFER_MAX_TOTAL_BYTES);
+        self.direct_download_jobs.insert(
+            id,
+            DirectDownloadJob {
+                destination,
+                is_directory: request.is_directory,
+                total_size: request.total_size,
+            },
+        );
+        self.handler
+            .direct_file_transfer_started(id, &root_name, file_count, total_size);
+    }
+
+    fn release_direct_download_job(&mut self, id: i32) {
+        if let Some(job) = self.direct_download_jobs.remove(&id) {
+            fs::release_direct_download_reservation(&job.destination, job.is_directory);
         }
     }
 
@@ -1084,7 +1399,10 @@ impl<T: InvokeUiSession> Remote<T> {
         if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
             job.remove_download_file();
         }
+        self.release_direct_download_job(id);
         let _ = fs::remove_job(id, &mut self.read_jobs);
+        self.job_status_samples.remove(&(true, id));
+        self.job_status_samples.remove(&(false, id));
         self.remove_jobs.remove(&id);
     }
 
@@ -1396,6 +1714,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(login_response::Union::PeerInfo(pi)) => {
+                        if self.recording_source_connection_id.is_empty()
+                            || self.recording_connection_ticket.is_empty()
+                        {
+                            (
+                                self.recording_source_connection_id,
+                                self.recording_connection_ticket,
+                            ) = self.handler.lc.read().unwrap().enterprise_audit_context();
+                        }
                         let peer_version = pi.version.clone();
                         let peer_platform = pi.platform.clone();
                         self.set_peer_info(&pi);
@@ -1603,7 +1929,23 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         Some(file_response::Union::Digest(digest)) => {
-                            if digest.is_upload {
+                            if self.direct_download_jobs.contains_key(&digest.id) {
+                                if let Some(job) = fs::remove_job(digest.id, &mut self.write_jobs) {
+                                    job.remove_download_file();
+                                }
+                                self.release_direct_download_job(digest.id);
+                                let error =
+                                    "overwrite negotiation is invalid for a direct transfer";
+                                self.handle_job_status(
+                                    digest.id,
+                                    digest.file_num,
+                                    Some(error.to_owned()),
+                                );
+                                allow_err!(
+                                    peer.send(&fs::new_error(digest.id, error, digest.file_num))
+                                        .await
+                                );
+                            } else if digest.is_upload {
                                 if let Some(job) = fs::get_job(digest.id, &mut self.read_jobs) {
                                     if let Some(file) = job.files().get(digest.file_num as usize) {
                                         if let fs::DataSource::FilePath(p) = &job.data_source {
@@ -1734,22 +2076,52 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         Some(file_response::Union::Block(block)) => {
-                            if let Some(job) = fs::get_job(block.id, &mut self.write_jobs) {
-                                if let Err(_err) = job.write(block).await {
-                                    // to-do: add "skip" for writing job
+                            let id = block.id;
+                            let file_num = block.file_num;
+                            let mut write_error = None;
+                            if self.direct_download_jobs.contains_key(&id)
+                                && !self.direct_download_receive_enabled()
+                            {
+                                write_error =
+                                    Some("direct file receive permission was revoked".to_owned());
+                            } else if let Some(job) = fs::get_job(block.id, &mut self.write_jobs) {
+                                if let Err(err) = job.write(block).await {
+                                    write_error = Some(err.to_string());
                                 }
                                 if job.r#type == fs::JobType::Generic {
                                     self.update_jobs_status();
                                 }
+                            }
+                            if let Some(err) = write_error {
+                                if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
+                                    job.remove_download_file();
+                                }
+                                self.release_direct_download_job(id);
+                                self.handle_job_status(id, file_num, Some(err.clone()));
+                                allow_err!(peer.send(&fs::new_error(id, err, file_num)).await);
                             }
                         }
                         Some(file_response::Union::Done(d)) => {
                             let mut err: Option<String> = None;
                             let mut job_type = fs::JobType::Generic;
                             let mut printer_data = None;
-                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {
-                                job.modify_time();
-                                err = job.job_error();
+                            let mut completed_write = false;
+                            let direct_download = self.direct_download_jobs.remove(&d.id);
+                            if let Some(mut job) = fs::remove_job(d.id, &mut self.write_jobs) {
+                                completed_write = true;
+                                err = (if direct_download.is_some()
+                                    && !self.direct_download_receive_enabled()
+                                {
+                                    job.remove_download_file();
+                                    Err(anyhow!("direct file receive permission was revoked"))
+                                } else if direct_download.is_some() {
+                                    job.finalize_direct_write().await
+                                } else {
+                                    job.finalize_write().await
+                                })
+                                .err()
+                                .map(|error| error.to_string())
+                                .or_else(|| job.job_error());
                                 job_type = job.r#type;
                                 printer_data = match job.get_buf_data().await {
                                     Ok(d) => d,
@@ -1759,12 +2131,17 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 };
                             }
+                            if direct_download.is_some() && !completed_write {
+                                err = Some(
+                                    "direct transfer destination job was not found".to_owned(),
+                                );
+                            }
                             match job_type {
                                 fs::JobType::Generic => {
-                                    self.handle_job_status(d.id, d.file_num, err);
+                                    self.handle_job_status(d.id, d.file_num, err.clone());
                                 }
                                 fs::JobType::Printer => {
-                                    if let Some(err) = err {
+                                    if let Some(ref err) = err {
                                         log::error!("Receive print job failed, error {err}");
                                     } else {
                                         log::info!(
@@ -1795,11 +2172,52 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 }
                             }
+                            if err.is_some() {
+                                if let Some(direct_download) = direct_download.as_ref() {
+                                    fs::release_direct_download_reservation(
+                                        &direct_download.destination,
+                                        direct_download.is_directory,
+                                    );
+                                }
+                            }
+                            #[cfg(target_os = "windows")]
+                            let direct_download_succeeded =
+                                direct_download.is_some() && completed_write && err.is_none();
+                            // Acknowledge only when this side actually owned and
+                            // finalized the destination write job. The controlled
+                            // host uses this acknowledgement as the terminal
+                            // DOWNLOAD audit point; source-side Done alone is not
+                            // enough to claim that the receiver stored the file.
+                            if completed_write || direct_download.is_some() {
+                                let acknowledgement = match err {
+                                    Some(err) => fs::new_error(d.id, err, d.file_num),
+                                    None => fs::new_done(d.id, d.file_num),
+                                };
+                                allow_err!(peer.send(&acknowledgement).await);
+                            }
+                            #[cfg(target_os = "windows")]
+                            if direct_download_succeeded {
+                                if let Some(direct_download) = direct_download.as_ref() {
+                                    open_direct_download_folder(&direct_download.destination);
+                                }
+                            }
                         }
                         Some(file_response::Union::Error(e)) => {
+                            let direct_download = self.direct_download_jobs.remove(&e.id);
                             let job_type = fs::remove_job(e.id, &mut self.write_jobs)
-                                .map(|j| j.r#type)
+                                .map(|j| {
+                                    if direct_download.is_some() {
+                                        j.remove_download_file();
+                                    }
+                                    j.r#type
+                                })
                                 .unwrap_or(fs::JobType::Generic);
+                            if let Some(direct_download) = direct_download {
+                                fs::release_direct_download_reservation(
+                                    &direct_download.destination,
+                                    direct_download.is_directory,
+                                );
+                            }
                             match job_type {
                                 fs::JobType::Generic => {
                                     self.handle_job_status(e.id, e.file_num, Some(e.error));
@@ -1831,6 +2249,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 "name": "open_file_transfer_folder",
                                 "id": id,
                                 "dir": req.dir,
+                                "localDir": get_string(&fs::get_download_dir()),
                             });
                             if !req.selected_name.is_empty() {
                                 evt["selectedName"] = serde_json::json!(req.selected_name);
@@ -2073,6 +2492,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 Some(message::Union::FileAction(action)) => match action.union {
+                    Some(file_action::Union::DirectReceive(request)) => {
+                        self.handle_direct_download_request(request, peer).await;
+                    }
                     Some(file_action::Union::Send(_s)) => match _s.file_type.enum_value() {
                         #[cfg(target_os = "windows")]
                         Ok(file_transfer_send_request::FileType::Printer) => {
@@ -2111,6 +2533,19 @@ impl<T: InvokeUiSession> Remote<T> {
                     Some(file_action::Union::SendConfirm(c)) => {
                         if let Some(job) = fs::get_job(c.id, &mut self.read_jobs) {
                             job.confirm(&c).await;
+                        }
+                    }
+                    Some(file_action::Union::Cancel(c)) => {
+                        if self.direct_download_jobs.contains_key(&c.id) {
+                            if let Some(job) = fs::remove_job(c.id, &mut self.write_jobs) {
+                                job.remove_download_file();
+                            }
+                            self.release_direct_download_job(c.id);
+                            self.handle_job_status(
+                                c.id,
+                                -1,
+                                Some("direct transfer cancelled by sender".to_owned()),
+                            );
                         }
                     }
                     _ => {}
@@ -2507,6 +2942,8 @@ impl<T: InvokeUiSession> Remote<T> {
         crate::client::start_video_thread(
             self.handler.clone(),
             display,
+            self.recording_source_connection_id.clone(),
+            self.recording_connection_ticket.clone(),
             video_receiver,
             video_queue,
             decode_fps,
@@ -2569,6 +3006,99 @@ impl<T: InvokeUiSession> Remote<T> {
         for (_, v) in self.video_threads.iter_mut() {
             v.video_sender.send(MediaData::RecordScreen(start)).ok();
         }
+    }
+
+    fn finalize_recorders(&mut self, allow_late_recovery: bool) -> Result<(), String> {
+        self.last_record_state = false;
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let mut pending = 0usize;
+        for thread in self.video_threads.values() {
+            if thread
+                .video_sender
+                .send(MediaData::FinalizeRecording(completion_tx.clone()))
+                .is_ok()
+            {
+                pending += 1;
+            }
+        }
+        drop(completion_tx);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut received = 0usize;
+        while received < pending {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let ack = if remaining.is_zero() {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            } else {
+                completion_rx.recv_timeout(remaining)
+            };
+            match ack {
+                Ok(()) => received += 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let error = "녹화 파일 마감 확인 시간이 초과되었습니다.".to_owned();
+                    self.set_recording_finalize_result(Err(error.clone()));
+                    if allow_late_recovery {
+                        // This mode is used only after the peer loop has ended;
+                        // the old source cannot resume or create new segments.
+                        self.track_late_recording_finalize_acks(
+                            completion_rx,
+                            pending.saturating_sub(received),
+                        );
+                    }
+                    return Err(error);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let error = "녹화 파일 마감 채널이 종료되었습니다.".to_owned();
+                    self.set_recording_finalize_result(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
+
+        self.active_recording_displays.clear();
+        self.set_recording_finalize_result(Ok(()));
+        Ok(())
+    }
+
+    fn set_recording_finalize_result(&self, result: Result<(), String>) {
+        self.handler
+            .connection_round_state
+            .lock()
+            .unwrap()
+            .set_recording_finalize_result(
+                self.connection_round,
+                self.recording_source_connection_id.clone(),
+                result,
+            );
+    }
+
+    fn track_late_recording_finalize_acks(
+        &self,
+        completion_rx: std::sync::mpsc::Receiver<()>,
+        remaining_acks: usize,
+    ) {
+        if remaining_acks == 0 {
+            return;
+        }
+        let state = self.handler.connection_round_state.clone();
+        let round = self.connection_round;
+        let source_connection_id = self.recording_source_connection_id.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+            for _ in 0..remaining_acks {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() || completion_rx.recv_timeout(remaining).is_err() {
+                    return;
+                }
+            }
+            state.lock().unwrap().set_recording_finalize_result(
+                round,
+                source_connection_id,
+                Ok(()),
+            );
+            log::info!("Late recording finalize acknowledgements completed: round={round}");
+        });
     }
 }
 

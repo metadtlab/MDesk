@@ -59,7 +59,7 @@ class GroupModel {
       if (gFFI.userModel.isWithinLoginProtection()) {
         debugPrint('GroupModel: 401 ignored (within login protection period)');
       } else {
-        gFFI.userModel.reset(resetOther: true);
+        await gFFI.userModel.recoverUnauthorized();
       }
     } else {
       _saveCache();

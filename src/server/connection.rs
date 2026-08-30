@@ -27,12 +27,13 @@ use hbb_common::platform::linux::run_cmds;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
-    config::{self, keys, Config, TrustedDevice},
+    anyhow::anyhow,
+    config::{self, keys, Config, LocalConfig, TrustedDevice},
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
     get_time, get_version_number,
     message_proto::{option_message::BoolOption, permission_info::Permission},
-    password_security::{self as password, ApproveMode},
+    password_security as password,
     sha2::{Digest, Sha256},
     sleep, timeout,
     tokio::{
@@ -186,6 +187,90 @@ enum MessageInput {
     BlockOffPlugin(String),
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasteTriggerKey {
+    V,
+    Insert,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Default)]
+struct PasteTriggerEdgeState {
+    v_down: bool,
+    insert_down: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl PasteTriggerEdgeState {
+    /// Returns true only for a new key edge. A `press` without a preceding
+    /// `down` is a complete standalone edge and therefore does not latch the
+    /// key. Repeated down/press messages remain suppressed until key-up.
+    fn observe(&mut self, key: PasteTriggerKey, down: bool, press: bool) -> bool {
+        let active = match key {
+            PasteTriggerKey::V => &mut self.v_down,
+            PasteTriggerKey::Insert => &mut self.insert_down,
+        };
+
+        if !down && !press {
+            *active = false;
+            return false;
+        }
+        if down {
+            let is_new_edge = !*active;
+            *active = true;
+            return is_new_edge;
+        }
+
+        // Translate-mode standalone press: there is no matching key-up, so do
+        // not latch it. If a real down is already active this is auto-repeat.
+        !*active
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod paste_trigger_edge_state_tests {
+    use super::{PasteTriggerEdgeState, PasteTriggerKey};
+
+    #[test]
+    fn suppresses_repeat_until_key_up_then_accepts_the_next_down() {
+        let mut state = PasteTriggerEdgeState::default();
+
+        assert!(state.observe(PasteTriggerKey::V, true, false));
+        assert!(!state.observe(PasteTriggerKey::V, true, false));
+        assert!(!state.observe(PasteTriggerKey::V, false, true));
+        assert!(!state.observe(PasteTriggerKey::V, false, false));
+        assert!(state.observe(PasteTriggerKey::V, true, false));
+    }
+
+    #[test]
+    fn rapid_distinct_key_cycles_are_each_accepted_without_a_timer() {
+        let mut state = PasteTriggerEdgeState::default();
+
+        assert!(state.observe(PasteTriggerKey::V, true, false));
+        assert!(!state.observe(PasteTriggerKey::V, false, false));
+        assert!(state.observe(PasteTriggerKey::V, true, false));
+    }
+
+    #[test]
+    fn standalone_press_is_accepted_without_latching_the_key() {
+        let mut state = PasteTriggerEdgeState::default();
+
+        assert!(state.observe(PasteTriggerKey::Insert, false, true));
+        assert!(state.observe(PasteTriggerKey::Insert, false, true));
+    }
+
+    #[test]
+    fn v_and_insert_edges_are_tracked_independently() {
+        let mut state = PasteTriggerEdgeState::default();
+
+        assert!(state.observe(PasteTriggerKey::V, true, false));
+        assert!(state.observe(PasteTriggerKey::Insert, true, false));
+        assert!(!state.observe(PasteTriggerKey::V, true, false));
+        assert!(!state.observe(PasteTriggerKey::Insert, true, false));
+    }
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct SessionKey {
     peer_id: String,
@@ -264,8 +349,13 @@ pub struct Connection {
     server: super::ServerPtrWeak,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
+    // File-transfer audit state is kept on the controlled host because that is
+    // where the connection ticket is available. The controller access token is
+    // never forwarded to this process.
+    pending_file_audits: HashMap<i32, PendingFileAudit>,
     timer: crate::RustDeskInterval,
     file_timer: crate::RustDeskInterval,
+    last_file_progress_to_cm: Instant,
     file_transfer: Option<(String, bool)>,
     view_camera: bool,
     terminal: bool,
@@ -313,9 +403,9 @@ pub struct Connection {
     // pastes on this host (Ctrl+V / Shift+Insert), so phantom records from
     // multi-session relay are avoided while real pastes are captured.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    last_clipboard_audit_for_paste: Option<Value>,
+    last_clipboard_audit_for_paste: Option<(Instant, Value)>,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    last_paste_audit_at: Option<Instant>,
+    paste_trigger_edge_state: PasteTriggerEdgeState,
     lr: LoginRequest,
     peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
@@ -403,6 +493,7 @@ const TEST_DELAY_TIMEOUT: Duration = Duration::from_secs(1);
 const SEC30: Duration = Duration::from_secs(30);
 const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
+const FILE_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -418,6 +509,7 @@ impl Connection {
         let hash = Hash {
             salt: Config::get_salt(),
             challenge: Config::get_auto_password(6),
+            approve_mode: password::approve_mode().as_str().to_owned(),
             ..Default::default()
         };
         let (tx_from_cm_holder, mut rx_from_cm) = mpsc::unbounded_channel::<ipc::Data>();
@@ -456,8 +548,10 @@ impl Connection {
             server,
             hash,
             read_jobs: Vec::new(),
+            pending_file_audits: HashMap::new(),
             timer: crate::rustdesk_interval(time::interval(SEC30)),
             file_timer: crate::rustdesk_interval(time::interval(SEC30)),
+            last_file_progress_to_cm: Instant::now(),
             file_transfer: None,
             view_camera: false,
             terminal: false,
@@ -496,7 +590,7 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             last_clipboard_audit_for_paste: None,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            last_paste_audit_at: None,
+            paste_trigger_edge_state: PasteTriggerEdgeState::default(),
             lr: Default::default(),
             peer_argb: 0u32,
             session_last_recv_time: None,
@@ -666,6 +760,15 @@ impl Connection {
                             msg_out.set_misc(misc);
                             conn.send(msg_out).await;
                         }
+                        #[cfg(windows)]
+                        ipc::Data::DirectFileTransfer {
+                            source_path,
+                            result: None,
+                        } => {
+                            if let Err(err) = conn.start_direct_file_transfer(source_path).await {
+                                log::error!("Failed to start direct Downloads transfer: {err}");
+                            }
+                        }
                         ipc::Data::SwitchPermission{name, enabled} => {
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {
@@ -714,6 +817,13 @@ impl Connection {
                             } else if &name == "file" {
                                 conn.file = enabled;
                                 conn.send_permission(Permission::File, enabled).await;
+                                #[cfg(any(
+                                    target_os = "windows",
+                                    feature = "unix-file-copy-paste"
+                                ))]
+                                conn.send_to_cm(ipc::Data::ClipboardFileEnabled(
+                                    conn.file_transfer_enabled(),
+                                ));
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if !enabled {
                                     conn.try_empty_file_clipboard();
@@ -738,7 +848,26 @@ impl Connection {
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
+                            // A write-side Done/Error from the host connection
+                            // manager is the durable completion point for an
+                            // UPLOAD (controller -> host).
+                            conn.capture_enterprise_file_outcome_from_cm(&bytes);
                             allow_err!(conn.stream.send_raw(bytes).await);
+                        }
+                        ipc::Data::FileTransferAuditOutcome { id, succeeded } => {
+                            if conn
+                                .pending_file_audits
+                                .get(&id)
+                                .map(|pending| {
+                                    pending.direction == EnterpriseFileDirection::Upload
+                                })
+                                .unwrap_or(false)
+                            {
+                                conn.post_enterprise_file_outcome(
+                                    id,
+                                    if succeeded { "COMPLETED" } else { "FAILED" },
+                                );
+                            }
                         }
                         #[cfg(target_os = "windows")]
                         ipc::Data::ClipboardFile(clip) => {
@@ -773,16 +902,23 @@ impl Connection {
                                 );
                                 continue;
                             }
+                            let mut clipboard_audit_after_send: Option<Value> = None;
                             match &clip {
-                                clipboard::ClipboardFile::Files { files } => {
+                                clipboard::ClipboardFile::Files {
+                                    files,
+                                    source_application,
+                                } => {
                                     let files_audit: Vec<(String, i64)> = files.iter().map(|(f, s)| {
                                         (f.clone(), *s as i64)
                                     }).collect();
-                                    conn.post_clipboard_audit(crate::clipboard_audit::summarize_files(
-                                        crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
-                                        &files_audit,
-                                        &conn.ip,
-                                    ));
+                                    clipboard_audit_after_send = Some(
+                                        crate::clipboard_audit::summarize_files_with_source(
+                                            crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                            &files_audit,
+                                            crate::clipboard_audit::ClipboardSourceApplication::from_proto_i32(*source_application),
+                                            &conn.ip,
+                                        ),
+                                    );
                                     conn.post_file_audit(
                                         FileAuditType::RemoteSend,
                                         "",
@@ -809,7 +945,14 @@ impl Connection {
                                 _ => {}
                             }
                             // 모든 클립보드 메시지 전송
-                            allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                            if let Err(err) = conn.stream.send(&clip_2_msg(clip)).await {
+                                log::error!("Failed to send clipboard file metadata: {}", err);
+                            } else if let Some(info) = clipboard_audit_after_send {
+                                conn.post_clipboard_audit(
+                                    info,
+                                    EnterpriseClipboardAction::Synced,
+                                );
+                            }
                         }
                         ipc::Data::PrivacyModeState((_, state, impl_key)) => {
                             let msg_out = match state {
@@ -891,11 +1034,29 @@ impl Connection {
                 },
                 _ = conn.file_timer.tick() => {
                     if !conn.read_jobs.is_empty() {
-                        conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));
+                        if conn.last_file_progress_to_cm.elapsed() >= FILE_PROGRESS_UPDATE_INTERVAL {
+                            conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));
+                            conn.last_file_progress_to_cm = Instant::now();
+                        }
                         match fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {
-                            Ok(log) => {
+                            Ok((log, outcomes)) => {
                                 if !log.is_empty() {
                                     conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), log)));
+                                }
+                                for outcome in outcomes {
+                                    let is_download = conn.pending_file_audits
+                                        .get(&outcome.id)
+                                        .map(|pending| pending.direction == EnterpriseFileDirection::Download)
+                                        .unwrap_or(false);
+                                    if is_download {
+                                        if outcome.succeeded {
+                                            if let Some(pending) = conn.pending_file_audits.get_mut(&outcome.id) {
+                                                pending.source_finished = true;
+                                            }
+                                        } else {
+                                            conn.post_enterprise_file_outcome(outcome.id, "FAILED");
+                                        }
+                                    }
                                 }
                             }
                             Err(err) =>  {
@@ -929,6 +1090,7 @@ impl Connection {
                     let latency = instant.elapsed().as_millis() as i64;
                     #[allow(unused_mut)]
                     let mut msg = value;
+                    let mut clipboard_audit_after_send: Option<Value> = None;
 
                     if latency > 1000 {
                         match &msg.union {
@@ -967,22 +1129,54 @@ impl Connection {
                                 msg = Arc::new(new_msg);
                             }
                         }
+                        Some(message::Union::Clipboard(clipboard)) => {
+                            clipboard_audit_after_send = Some(
+                                crate::clipboard_audit::summarize_multi_clipboards(
+                                    crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                    std::slice::from_ref(clipboard),
+                                    &conn.ip,
+                                ),
+                            );
+                        }
                         Some(message::Union::MultiClipboards(_multi_clipboards)) => {
-                            conn.post_clipboard_audit(
+                            let audit_info =
                                 crate::clipboard_audit::summarize_multi_clipboards(
                                     crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
                                     &_multi_clipboards.clipboards,
                                     &conn.ip,
-                                ),
-                            );
+                                );
                             #[cfg(not(target_os = "ios"))]
                             if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(&conn.lr.version, &conn.lr.my_platform, _multi_clipboards) {
+                                let translated_audit = match msg_out.union.as_ref() {
+                                    Some(message::Union::Clipboard(clipboard)) => Some(
+                                        crate::clipboard_audit::summarize_multi_clipboards(
+                                            crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                            std::slice::from_ref(clipboard),
+                                            &conn.ip,
+                                        ),
+                                    ),
+                                    Some(message::Union::MultiClipboards(clipboards)) => Some(
+                                        crate::clipboard_audit::summarize_multi_clipboards(
+                                            crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                            &clipboards.clipboards,
+                                            &conn.ip,
+                                        ),
+                                    ),
+                                    _ => None,
+                                };
                                 if let Err(err) = conn.stream.send(&msg_out).await {
                                     conn.on_close(&err.to_string(), false).await;
                                     break;
                                 }
+                                if let Some(info) = translated_audit {
+                                    conn.post_clipboard_audit(
+                                        info,
+                                        EnterpriseClipboardAction::Synced,
+                                    );
+                                }
                                 continue;
                             }
+                            clipboard_audit_after_send = Some(audit_info);
                         }
                         _ => {}
                     }
@@ -991,6 +1185,9 @@ impl Connection {
                     if let Err(err) = conn.stream.send(msg).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
+                    }
+                    if let Some(info) = clipboard_audit_after_send {
+                        conn.post_clipboard_audit(info, EnterpriseClipboardAction::Synced);
                     }
                 },
                 Some(data) = rx_from_authed.recv() => {
@@ -1084,9 +1281,50 @@ impl Connection {
             raii::AuthedConnID::check_remove_session(conn.inner.id(), conn.session_key());
         }
 
-        conn.post_conn_audit(json!({
-            "action": "close",
-        }));
+        if conn.authorized {
+            // The peer may close immediately after its last upload block while
+            // the host connection manager is still flushing/renaming the
+            // destination file. Give that local terminal Done/Error a short
+            // chance to win over cleanup so a successful upload is not audited
+            // as CANCELLED merely because of channel scheduling.
+            if conn
+                .pending_file_audits
+                .values()
+                .any(|pending| pending.direction == EnterpriseFileDirection::Upload)
+            {
+                let drain_deadline = Instant::now() + Duration::from_millis(750);
+                while conn
+                    .pending_file_audits
+                    .values()
+                    .any(|pending| pending.direction == EnterpriseFileDirection::Upload)
+                {
+                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match time::timeout(remaining, rx_from_cm.recv()).await {
+                        Ok(Some(ipc::Data::RawMessage(bytes))) => {
+                            conn.capture_enterprise_file_outcome_from_cm(&bytes);
+                        }
+                        Ok(Some(ipc::Data::FileTransferAuditOutcome { id, succeeded })) => {
+                            conn.post_enterprise_file_outcome(
+                                id,
+                                if succeeded { "COMPLETED" } else { "FAILED" },
+                            );
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            }
+            let unfinished_file_jobs: Vec<i32> = conn.pending_file_audits.keys().copied().collect();
+            for job_id in unfinished_file_jobs {
+                conn.post_enterprise_file_outcome(job_id, "CANCELLED");
+            }
+            conn.post_conn_audit(json!({
+                "action": "close",
+            }));
+        }
         if let Some(s) = conn.server.upgrade() {
             let mut s = s.write().unwrap();
             s.remove_connection(&conn.inner);
@@ -1205,13 +1443,37 @@ impl Connection {
     async fn post_seq_loop(mut rx: mpsc::UnboundedReceiver<(String, Value)>) {
         while let Some((url, v)) = rx.recv().await {
             log::info!("Posting audit to {}", url);
-            match Self::post_audit_async(url.clone(), v).await {
-                Ok(response) => {
-                    log::info!("Audit response from {}: {}", url, response);
+            let mut delivered = false;
+            for attempt in 1..=4u32 {
+                match Self::post_audit_async(url.clone(), v.clone()).await {
+                    Ok(response) => {
+                        log::info!("Audit response from {}: {}", url, response);
+                        delivered = true;
+                        break;
+                    }
+                    Err(e) if attempt < 4 => {
+                        let delay_ms = 250u64 * (1u64 << (attempt - 1));
+                        log::warn!(
+                            "Failed to post audit to {} (attempt {}/4): {}; retrying in {}ms",
+                            url,
+                            attempt,
+                            e,
+                            delay_ms
+                        );
+                        time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to post audit to {} after {} attempts: {}",
+                            url,
+                            attempt,
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    log::error!("Failed to post audit to {}: {}", url, e);
-                }
+            }
+            if !delivered {
+                log::error!("Audit event delivery exhausted for {}", url);
             }
         }
         log::debug!("post_seq_loop exited");
@@ -1341,10 +1603,6 @@ impl Connection {
         msg_out.set_hash(self.hash.clone());
         self.send(msg_out).await;
         self.get_api_server();
-        self.post_conn_audit(json!({
-            "ip": addr.ip(),
-            "action": "new",
-        }));
         true
     }
 
@@ -1376,6 +1634,12 @@ impl Connection {
         if self.server_audit_conn.is_empty() {
             log::debug!("Audit URL is empty, skipping conn audit");
             return;
+        }
+        if let Some(context) = self.lr.audit_context.as_ref() {
+            if !context.connection_ticket.is_empty() && !context.source_connection_id.is_empty() {
+                self.post_enterprise_conn_audit(v, context);
+                return;
+            }
         }
         let url = self.server_audit_conn.clone();
         let mut v = v;
@@ -1410,6 +1674,52 @@ impl Connection {
         allow_err!(self.tx_post_seq.send((url, v)));
     }
 
+    fn post_enterprise_conn_audit(&self, v: Value, context: &AuditContext) {
+        let event = if v["action"] == "close" {
+            "CLOSED"
+        } else {
+            "OPENED"
+        };
+        let connection_type = if self.file_transfer.is_some() {
+            "FILE_TRANSFER"
+        } else if self.port_forward_socket.is_some() {
+            "PORT_FORWARD"
+        } else if self.view_camera {
+            "VIEW_CAMERA"
+        } else if self.terminal {
+            "TERMINAL"
+        } else {
+            "REMOTE"
+        };
+        let api_base = self
+            .server_audit_conn
+            .trim_end_matches("/api/audit/conn")
+            .trim_end_matches('/');
+        let url = format!("{api_base}/api/audit/v2/connection");
+        let payload = json!({
+            "ticket": context.connection_ticket,
+            "source_connection_id": context.source_connection_id,
+            "event": event,
+            "reporter_rid": Config::get_id(),
+            "reporter_uuid": crate::encode64(hbb_common::get_uuid()),
+            "controller_rid": self.lr.my_id,
+            "connection_type": connection_type,
+            "session_id": self.lr.session_id.to_string(),
+            "conn_id": self.inner.id.to_string(),
+            "from_ip": self.ip,
+        });
+        log::info!(
+            "Sending verified conn audit event={} source_connection_id={} to {}",
+            event,
+            context.source_connection_id,
+            url
+        );
+        // OPENED and CLOSED share one queue so a short connection cannot race
+        // its close event ahead of the open request. The API remains idempotent
+        // for retries.
+        allow_err!(self.tx_post_seq.send((url, payload)));
+    }
+
     fn get_files_for_audit(job_type: fs::JobType, mut files: Vec<FileEntry>) -> Vec<(String, i64)> {
         files
             .drain(..)
@@ -1420,10 +1730,309 @@ impl Connection {
                     } else {
                         f.name
                     },
-                    f.size as _,
+                    i64::try_from(f.size).unwrap_or(i64::MAX),
                 )
             })
             .collect()
+    }
+
+    fn truncate_audit_text(value: &str, max_chars: usize) -> String {
+        let mut utf16_units = 0usize;
+        value
+            .chars()
+            .take_while(|character| {
+                let next = utf16_units.saturating_add(character.len_utf16());
+                if next > max_chars {
+                    return false;
+                }
+                utf16_units = next;
+                true
+            })
+            .collect()
+    }
+
+    fn normalized_audit_files(path: &str, files: Vec<(String, i64)>) -> Vec<(String, i64)> {
+        let fallback_name = PathBuf::from(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("transferred-file")
+            .to_owned();
+        let mut normalized: Vec<(String, i64)> = files
+            .into_iter()
+            .map(|(name, size)| {
+                let name = if name.trim().is_empty() {
+                    fallback_name.clone()
+                } else {
+                    name
+                };
+                (Self::truncate_audit_text(&name, 255), size.max(0))
+            })
+            .collect();
+        if normalized.is_empty() {
+            normalized.push((Self::truncate_audit_text(&fallback_name, 255), 0));
+        }
+        normalized
+    }
+
+    fn direct_download_audit_basename(value: &str) -> Option<&str> {
+        let basename = value
+            .rsplit(|character| character == '/' || character == '\\')
+            .next()?;
+        if basename.trim().is_empty()
+            || basename == "."
+            || basename == ".."
+            || basename.chars().any(|character| character.is_control())
+        {
+            None
+        } else {
+            Some(basename)
+        }
+    }
+
+    fn normalized_direct_download_audit_files(
+        root_name: &str,
+        files: Vec<(String, i64)>,
+    ) -> Vec<(String, i64)> {
+        let fallback_name =
+            Self::direct_download_audit_basename(root_name).unwrap_or("transferred-file");
+        let mut normalized = files
+            .into_iter()
+            .map(|(relative_name, size)| {
+                let basename = if relative_name.is_empty() {
+                    fallback_name
+                } else {
+                    Self::direct_download_audit_basename(&relative_name)
+                        .unwrap_or("transferred-file")
+                };
+                (Self::truncate_audit_text(basename, 255), size.max(0))
+            })
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            normalized.push((Self::truncate_audit_text(fallback_name, 255), 0));
+        }
+        normalized
+    }
+
+    fn enterprise_file_transfer_mode_for(
+        is_file_transfer_connection: bool,
+        is_remote_connection: bool,
+        direction: EnterpriseFileDirection,
+        path: &str,
+    ) -> Option<EnterpriseFileTransferMode> {
+        if is_file_transfer_connection {
+            return Some(EnterpriseFileTransferMode::FileManager);
+        }
+        if is_remote_connection
+            && direction == EnterpriseFileDirection::Upload
+            && fs::is_remote_drop_downloads_path(path)
+        {
+            return Some(EnterpriseFileTransferMode::RemoteDrop);
+        }
+        None
+    }
+
+    fn enterprise_file_transfer_mode(
+        &self,
+        direction: EnterpriseFileDirection,
+        path: &str,
+    ) -> Option<EnterpriseFileTransferMode> {
+        let context = self.lr.audit_context.as_ref()?;
+        if context.connection_ticket.trim().is_empty()
+            || context.source_connection_id.trim().is_empty()
+        {
+            return None;
+        }
+        Self::enterprise_file_transfer_mode_for(
+            self.file_transfer.is_some(),
+            self.is_remote(),
+            direction,
+            path,
+        )
+    }
+
+    fn enterprise_file_audit_path(mode: EnterpriseFileTransferMode, path: &str) -> String {
+        match mode {
+            // The protocol sentinel can contain a controller-selected relative
+            // name. It is needed to route the write, but must not leave the
+            // controlled host in an audit payload.
+            EnterpriseFileTransferMode::RemoteDrop
+            | EnterpriseFileTransferMode::RemoteDirectDownload => "Downloads".to_owned(),
+            EnterpriseFileTransferMode::FileManager => Self::truncate_audit_text(path, 2000),
+        }
+    }
+
+    fn enterprise_file_normalization_path(mode: EnterpriseFileTransferMode, path: &str) -> String {
+        match mode {
+            EnterpriseFileTransferMode::FileManager => path.to_owned(),
+            EnterpriseFileTransferMode::RemoteDrop => fs::resolve_remote_drop_downloads_path(path)
+                .ok()
+                .flatten()
+                .and_then(|resolved| {
+                    resolved
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default(),
+            EnterpriseFileTransferMode::RemoteDirectDownload => String::new(),
+        }
+    }
+
+    fn remember_enterprise_file_transfer(
+        &mut self,
+        job_id: i32,
+        direction: EnterpriseFileDirection,
+        path: &str,
+        files: Vec<(String, i64)>,
+    ) {
+        let Some(transfer_mode) = self.enterprise_file_transfer_mode(direction, path) else {
+            return;
+        };
+        let normalized_file_path = Self::enterprise_file_normalization_path(transfer_mode, path);
+        let pending = PendingFileAudit {
+            transfer_id: uuid::Uuid::new_v4().to_string(),
+            direction,
+            transfer_mode,
+            path: Self::enterprise_file_audit_path(transfer_mode, path),
+            files: Self::normalized_audit_files(&normalized_file_path, files),
+            source_finished: false,
+        };
+        if self.pending_file_audits.insert(job_id, pending).is_some() {
+            log::warn!(
+                "Replaced unfinished file audit state for reused transfer job id {}",
+                job_id
+            );
+        }
+    }
+
+    fn remember_enterprise_direct_download(
+        &mut self,
+        job_id: i32,
+        root_name: &str,
+        files: Vec<(String, i64)>,
+    ) {
+        let Some(context) = self.lr.audit_context.as_ref() else {
+            return;
+        };
+        if context.connection_ticket.trim().is_empty()
+            || context.source_connection_id.trim().is_empty()
+        {
+            return;
+        }
+        let pending = PendingFileAudit {
+            transfer_id: uuid::Uuid::new_v4().to_string(),
+            direction: EnterpriseFileDirection::Download,
+            transfer_mode: EnterpriseFileTransferMode::RemoteDirectDownload,
+            path: "Downloads".to_owned(),
+            files: Self::normalized_direct_download_audit_files(root_name, files),
+            source_finished: false,
+        };
+        if self.pending_file_audits.insert(job_id, pending).is_some() {
+            log::warn!(
+                "Replaced unfinished direct file audit state for reused transfer job id {}",
+                job_id
+            );
+        }
+    }
+
+    fn post_enterprise_file_outcome(&mut self, job_id: i32, status: &'static str) {
+        let Some(pending) = self.pending_file_audits.remove(&job_id) else {
+            return;
+        };
+        let Some(context) = self.lr.audit_context.as_ref() else {
+            return;
+        };
+        if context.connection_ticket.trim().is_empty()
+            || context.source_connection_id.trim().is_empty()
+        {
+            return;
+        }
+
+        let audit_base = if self.server_audit_file.trim().is_empty() {
+            self.server_audit_conn
+                .trim_end_matches("/api/audit/conn")
+                .trim_end_matches('/')
+        } else {
+            self.server_audit_file
+                .trim_end_matches("/api/audit/file")
+                .trim_end_matches('/')
+        };
+        if audit_base.is_empty() {
+            log::warn!("Audit URL is empty, dropping verified file outcome");
+            return;
+        }
+        let url = format!("{audit_base}/api/audit/v2/file");
+        let occurred_at = chrono::Utc::now().to_rfc3339();
+        let is_batched = pending.files.len() > 100;
+        for (batch_index, file_batch) in pending.files.chunks(100).enumerate() {
+            let files: Vec<Value> = file_batch
+                .iter()
+                .map(|(name, size)| json!({ "name": name, "size": size }))
+                .collect();
+            let event_id = uuid::Uuid::new_v4().to_string();
+            // The API treats (source_connection_id, transfer_id) as one
+            // terminal event. Large directory transfers therefore use a
+            // stable per-batch suffix instead of conflicting on the second
+            // batch while still keeping all files auditable.
+            let transfer_id = if is_batched {
+                format!("{}:{}", pending.transfer_id, batch_index + 1)
+            } else {
+                pending.transfer_id.clone()
+            };
+            let payload = json!({
+                "ticket": context.connection_ticket,
+                "source_connection_id": context.source_connection_id,
+                "event_id": event_id,
+                "transfer_id": transfer_id,
+                "event": status,
+                "reporter_rid": Config::get_id(),
+                "reporter_uuid": crate::encode64(hbb_common::get_uuid()),
+                "controller_rid": self.lr.my_id,
+                "direction": pending.direction.as_api_str(),
+                "transfer_mode": pending.transfer_mode.as_api_str(),
+                "path": pending.path,
+                "files": files,
+                "occurred_at": occurred_at,
+            });
+            log::info!(
+                "Queue verified file audit event={} direction={} job_id={} file_count={} source_connection_id={}",
+                status,
+                pending.direction.as_api_str(),
+                job_id,
+                file_batch.len(),
+                context.source_connection_id
+            );
+            allow_err!(self.tx_post_seq.send((url.clone(), payload)));
+        }
+    }
+
+    fn capture_enterprise_file_outcome_from_cm(&mut self, bytes: &[u8]) {
+        let Some((job_id, status)) = Self::enterprise_file_terminal_outcome(bytes) else {
+            return;
+        };
+        if self
+            .pending_file_audits
+            .get(&job_id)
+            .map(|pending| pending.direction == EnterpriseFileDirection::Upload)
+            .unwrap_or(false)
+        {
+            self.post_enterprise_file_outcome(job_id, status);
+        }
+    }
+
+    fn enterprise_file_terminal_outcome(bytes: &[u8]) -> Option<(i32, &'static str)> {
+        let Ok(message) = Message::parse_from_bytes(bytes) else {
+            return None;
+        };
+        let Some(message::Union::FileResponse(response)) = message.union else {
+            return None;
+        };
+        match response.union {
+            Some(file_response::Union::Done(done)) => Some((done.id, "COMPLETED")),
+            Some(file_response::Union::Error(error)) => Some((error.id, "FAILED")),
+            _ => None,
+        }
     }
 
     fn post_file_audit(
@@ -1435,6 +2044,20 @@ impl Connection {
     ) {
         if self.server_audit_file.is_empty() {
             log::debug!("Audit URL is empty, skipping file audit");
+            return;
+        }
+        let direction = match r#type {
+            FileAuditType::RemoteReceive => EnterpriseFileDirection::Upload,
+            FileAuditType::RemoteSend => EnterpriseFileDirection::Download,
+        };
+        if self
+            .enterprise_file_transfer_mode(direction, path)
+            .is_some()
+        {
+            // V2 records only a terminal transfer outcome. The legacy call is
+            // made at request/clipboard-detection time and would create false
+            // positives or duplicate the verified completion event.
+            log::debug!("Verified file audit is active; skip legacy start-time audit");
             return;
         }
         let url = self.server_audit_file.clone();
@@ -1479,9 +2102,20 @@ impl Connection {
     }
 
     // 클립보드 전송 내역(메타데이터 전용)을 audit 서버로 전송한다.
-    // info에는 클립보드 "내용"은 절대 포함되지 않으며, 방향/종류/포맷/파일명(basename)
-    // /개수/크기/이미지 크기 등 메타데이터만 담긴다. (src/clipboard_audit.rs 참고)
-    fn post_clipboard_audit(&self, info: Value) {
+    // Verified V2에는 텍스트/이미지/파일명 등 실제 내용이 들어가지 않는다.
+    fn post_clipboard_audit(&self, info: Value, action: EnterpriseClipboardAction) {
+        if let Some(context) = self.lr.audit_context.as_ref() {
+            if !context.connection_ticket.trim().is_empty()
+                && !context.source_connection_id.trim().is_empty()
+                && self.file_transfer.is_none()
+                && self.port_forward_socket.is_none()
+                && !self.view_camera
+                && !self.terminal
+            {
+                self.post_enterprise_clipboard_audit(&info, action, context);
+                return;
+            }
+        }
         if self.server_audit_clipboard.is_empty() {
             log::debug!("Clipboard audit URL is empty, skipping clipboard audit");
             return;
@@ -1494,7 +2128,7 @@ impl Connection {
             "type": 0,
             "info": info.to_string(),
         });
-        log::info!("Sending clipboard audit to {}: {:?}", url, v);
+        log::info!("Sending legacy metadata-only clipboard audit to {}", url);
         let url_clone = url.clone();
         tokio::spawn(async move {
             match Self::post_audit_async(url, v).await {
@@ -1508,8 +2142,126 @@ impl Connection {
         });
     }
 
-    // 호스트에서 실제 붙여넣기(Ctrl+V / Shift+Insert)가 일어났는지 키 입력으로 감지해,
-    // 직전에 컨트롤러로부터 받은 클립보드를 "수신(client_to_host)" audit으로 기록한다.
+    fn post_enterprise_clipboard_audit(
+        &self,
+        info: &Value,
+        action: EnterpriseClipboardAction,
+        context: &AuditContext,
+    ) {
+        let audit_base = if self.server_audit_clipboard.trim().is_empty() {
+            self.server_audit_conn
+                .trim_end_matches("/api/audit/conn")
+                .trim_end_matches('/')
+        } else {
+            self.server_audit_clipboard
+                .trim_end_matches("/api/audit/clipboard")
+                .trim_end_matches('/')
+        };
+        if audit_base.is_empty() {
+            log::warn!("Audit URL is empty, dropping verified clipboard event");
+            return;
+        }
+
+        let Some(direction) = Self::enterprise_clipboard_direction(info) else {
+            log::warn!("Unknown clipboard audit direction; verified event was not queued");
+            return;
+        };
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let classification = Self::enterprise_clipboard_classification(info);
+        let size_bytes = info
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .or_else(|| info.get("total_size").and_then(Value::as_u64))
+            .unwrap_or(0);
+        let item_count = info
+            .get("item_count")
+            .and_then(Value::as_u64)
+            .or_else(|| info.get("items").and_then(Value::as_u64))
+            .or_else(|| info.get("file_count").and_then(Value::as_u64))
+            .unwrap_or(0)
+            .min(100_000);
+        let url = format!("{audit_base}/api/audit/v2/clipboard");
+        let payload = json!({
+            "ticket": context.connection_ticket,
+            "source_connection_id": context.source_connection_id,
+            "event_id": event_id,
+            "operation_id": format!("clipboard:{event_id}"),
+            "action": action.as_api_str(),
+            "status": "OBSERVED",
+            "reporter_rid": Config::get_id(),
+            "reporter_uuid": crate::encode64(hbb_common::get_uuid()),
+            "controller_rid": self.lr.my_id,
+            "direction": direction,
+            "content_type": classification.content_type,
+            "source_application": classification.source_application,
+            "size_bytes": size_bytes,
+            "item_count": item_count,
+            "occurred_at": chrono::Utc::now().to_rfc3339(),
+        });
+        log::info!(
+            "Queue verified clipboard audit action={} direction={} type={} source_connection_id={}",
+            action.as_api_str(),
+            direction,
+            classification.content_type,
+            context.source_connection_id
+        );
+        allow_err!(self.tx_post_seq.send((url, payload)));
+    }
+
+    fn enterprise_clipboard_direction(info: &Value) -> Option<&'static str> {
+        match info.get("direction").and_then(Value::as_str) {
+            Some("host_to_client") => Some("HOST_TO_CONTROLLER"),
+            Some("client_to_host") => Some("CONTROLLER_TO_HOST"),
+            _ => None,
+        }
+    }
+
+    fn enterprise_clipboard_content_type(info: &Value) -> &'static str {
+        match info.get("kind").and_then(Value::as_str) {
+            Some("mixed") => "MIXED",
+            Some("image") => "IMAGE",
+            Some("file") => "FILES",
+            Some("text") => {
+                let formats = info.get("formats").and_then(Value::as_array);
+                if formats.map_or(false, |values| {
+                    values.iter().any(|value| value.as_str() == Some("html"))
+                }) {
+                    "HTML"
+                } else if formats.map_or(false, |values| {
+                    values.iter().any(|value| value.as_str() == Some("rtf"))
+                }) {
+                    "RTF"
+                } else {
+                    "TEXT"
+                }
+            }
+            _ => "OTHER",
+        }
+    }
+
+    fn enterprise_clipboard_source_application(info: &Value) -> &'static str {
+        match info.get("source_application").and_then(Value::as_str) {
+            Some("EXCEL") => "EXCEL",
+            Some("POWERPOINT") => "POWERPOINT",
+            Some("WORD") => "WORD",
+            Some("BROWSER") => "BROWSER",
+            Some("FILE_MANAGER") => "FILE_MANAGER",
+            Some("IMAGE_EDITOR") => "IMAGE_EDITOR",
+            Some("PDF_VIEWER") => "PDF_VIEWER",
+            Some("OTHER") => "OTHER",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn enterprise_clipboard_classification(info: &Value) -> EnterpriseClipboardClassification {
+        EnterpriseClipboardClassification {
+            content_type: Self::enterprise_clipboard_content_type(info),
+            source_application: Self::enterprise_clipboard_source_application(info),
+        }
+    }
+
+    // 호스트에 붙여넣기 키(Ctrl+V / Shift+Insert)가 요청됐는지 감지해,
+    // 직전에 컨트롤러로부터 받은 클립보드를 PASTE_REQUESTED audit으로 기록한다.
     // 멀티세션 자동 중계로 받은 클립보드는 붙여넣기 전에는 기록되지 않으므로 유령
     // 기록을 막으면서, 실제 붙여넣기는 정확히 캡처한다.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1529,14 +2281,6 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn detect_and_audit_paste(&mut self, me: &KeyEvent) {
-        if !self.clipboard || self.last_clipboard_audit_for_paste.is_none() {
-            return;
-        }
-        // 키 업 이벤트는 붙여넣기 판별에서 제외.
-        if !me.down && !me.press {
-            return;
-        }
-
         let rdev_key = Self::key_event_rdev_key(me);
         let is_v = match me.mode.enum_value() {
             Ok(KeyboardMode::Legacy) => matches!(
@@ -1562,6 +2306,45 @@ impl Connection {
                     )
             }
         };
+
+        let trigger_key = if is_v {
+            Some(PasteTriggerKey::V)
+        } else if is_insert {
+            Some(PasteTriggerKey::Insert)
+        } else {
+            None
+        };
+        let Some(trigger_key) = trigger_key else {
+            return;
+        };
+
+        // Update the edge state before clipboard/cache checks. A key-up must
+        // always clear a latched V/Insert even while clipboard sync is disabled
+        // or no auditable clipboard metadata is cached.
+        if !self
+            .paste_trigger_edge_state
+            .observe(trigger_key, me.down, me.press)
+        {
+            return;
+        }
+
+        if !self.clipboard || self.last_clipboard_audit_for_paste.is_none() {
+            return;
+        }
+        // Do not attribute a much later paste request to stale clipboard
+        // metadata from this connection. Cross-session clipboard provenance
+        // requires a future host-wide generation marker, so fail closed once
+        // this short observation window expires.
+        const CLIPBOARD_PASTE_AUDIT_TTL: Duration = Duration::from_secs(120);
+        if self
+            .last_clipboard_audit_for_paste
+            .as_ref()
+            .map(|(observed_at, _)| observed_at.elapsed() > CLIPBOARD_PASTE_AUDIT_TTL)
+            .unwrap_or(true)
+        {
+            self.last_clipboard_audit_for_paste = None;
+            return;
+        }
 
         let ctrl_held = self
             .pressed_modifiers
@@ -1591,17 +2374,8 @@ impl Connection {
             return;
         }
 
-        // 키 auto-repeat로 인한 중복 기록 방지(디바운스).
-        let now = Instant::now();
-        if let Some(last) = self.last_paste_audit_at {
-            if now.duration_since(last) < Duration::from_millis(1000) {
-                return;
-            }
-        }
-        self.last_paste_audit_at = Some(now);
-
-        if let Some(info) = self.last_clipboard_audit_for_paste.clone() {
-            self.post_clipboard_audit(info);
+        if let Some((_, info)) = self.last_clipboard_audit_for_paste.clone() {
+            self.post_clipboard_audit(info, EnterpriseClipboardAction::Pasted);
         }
     }
 
@@ -1636,7 +2410,18 @@ impl Connection {
 
     #[inline]
     async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        crate::post_request(url, v.to_string(), "").await
+        if url.ends_with("/api/audit/v2/connection")
+            || url.ends_with("/api/audit/v2/file")
+            || url.ends_with("/api/audit/v2/clipboard")
+        {
+            return crate::common::post_request_checked(url, v.to_string(), "").await;
+        }
+        let access_token = LocalConfig::get_option("access_token");
+        if access_token.trim().is_empty() {
+            bail!("Audit access token is missing; sign in on this device again");
+        }
+        let authorization = format!("Authorization: Bearer {}", access_token.trim());
+        crate::common::post_request_checked(url, v.to_string(), &authorization).await
     }
 
     async fn send_logon_response(&mut self) {
@@ -1704,6 +2489,14 @@ impl Connection {
             .unwrap()
             .get(&self.session_key())
             .map(|s| s.last_recv_time.clone());
+        if self.lr.audit_context.as_ref().map_or(true, |context| {
+            context.connection_ticket.is_empty() || context.source_connection_id.is_empty()
+        }) {
+            self.post_conn_audit(json!({
+                "ip": self.ip,
+                "action": "new",
+            }));
+        }
         self.post_conn_audit(
             json!({"peer": ((&self.lr.my_id, &self.lr.my_name)), "type": conn_type}),
         );
@@ -2019,6 +2812,85 @@ impl Connection {
             && !self.terminal
     }
 
+    #[cfg(windows)]
+    fn ensure_direct_file_transfer_allowed(&self) -> ResultType<()> {
+        if !self.authorized || !self.is_remote() {
+            bail!("direct transfer requires an authorized REMOTE connection");
+        }
+        if !self.file_transfer_enabled() {
+            bail!("file transfer permission is disabled");
+        }
+        if crate::get_builtin_option(keys::OPTION_ONE_WAY_FILE_TRANSFER) == "Y" {
+            bail!("host-to-controller file transfer is disabled by one-way policy");
+        }
+        if !self.lr.supports_direct_file_receive {
+            bail!("controller does not advertise direct file receive capability");
+        }
+        let context = self
+            .lr
+            .audit_context
+            .as_ref()
+            .ok_or_else(|| anyhow!("verified audit context is required"))?;
+        if context.protocol_version == 0
+            || context.connection_ticket.trim().is_empty()
+            || context.source_connection_id.trim().is_empty()
+        {
+            bail!("verified audit context is incomplete");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn start_direct_file_transfer(&mut self, source_path: String) -> ResultType<()> {
+        self.ensure_direct_file_transfer_allowed()?;
+        let source = PathBuf::from(source_path);
+        if !source.is_absolute() {
+            bail!("direct transfer source must be absolute");
+        }
+
+        let walk_source = source.clone();
+        let manifest = hbb_common::tokio::task::spawn_blocking(move || {
+            fs::get_direct_transfer_manifest(&walk_source)
+        })
+        .await
+        .map_err(|err| anyhow!("direct transfer manifest worker failed: {err}"))??;
+        let id = fs::get_next_direct_job_id();
+        if self.read_jobs.iter().any(|job| job.id() == id)
+            || self.pending_file_audits.contains_key(&id)
+        {
+            bail!("direct transfer job id collision");
+        }
+
+        let job = fs::TransferJob::new_direct_read(id, source, &manifest)?;
+        let request = fs::new_direct_receive(id, &manifest);
+        self.stream.send(&request).await?;
+
+        let audit_files = manifest
+            .files
+            .iter()
+            .map(|file| {
+                let name = if file.name.is_empty() {
+                    manifest.root_name.clone()
+                } else {
+                    file.name.clone()
+                };
+                (name, i64::try_from(file.size).unwrap_or(i64::MAX))
+            })
+            .collect::<Vec<_>>();
+        self.remember_enterprise_direct_download(id, &manifest.root_name, audit_files);
+        self.read_jobs.push(job);
+        self.file_timer = crate::rustdesk_interval(time::interval(MILLI1));
+        self.file_transferred = true;
+        log::info!(
+            "Started direct host-to-controller Downloads transfer job {} root={} files={} bytes={}",
+            id,
+            manifest.root_name,
+            manifest.files.len(),
+            manifest.total_size
+        );
+        Ok(())
+    }
+
     fn try_sub_monitor_services(&mut self) {
         let is_remote = self.is_remote();
         if is_remote && !self.services_subed {
@@ -2176,7 +3048,33 @@ impl Connection {
             && crate::get_builtin_option(keys::OPTION_ONE_WAY_FILE_TRANSFER) != "Y"
     }
 
+    fn direct_file_receive_ready_for_cm(
+        peer_capability: bool,
+        authorized: bool,
+        is_remote: bool,
+        one_way_policy_allows: bool,
+        audit_context: Option<&AuditContext>,
+    ) -> bool {
+        cfg!(windows)
+            && peer_capability
+            && authorized
+            && is_remote
+            && one_way_policy_allows
+            && audit_context.map_or(false, |context| {
+                context.protocol_version > 0
+                    && !context.connection_ticket.trim().is_empty()
+                    && !context.source_connection_id.trim().is_empty()
+            })
+    }
+
     fn try_start_cm(&mut self, peer_id: String, name: String, authorized: bool) {
+        let direct_file_receive_supported = Self::direct_file_receive_ready_for_cm(
+            self.lr.supports_direct_file_receive,
+            authorized,
+            self.is_remote(),
+            crate::get_builtin_option(keys::OPTION_ONE_WAY_FILE_TRANSFER) != "Y",
+            self.lr.audit_context.as_ref(),
+        );
         self.send_to_cm(ipc::Data::Login {
             id: self.inner.id(),
             is_file_transfer: self.file_transfer.is_some(),
@@ -2192,11 +3090,16 @@ impl Connection {
             audio: self.audio,
             file: self.file,
             file_transfer_enabled: self.file,
+            direct_file_receive_supported,
             restart: self.restart,
             recording: self.recording,
             block_input: self.block_input,
             from_switch: self.from_switch,
         });
+        #[cfg(windows)]
+        self.send_to_cm(ipc::Data::ClipboardFileEnabled(
+            self.file_transfer_enabled(),
+        ));
     }
 
     #[inline]
@@ -2913,27 +3816,6 @@ impl Connection {
                 return true;
             }
 
-            // https://github.com/rustdesk/rustdesk-server-pro/discussions/646
-            // `is_logon` is used to check login with `OPTION_ALLOW_LOGON_SCREEN_PASSWORD` == "Y".
-            // On Windows, `is_locked()` covers the normal locked-session case.
-            // `is_logon_ui()` remains as a fallback for the logon UI process.
-            #[cfg(target_os = "windows")]
-            let is_logon = || {
-                crate::platform::is_prelogin() || crate::platform::is_locked() || {
-                    match crate::platform::is_logon_ui() {
-                        Ok(result) => result,
-                        Err(e) => {
-                            log::error!("Failed to detect logon UI: {:?}", e);
-                            false
-                        }
-                    }
-                }
-            };
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let is_logon = || crate::platform::is_prelogin() || crate::platform::is_locked();
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            let is_logon = || crate::platform::is_prelogin();
-
             if !hbb_common::is_ip_str(&lr.username)
                 && !hbb_common::is_domain_port_str(&lr.username)
                 && lr.username != Config::get_id()
@@ -2952,12 +3834,11 @@ impl Connection {
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;
                 return false;
-            } else if (password::approve_mode() == ApproveMode::Click
-                && !(crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
-                    && is_logon()))
-                || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
-            {
-                let approve = format!("{:?}", password::approve_mode());
+            } else if password::requires_manual_approval(
+                password::approve_mode(),
+                password::has_valid_password(),
+            ) {
+                let approve = password::approve_mode().as_str();
                 self.log_access_audit(
                     "PENDING",
                     None,
@@ -3366,7 +4247,7 @@ impl Connection {
                             }
                         }
 
-                        // 호스트에서 실제 붙여넣기(Ctrl/⌘+V, Shift+Insert) 감지 후 audit.
+                        // 호스트 붙여넣기 요청(Ctrl/⌘+V, Shift+Insert) 감지 후 audit.
                         self.detect_and_audit_paste(&me);
 
                         if is_press {
@@ -3392,12 +4273,14 @@ impl Connection {
                         // pasted on this host. Cache it and log only on real paste.
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         {
-                            self.last_clipboard_audit_for_paste =
-                                Some(crate::clipboard_audit::summarize_multi_clipboards(
+                            self.last_clipboard_audit_for_paste = Some((
+                                Instant::now(),
+                                crate::clipboard_audit::summarize_multi_clipboards(
                                     crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
                                     std::slice::from_ref(&cb),
                                     &self.ip,
-                                ));
+                                ),
+                            ));
                         }
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Host);
@@ -3429,12 +4312,14 @@ impl Connection {
                     // Cache only; logged on real paste. See Clipboard branch above.
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.clipboard {
-                        self.last_clipboard_audit_for_paste =
-                            Some(crate::clipboard_audit::summarize_multi_clipboards(
+                        self.last_clipboard_audit_for_paste = Some((
+                            Instant::now(),
+                            crate::clipboard_audit::summarize_multi_clipboards(
                                 crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
                                 &_mcb.clipboards,
                                 &self.ip,
-                            ));
+                            ),
+                        ));
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.clipboard {
@@ -3486,11 +4371,20 @@ impl Connection {
                             .iter()
                             .map(|f| (f.name.clone(), f.size as i64))
                             .collect::<Vec<(String, i64)>>();
-                        self.post_clipboard_audit(crate::clipboard_audit::summarize_files(
-                            crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
-                            &files_audit,
-                            &self.ip,
-                        ));
+                        self.post_clipboard_audit(
+                            crate::clipboard_audit::summarize_files_with_source(
+                                crate::clipboard_audit::ClipboardAuditDirection::ClientToHost,
+                                &files_audit,
+                                files
+                                    .source_application
+                                    .enum_value()
+                                    .ok()
+                                    .map(crate::clipboard_audit::ClipboardSourceApplication::from_proto)
+                                    .unwrap_or(crate::clipboard_audit::ClipboardSourceApplication::Unknown),
+                                &self.ip,
+                            ),
+                            EnterpriseClipboardAction::Pasted,
+                        );
                         self.post_file_audit(
                             FileAuditType::RemoteReceive,
                             "",
@@ -3535,25 +4429,47 @@ impl Connection {
                                 );
                             }
 
+                            let mut clipboard_audit_after_send: Option<Value> = None;
+                            let mut sent_clipboard_response = false;
                             for msg in out_msgs.into_iter() {
                                 if let Some(message::Union::Cliprdr(cliprdr)) = msg.union.as_ref() {
                                     if let Some(cliprdr::Union::Files(files)) =
                                         cliprdr.union.as_ref()
                                     {
+                                        let files_audit = files
+                                            .files
+                                            .iter()
+                                            .map(|f| (f.name.clone(), f.size as i64))
+                                            .collect::<Vec<(String, i64)>>();
+                                        clipboard_audit_after_send = Some(
+                                            crate::clipboard_audit::summarize_files(
+                                                crate::clipboard_audit::ClipboardAuditDirection::HostToClient,
+                                                &files_audit,
+                                                &self.ip,
+                                            ),
+                                        );
                                         self.post_file_audit(
                                             FileAuditType::RemoteSend,
                                             "",
-                                            files
-                                                .files
-                                                .iter()
-                                                .map(|f| (f.name.clone(), f.size as i64))
-                                                .collect::<Vec<(String, i64)>>(),
+                                            files_audit,
                                             json!({}),
                                         );
                                         continue;
                                     }
                                 }
-                                self.send(msg).await;
+                                if let Err(err) = self.stream.send(&msg).await {
+                                    log::error!("Failed to send Unix clipboard response: {}", err);
+                                } else {
+                                    sent_clipboard_response = true;
+                                }
+                            }
+                            if sent_clipboard_response {
+                                if let Some(info) = clipboard_audit_after_send {
+                                    self.post_clipboard_audit(
+                                        info,
+                                        EnterpriseClipboardAction::Synced,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3698,14 +4614,23 @@ impl Connection {
                                         self.read_jobs.push(job);
                                         self.file_timer =
                                             crate::rustdesk_interval(time::interval(MILLI1));
+                                        let audit_path = if job_type == fs::JobType::Printer {
+                                            "Remote print"
+                                        } else {
+                                            &s.path
+                                        };
+                                        let audit_files =
+                                            Self::get_files_for_audit(job_type, files);
+                                        self.remember_enterprise_file_transfer(
+                                            id,
+                                            EnterpriseFileDirection::Download,
+                                            audit_path,
+                                            audit_files.clone(),
+                                        );
                                         self.post_file_audit(
                                             FileAuditType::RemoteSend,
-                                            if job_type == fs::JobType::Printer {
-                                                "Remote print"
-                                            } else {
-                                                &s.path
-                                            },
-                                            Self::get_files_for_audit(job_type, files),
+                                            audit_path,
+                                            audit_files,
                                             json!({}),
                                         );
                                     }
@@ -3736,10 +4661,20 @@ impl Connection {
                                     total_size: r.total_size,
                                     conn_id: self.inner.id(),
                                 });
+                                let audit_files = Self::get_files_for_audit(
+                                    fs::JobType::Generic,
+                                    r.files.clone(),
+                                );
+                                self.remember_enterprise_file_transfer(
+                                    r.id,
+                                    EnterpriseFileDirection::Upload,
+                                    &r.path,
+                                    audit_files.clone(),
+                                );
                                 self.post_file_audit(
                                     FileAuditType::RemoteReceive,
                                     &r.path,
-                                    Self::get_files_for_audit(fs::JobType::Generic, r.files),
+                                    audit_files,
                                     json!({}),
                                 );
                                 self.file_transferred = true;
@@ -3795,6 +4730,7 @@ impl Connection {
                                         fs::serialize_transfer_job(&job, false, true, ""),
                                     )));
                                 }
+                                self.post_enterprise_file_outcome(c.id, "CANCELLED");
                             }
                             Some(file_action::Union::SendConfirm(r)) => {
                                 if let Some(job) = fs::get_job(r.id, &mut self.read_jobs) {
@@ -3835,10 +4771,32 @@ impl Connection {
                         });
                     }
                     Some(file_response::Union::Done(d)) => {
-                        self.send_fs(ipc::FS::WriteDone {
-                            id: d.id,
-                            file_num: d.file_num,
-                        });
+                        let is_download_ack = self
+                            .pending_file_audits
+                            .get(&d.id)
+                            .map(|pending| {
+                                pending.direction == EnterpriseFileDirection::Download
+                                    && pending.source_finished
+                            })
+                            .unwrap_or(false);
+                        if is_download_ack {
+                            self.post_enterprise_file_outcome(d.id, "COMPLETED");
+                        } else if self
+                            .pending_file_audits
+                            .get(&d.id)
+                            .map(|pending| pending.direction == EnterpriseFileDirection::Download)
+                            .unwrap_or(false)
+                        {
+                            log::warn!(
+                                "Ignore premature download completion acknowledgement for job {}",
+                                d.id
+                            );
+                        } else {
+                            self.send_fs(ipc::FS::WriteDone {
+                                id: d.id,
+                                file_num: d.file_num,
+                            });
+                        }
                     }
                     Some(file_response::Union::Digest(d)) => self.send_fs(ipc::FS::CheckDigest {
                         id: d.id,
@@ -3849,11 +4807,21 @@ impl Connection {
                         is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
-                        self.send_fs(ipc::FS::WriteError {
-                            id: e.id,
-                            file_num: e.file_num,
-                            err: e.error,
-                        });
+                        let is_download_ack = self
+                            .pending_file_audits
+                            .get(&e.id)
+                            .map(|pending| pending.direction == EnterpriseFileDirection::Download)
+                            .unwrap_or(false);
+                        if is_download_ack {
+                            let _ = fs::remove_job(e.id, &mut self.read_jobs);
+                            self.post_enterprise_file_outcome(e.id, "FAILED");
+                        } else {
+                            self.send_fs(ipc::FS::WriteError {
+                                id: e.id,
+                                file_num: e.file_num,
+                                err: e.error,
+                            });
+                        }
                     }
                     _ => {}
                 },
@@ -5666,6 +6634,422 @@ pub enum AlarmAuditType {
 pub enum FileAuditType {
     RemoteSend = 0,
     RemoteReceive = 1,
+}
+
+#[derive(Debug, Serialize)]
+struct EnterpriseClipboardClassification {
+    content_type: &'static str,
+    source_application: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnterpriseClipboardAction {
+    /// Clipboard metadata was written to the remote session transport. The
+    /// receiving OS does not provide an application acknowledgement.
+    Synced,
+    /// A controller-to-host clipboard was followed by a paste input request.
+    Pasted,
+}
+
+impl EnterpriseClipboardAction {
+    fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Synced => "SYNC_SENT",
+            Self::Pasted => "PASTE_REQUESTED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnterpriseFileDirection {
+    /// The logged-in controller sends a file to the controlled host.
+    Upload,
+    /// The logged-in controller receives a file from the controlled host.
+    Download,
+}
+
+impl EnterpriseFileDirection {
+    fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Upload => "UPLOAD",
+            Self::Download => "DOWNLOAD",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnterpriseFileTransferMode {
+    /// A dedicated file-manager connection.
+    FileManager,
+    /// A controller-to-host drop embedded in a remote-control connection.
+    RemoteDrop,
+    /// A controlled-host initiated push into the controller's Downloads.
+    RemoteDirectDownload,
+}
+
+impl EnterpriseFileTransferMode {
+    fn as_api_str(self) -> &'static str {
+        match self {
+            Self::FileManager => "FILE_MANAGER",
+            Self::RemoteDrop => "REMOTE_DROP",
+            Self::RemoteDirectDownload => "REMOTE_DIRECT_DOWNLOAD",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingFileAudit {
+    transfer_id: String,
+    direction: EnterpriseFileDirection,
+    transfer_mode: EnterpriseFileTransferMode,
+    path: String,
+    files: Vec<(String, i64)>,
+    source_finished: bool,
+}
+
+#[cfg(test)]
+mod enterprise_file_audit_tests {
+    use super::{Connection, EnterpriseFileDirection, EnterpriseFileTransferMode};
+    use hbb_common::{fs, message_proto::AuditContext, protobuf::Message as _};
+
+    #[test]
+    fn cm_direct_receive_capability_requires_verified_remote_audit_context() {
+        let valid = AuditContext {
+            protocol_version: 1,
+            source_connection_id: "source-connection".to_owned(),
+            connection_ticket: "opaque-ticket".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            Connection::direct_file_receive_ready_for_cm(true, true, true, true, Some(&valid)),
+            cfg!(windows)
+        );
+
+        let invalid_contexts = [
+            None,
+            Some(AuditContext {
+                protocol_version: 0,
+                ..valid.clone()
+            }),
+            Some(AuditContext {
+                connection_ticket: " ".to_owned(),
+                ..valid.clone()
+            }),
+            Some(AuditContext {
+                source_connection_id: String::new(),
+                ..valid.clone()
+            }),
+        ];
+        for context in &invalid_contexts {
+            assert!(!Connection::direct_file_receive_ready_for_cm(
+                true,
+                true,
+                true,
+                true,
+                context.as_ref()
+            ));
+        }
+        assert!(!Connection::direct_file_receive_ready_for_cm(
+            false,
+            true,
+            true,
+            true,
+            Some(&valid)
+        ));
+        assert!(!Connection::direct_file_receive_ready_for_cm(
+            true,
+            false,
+            true,
+            true,
+            Some(&valid)
+        ));
+        assert!(!Connection::direct_file_receive_ready_for_cm(
+            true,
+            true,
+            false,
+            true,
+            Some(&valid)
+        ));
+        assert!(!Connection::direct_file_receive_ready_for_cm(
+            true,
+            true,
+            true,
+            false,
+            Some(&valid)
+        ));
+    }
+
+    #[test]
+    fn normalizes_empty_name_and_negative_size() {
+        let files = Connection::normalized_audit_files(
+            r"C:\Users\operator\Downloads\report.pdf",
+            vec![(String::new(), -10)],
+        );
+
+        assert_eq!(files, vec![("report.pdf".to_owned(), 0)]);
+    }
+
+    #[test]
+    fn creates_a_nonempty_fallback_for_empty_file_lists() {
+        let files = Connection::normalized_audit_files("", Vec::new());
+
+        assert_eq!(files, vec![("transferred-file".to_owned(), 0)]);
+
+        let empty_folder = Connection::normalized_audit_files("selected-empty-folder", Vec::new());
+        assert_eq!(empty_folder, vec![("selected-empty-folder".to_owned(), 0)]);
+    }
+
+    #[test]
+    fn direct_download_audit_keeps_only_utf16_bounded_basenames() {
+        let long_emoji_name = format!("{}.xlsx", "📊".repeat(140));
+        let files = Connection::normalized_direct_download_audit_files(
+            "selected-folder",
+            vec![(format!("private/deep/{long_emoji_name}"), 42)],
+        );
+
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].0.contains('/'));
+        assert!(!files[0].0.contains('\\'));
+        assert!(files[0].0.encode_utf16().count() <= 255);
+        assert_eq!(files[0].1, 42);
+
+        let empty_folder =
+            Connection::normalized_direct_download_audit_files("selected-empty-folder", Vec::new());
+        assert_eq!(empty_folder, vec![("selected-empty-folder".to_owned(), 0)]);
+    }
+
+    #[test]
+    fn api_direction_is_from_the_logged_in_controller_perspective() {
+        assert_eq!(EnterpriseFileDirection::Upload.as_api_str(), "UPLOAD");
+        assert_eq!(EnterpriseFileDirection::Download.as_api_str(), "DOWNLOAD");
+    }
+
+    #[test]
+    fn permits_only_file_manager_or_controller_to_host_remote_drop() {
+        let file_manager_upload = Connection::enterprise_file_transfer_mode_for(
+            true,
+            false,
+            EnterpriseFileDirection::Upload,
+            r"C:\remote\destination",
+        );
+        let file_manager_download = Connection::enterprise_file_transfer_mode_for(
+            true,
+            false,
+            EnterpriseFileDirection::Download,
+            r"C:\remote\source",
+        );
+        let remote_drop_upload = Connection::enterprise_file_transfer_mode_for(
+            false,
+            true,
+            EnterpriseFileDirection::Upload,
+            "mdesk-drop-downloads:report.xlsx",
+        );
+
+        assert_eq!(
+            file_manager_upload,
+            Some(EnterpriseFileTransferMode::FileManager)
+        );
+        assert_eq!(
+            file_manager_download,
+            Some(EnterpriseFileTransferMode::FileManager)
+        );
+        assert_eq!(
+            remote_drop_upload,
+            Some(EnterpriseFileTransferMode::RemoteDrop)
+        );
+
+        for (is_remote, direction, path) in [
+            (true, EnterpriseFileDirection::Upload, r"C:\remote\folder"),
+            (
+                true,
+                EnterpriseFileDirection::Download,
+                "mdesk-drop-downloads:report.xlsx",
+            ),
+            (
+                false,
+                EnterpriseFileDirection::Upload,
+                "mdesk-drop-downloads:report.xlsx",
+            ),
+        ] {
+            assert_eq!(
+                Connection::enterprise_file_transfer_mode_for(false, is_remote, direction, path),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn remote_drop_uses_a_privacy_safe_audit_path() {
+        assert_eq!(
+            Connection::enterprise_file_audit_path(
+                EnterpriseFileTransferMode::RemoteDrop,
+                "mdesk-drop-downloads:private%20report.xlsx",
+            ),
+            "Downloads"
+        );
+        assert_eq!(
+            Connection::enterprise_file_audit_path(
+                EnterpriseFileTransferMode::FileManager,
+                r"C:\remote\destination",
+            ),
+            r"C:\remote\destination"
+        );
+        assert_eq!(
+            EnterpriseFileTransferMode::FileManager.as_api_str(),
+            "FILE_MANAGER"
+        );
+        assert_eq!(
+            EnterpriseFileTransferMode::RemoteDrop.as_api_str(),
+            "REMOTE_DROP"
+        );
+        assert_eq!(
+            Connection::enterprise_file_audit_path(
+                EnterpriseFileTransferMode::RemoteDirectDownload,
+                r"C:\must-not-leak\private.txt",
+            ),
+            "Downloads"
+        );
+        assert_eq!(
+            EnterpriseFileTransferMode::RemoteDirectDownload.as_api_str(),
+            "REMOTE_DIRECT_DOWNLOAD"
+        );
+    }
+
+    #[test]
+    fn remote_drop_recovers_only_a_valid_decoded_fallback_file_name() {
+        let sentinel = "mdesk-drop-downloads:%ED%95%9C%EA%B8%80%20report%20final.xlsx";
+        let fallback_path = Connection::enterprise_file_normalization_path(
+            EnterpriseFileTransferMode::RemoteDrop,
+            sentinel,
+        );
+        let files =
+            Connection::normalized_audit_files(&fallback_path, vec![(String::new(), 1_024)]);
+
+        assert_eq!(fallback_path, "한글 report final.xlsx");
+        assert_eq!(files, vec![("한글 report final.xlsx".to_owned(), 1_024)]);
+        assert!(!fallback_path.contains("mdesk-drop-downloads:"));
+        assert!(!fallback_path.contains(r"C:\Users"));
+    }
+
+    #[test]
+    fn invalid_remote_drop_fallback_never_exposes_a_sentinel_or_absolute_path() {
+        for invalid in [
+            "mdesk-drop-downloads:",
+            r"mdesk-drop-downloads:C:\Users\operator\secret.xlsx",
+            "mdesk-drop-downloads:folder/%5Csecret.xlsx",
+        ] {
+            let fallback_path = Connection::enterprise_file_normalization_path(
+                EnterpriseFileTransferMode::RemoteDrop,
+                invalid,
+            );
+            let files =
+                Connection::normalized_audit_files(&fallback_path, vec![(String::new(), 7)]);
+
+            assert!(fallback_path.is_empty());
+            assert_eq!(files, vec![("transferred-file".to_owned(), 7)]);
+            assert!(!files[0].0.contains("mdesk-drop-downloads:"));
+            assert!(!files[0].0.contains(r"C:\Users"));
+        }
+    }
+
+    #[test]
+    fn recognizes_only_terminal_file_responses() {
+        let done = fs::new_done(41, 0).write_to_bytes().unwrap();
+        let failed = fs::new_error(42, "disk full", 0).write_to_bytes().unwrap();
+        let unrelated = hbb_common::message_proto::Message::new()
+            .write_to_bytes()
+            .unwrap();
+
+        assert_eq!(
+            Connection::enterprise_file_terminal_outcome(&done),
+            Some((41, "COMPLETED"))
+        );
+        assert_eq!(
+            Connection::enterprise_file_terminal_outcome(&failed),
+            Some((42, "FAILED"))
+        );
+        assert_eq!(
+            Connection::enterprise_file_terminal_outcome(&unrelated),
+            None
+        );
+        assert_eq!(
+            Connection::enterprise_file_terminal_outcome(b"not protobuf"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod enterprise_clipboard_audit_tests {
+    use super::{Connection, EnterpriseClipboardAction};
+    use serde_json::json;
+
+    #[test]
+    fn maps_legacy_directions_to_controller_perspective() {
+        assert_eq!(
+            Connection::enterprise_clipboard_direction(&json!({
+                "direction": "host_to_client"
+            })),
+            Some("HOST_TO_CONTROLLER")
+        );
+        assert_eq!(
+            Connection::enterprise_clipboard_direction(&json!({
+                "direction": "client_to_host"
+            })),
+            Some("CONTROLLER_TO_HOST")
+        );
+    }
+
+    #[test]
+    fn maps_content_without_exposing_payload_fields() {
+        assert_eq!(
+            Connection::enterprise_clipboard_content_type(&json!({
+                "kind": "text",
+                "formats": ["text", "html"]
+            })),
+            "HTML"
+        );
+        assert_eq!(
+            Connection::enterprise_clipboard_content_type(&json!({ "kind": "image" })),
+            "IMAGE"
+        );
+        assert_eq!(
+            Connection::enterprise_clipboard_content_type(&json!({ "kind": "file" })),
+            "FILES"
+        );
+        assert_eq!(
+            Connection::enterprise_clipboard_content_type(&json!({ "kind": "mixed" })),
+            "MIXED"
+        );
+    }
+
+    #[test]
+    fn serializes_source_application_separately_from_content_type() {
+        let classification = Connection::enterprise_clipboard_classification(&json!({
+            "kind": "mixed",
+            "source_application": "EXCEL"
+        }));
+        let serialized = serde_json::to_value(classification).unwrap();
+
+        assert_eq!(serialized["content_type"], "MIXED");
+        assert_eq!(serialized["source_application"], "EXCEL");
+        assert_eq!(serialized.as_object().unwrap().len(), 2);
+
+        let untrusted = Connection::enterprise_clipboard_classification(&json!({
+            "kind": "text",
+            "source_application": "excel.exe"
+        }));
+        assert_eq!(untrusted.source_application, "UNKNOWN");
+    }
+
+    #[test]
+    fn action_names_describe_only_what_the_host_observed() {
+        assert_eq!(EnterpriseClipboardAction::Synced.as_api_str(), "SYNC_SENT");
+        assert_eq!(
+            EnterpriseClipboardAction::Pasted.as_api_str(),
+            "PASTE_REQUESTED"
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]

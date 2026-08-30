@@ -1,0 +1,53 @@
+[2026-08-16 00:46:50.906279 +09:00] INFO [src\main.rs:508] [MDeskMini][log.ready] diagnostic_log=D:\IMedix\Rust\rustdesk\MDeskMini\target\win7-x86\MDeskMini_diagnostic.log internal_file_logger_ready=true max_level=Debug
+[2026-08-16 00:46:50.908686 +09:00] INFO [src\main.rs:508] [MDeskMini][process.start] version=1.5.2 pid=34672 arch=x86 mode=serve
+[2026-08-16 00:46:50.908908 +09:00] INFO [src\main.rs:508] [MDeskMini][process.dpi.begin] configuring DPI awareness
+[2026-08-16 00:46:50.909791 +09:00] INFO [src\main.rs:508] [MDeskMini][process.dpi.complete] DPI awareness configured
+[2026-08-16 00:46:50.910100 +09:00] INFO [src\main.rs:508] [MDeskMini][serve.begin] headless=false approve_mode=click api_configured=true password_configured=false
+[2026-08-16 00:46:50.947226 +09:00] INFO [src\main.rs:508] [MDeskMini][ui.waiting_window] created
+[2026-08-16 00:46:50.947613 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=5 title=MDesk 준비중 message=프로그램을 초기화하고 있습니다.
+[2026-08-16 00:46:50.952954 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.global_init.begin] starting global initialization
+[2026-08-16 00:46:50.953061 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\hbb_common\src\config.rs:944] [Config] Loading config file: C:\Users\owner\AppData\Roaming\MDesk\config\MDesk.toml
+[2026-08-16 00:46:50.953352 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\hbb_common\src\config.rs:946] [Config] File exists: true
+[2026-08-16 00:46:50.962212 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\hbb_common\src\config.rs:950] [Config] Config loaded successfully from: C:\Users\owner\AppData\Roaming\MDesk\config\MDesk.toml
+[2026-08-16 00:46:51.427677 +09:00] WARN [D:\IMedix\Rust\rustdesk\src\platform\windows.rs:2203] Failed to add outbound TCP firewall rule: 
+[2026-08-16 00:46:51.427723 +09:00] WARN [D:\IMedix\Rust\rustdesk\src\platform\windows.rs:2210] Failed to add outbound UDP firewall rule: 
+[2026-08-16 00:46:51.427732 +09:00] WARN [D:\IMedix\Rust\rustdesk\src\platform\windows.rs:2217] Failed to add inbound TCP firewall rule: 
+[2026-08-16 00:46:51.427738 +09:00] WARN [D:\IMedix\Rust\rustdesk\src\platform\windows.rs:2224] Failed to add inbound UDP firewall rule: 
+[2026-08-16 00:46:51.427751 +09:00] WARN [D:\IMedix\Rust\rustdesk\src\platform\windows.rs:2230] Failed to add firewall rules: outbound TCP, outbound UDP, inbound TCP, inbound UDP (may need administrator privileges). Path: D:\IMedix\Rust\rustdesk\MDeskMini\target\win7-x86\MDeskMini-Win7-x86.exe
+[2026-08-16 00:46:51.428087 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.global_init.complete] global initialization completed
+[2026-08-16 00:46:51.428328 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.custom_client.begin] loading custom client settings
+[2026-08-16 00:46:51.428584 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.custom_client.complete] custom client settings loaded
+[2026-08-16 00:46:51.428876 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.defaults.complete] product defaults applied
+[2026-08-16 00:46:51.429029 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\hbb_common\src\config.rs:944] [Config] Loading config file: C:\Users\owner\AppData\Roaming\MDesk\config\MDesk2.toml
+[2026-08-16 00:46:51.429153 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\hbb_common\src\config.rs:946] [Config] File exists: true
+[2026-08-16 00:46:51.435522 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\hbb_common\src\config.rs:950] [Config] Config loaded successfully from: C:\Users\owner\AppData\Roaming\MDesk\config\MDesk2.toml
+[2026-08-16 00:46:51.436765 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.windows_bootstrap.complete] Windows bootstrap completed
+[2026-08-16 00:46:51.437100 +09:00] INFO [src\main.rs:508] [MDeskMini][runtime.ready] local_peer_id=5270854
+[2026-08-16 00:46:51.437685 +09:00] INFO [src\main.rs:508] [MDeskMini][installed_mdesk.not_found] continuing in portable host mode
+[2026-08-16 00:46:51.439923 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=30 title=MDesk 준비중 message=원격 접속 정책을 적용하고 있습니다.
+[2026-08-16 00:46:51.446233 +09:00] INFO [src\main.rs:508] [MDeskMini][policy.applied] host acceptance policy applied
+[2026-08-16 00:46:51.446587 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=45 title=MDesk 준비중 message=인증번호를 확인하고 있습니다.
+[2026-08-16 00:46:51.450786 +09:00] INFO [src\main.rs:508] [MDeskMini][cert.clipboard.begin] checking clipboard for certificate number
+[2026-08-16 00:46:51.454169 +09:00] INFO [src\main.rs:508] [MDeskMini][cert.clipboard.empty] certificate number was not found
+[2026-08-16 00:46:51.454451 +09:00] INFO [src\main.rs:508] [MDeskMini][cert.not_available] no verified clipboard certificate session
+[2026-08-16 00:46:51.454725 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=60 title=MDesk 준비중 message=원격 연결 허용 상태를 준비하고 있습니다.
+[2026-08-16 00:46:51.458480 +09:00] INFO [src\main.rs:508] [MDeskMini][host.accepting] host accepting mode is enabled
+[2026-08-16 00:46:51.458977 +09:00] INFO [src\main.rs:508] [MDeskMini][portable_service.start] requesting quick-support SYSTEM service
+[2026-08-16 00:46:51.459007 +09:00] INFO [D:\IMedix\Rust\rustdesk\src\server\portable_service.rs:548] start portable service
+[2026-08-16 00:46:51.734966 +09:00] INFO [D:\IMedix\Rust\rustdesk\src\server\portable_service.rs:94] Create shared memory, size: 15073344, flink: C:\ProgramData\MDesk\shared_memory_portable_service
+[2026-08-16 00:46:51.822501 +09:00] INFO [D:\IMedix\Rust\rustdesk\src\ipc.rs:346] Started ipc_portable_service server at path: \\.\pipe\MDesk\query_portable_service
+[2026-08-16 00:46:52.760650 +09:00] INFO [D:\IMedix\Rust\rustdesk\src\server\portable_service.rs:789] Got portable service ipc connection
+[2026-08-16 00:46:52.825773 +09:00] INFO [src\main.rs:508] [MDeskMini][portable_service.detected] elapsed_ms=1004
+[2026-08-16 00:46:52.826453 +09:00] INFO [src\main.rs:508] [MDeskMini][portable_service.ready] SYSTEM portable service is ready
+[2026-08-16 00:46:52.827371 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=72 title=MDesk 준비중 message=연결 관리자를 시작하고 있습니다.
+[2026-08-16 00:46:52.832932 +09:00] INFO [src\main.rs:508] [MDeskMini][connection_manager.ready] connection manager initialized
+[2026-08-16 00:46:52.832915 +09:00] INFO [D:\IMedix\Rust\rustdesk\libs\clipboard\src\context_send.rs:41] clipboard context for file transfer created.
+[2026-08-16 00:46:52.833290 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=82 title=MDesk 준비중 message=작업 표시줄 아이콘을 준비하고 있습니다.
+[2026-08-16 00:46:52.834336 +09:00] INFO [D:\IMedix\Rust\rustdesk\src\ipc.rs:346] Started ipc_cm server at path: \\.\pipe\MDesk\query_cm
+[2026-08-16 00:46:52.859602 +09:00] INFO [src\main.rs:508] [MDeskMini][tray.ready] tray icon created
+[2026-08-16 00:46:52.860007 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=92 title=MDesk 준비중 message=원격 서버를 시작하고 있습니다.
+[2026-08-16 00:46:52.864260 +09:00] INFO [src\main.rs:508] [MDeskMini][server.spawn] starting host server thread
+[2026-08-16 00:46:52.864713 +09:00] INFO [src\main.rs:508] [MDeskMini][startup.progress] percent=100 title=MDesk 원격대기중 message=원격 연결 요청을 기다리는 중입니다.
+[2026-08-16 00:46:52.865095 +09:00] INFO [src\main.rs:508] [MDeskMini][server.thread.begin] host server thread entered
+[2026-08-16 00:46:52.866619 +09:00] ERROR [D:\IMedix\Rust\rustdesk\src\ipc.rs:356] Failed to start ipc server at path \\.\pipe\MDesk\query: 액세스가 거부되었습니다. (os error 5)
+[2026-08-16 00:46:52.867321 +09:00] ERROR [D:\IMedix\Rust\rustdesk\src\server.rs:556] Failed to start ipc: 액세스가 거부되었습니다. (os error 5)

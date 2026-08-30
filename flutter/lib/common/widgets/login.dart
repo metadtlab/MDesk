@@ -457,12 +457,10 @@ Future<bool?> loginDialog() async {
       switch (resp.type) {
         case HttpType.kAuthResTypeToken:
           if (resp.access_token != null) {
-            if (storeIfAccessToken) {
-              await bind.mainSetLocalOption(
-                  key: 'access_token', value: resp.access_token!);
-              await bind.mainSetLocalOption(
-                  key: 'user_info', value: jsonEncode(resp.user ?? {}));
-            }
+            await gFFI.userModel.applyLoginResponse(
+              resp,
+              storeSession: storeIfAccessToken,
+            );
             if (close != null) {
               close(true);
             }
@@ -661,10 +659,10 @@ Future<bool?> mdesk2faVerifyDialog(String tfaKey,
       try {
         final resp = await gFFI.userModel.login2faVerify(tfaKey, code.text);
         if (resp.access_token != null && resp.user != null) {
-          await bind.mainSetLocalOption(
-              key: 'access_token', value: resp.access_token!);
-          await bind.mainSetLocalOption(
-              key: 'user_info', value: jsonEncode(resp.user!));
+          await gFFI.userModel.applyLoginResponse(
+            resp,
+            storeSession: true,
+          );
           close(true);
           return;
         }
@@ -755,8 +753,10 @@ Future<bool?> verificationCodeDialog(
         switch (resp.type) {
           case HttpType.kAuthResTypeToken:
             if (resp.access_token != null) {
-              await bind.mainSetLocalOption(
-                  key: 'access_token', value: resp.access_token!);
+              await gFFI.userModel.applyLoginResponse(
+                resp,
+                storeSession: true,
+              );
               close(true);
               return;
             }

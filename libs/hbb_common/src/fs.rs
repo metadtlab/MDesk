@@ -1,8 +1,10 @@
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 use std::{
+    collections::HashSet,
+    convert::TryFrom,
     fmt::{Debug, Display},
-    io::Cursor,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicI32, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,10 +25,77 @@ use crate::{
 };
 
 static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
+// Negative IDs are reserved for controlled-host initiated direct pushes. This
+// avoids colliding with the controller's ordinary positive file-manager jobs
+// on the same bidirectional stream.
+static NEXT_DIRECT_JOB_ID: AtomicI32 = AtomicI32::new(-1);
 pub const REMOTE_DROP_DOWNLOADS_PREFIX: &str = "mdesk-drop-downloads:";
+pub const DIRECT_TRANSFER_MAX_ENTRIES: usize = 100_000;
+pub const DIRECT_TRANSFER_MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
+pub const DIRECT_TRANSFER_MAX_PATH_BYTES: usize = 4 * 1024;
+pub const DIRECT_TRANSFER_MAX_DEPTH: usize = 64;
+pub const DIRECT_TRANSFER_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub const DIRECT_TRANSFER_MAX_BLOCK_BYTES: usize = 128 * 1024;
+
+#[derive(Debug)]
+pub struct DirectTransferManifest {
+    pub root_name: String,
+    pub is_directory: bool,
+    pub files: Vec<FileEntry>,
+    pub empty_dirs: Vec<String>,
+    pub total_size: u64,
+    source_identities: Vec<DirectSourceIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirectSourceIdentity {
+    volume_serial: u64,
+    file_index: u64,
+    file_size: u64,
+    last_write_time: u64,
+}
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+#[repr(C)]
+#[derive(Default)]
+struct DirectByHandleFileInformation {
+    dwFileAttributes: u32,
+    ftCreationTimeLow: u32,
+    ftCreationTimeHigh: u32,
+    ftLastAccessTimeLow: u32,
+    ftLastAccessTimeHigh: u32,
+    ftLastWriteTimeLow: u32,
+    ftLastWriteTimeHigh: u32,
+    dwVolumeSerialNumber: u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    nNumberOfLinks: u32,
+    nFileIndexHigh: u32,
+    nFileIndexLow: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetFileInformationByHandle(
+        file: *mut std::ffi::c_void,
+        information: *mut DirectByHandleFileInformation,
+    ) -> i32;
+}
 
 pub fn get_next_job_id() -> i32 {
     NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+pub fn get_next_direct_job_id() -> i32 {
+    let id = NEXT_DIRECT_JOB_ID.fetch_sub(1, Ordering::SeqCst);
+    if id == i32::MIN {
+        NEXT_DIRECT_JOB_ID.store(-1, Ordering::SeqCst);
+        -1
+    } else {
+        id
+    }
 }
 
 pub fn update_next_job_id(id: i32) {
@@ -152,6 +221,580 @@ pub fn get_download_dir() -> PathBuf {
             }
         })
         .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Resolve the interactive user's Downloads folder without silently falling
+/// back to a temporary directory. Direct host-to-controller transfers promise
+/// the user that this is the destination, so an unresolved Downloads folder is
+/// a hard failure.
+pub fn get_download_dir_strict() -> ResultType<PathBuf> {
+    let path =
+        dirs_next::download_dir().ok_or_else(|| anyhow!("Downloads folder is unavailable"))?;
+    if path.as_os_str().is_empty() {
+        bail!("Downloads folder is unavailable");
+    }
+    if !path.exists() {
+        std::fs::create_dir_all(&path)?;
+    }
+    let metadata = std::fs::metadata(&path)?;
+    if !metadata.is_dir() {
+        bail!("Downloads destination is not a directory");
+    }
+    Ok(path)
+}
+
+fn validate_direct_path_component(component: &str) -> ResultType<()> {
+    if component.is_empty() || component == "." || component == ".." {
+        bail!("invalid direct transfer path component");
+    }
+    if component.encode_utf16().count() > 255 {
+        bail!("direct transfer path component is too long");
+    }
+    if component.chars().any(|c| {
+        c == '/'
+            || c == '\\'
+            || c == '\0'
+            || c.is_control()
+            || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    }) {
+        bail!("invalid direct transfer path component");
+    }
+    if component.ends_with(' ') || component.ends_with('.') {
+        bail!("invalid direct transfer path component");
+    }
+
+    // Windows treats these basenames as devices even when an extension is
+    // present. Reject them on every build so validation is protocol-stable.
+    let stem = component.split('.').next().unwrap_or(component);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
+    {
+        bail!("reserved direct transfer path component");
+    }
+    Ok(())
+}
+
+fn decompress_direct_transfer_block(data: &[u8], limit: usize) -> ResultType<Vec<u8>> {
+    let decoder = zstd::stream::read::Decoder::new(data)?;
+    let read_limit = u64::try_from(limit)
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1);
+    let mut limited = decoder.take(read_limit);
+    let mut output = Vec::with_capacity(limit.min(DIRECT_TRANSFER_MAX_BLOCK_BYTES));
+    limited.read_to_end(&mut output)?;
+    if output.len() > limit {
+        bail!("direct transfer block exceeds declared size");
+    }
+    Ok(output)
+}
+
+fn direct_relative_components(path: &str) -> ResultType<Vec<&str>> {
+    if path.is_empty() || path.starts_with('/') || path.starts_with('\\') {
+        bail!("invalid direct transfer relative path");
+    }
+    let components = path.split(|c| c == '/' || c == '\\').collect::<Vec<_>>();
+    if components.is_empty() {
+        bail!("invalid direct transfer relative path");
+    }
+    for component in &components {
+        validate_direct_path_component(component)?;
+    }
+    Ok(components)
+}
+
+fn normalized_direct_relative_path(path: &str) -> ResultType<String> {
+    Ok(direct_relative_components(path)?.join("/"))
+}
+
+fn direct_collision_key(path: &str) -> String {
+    // Direct Downloads is currently a Windows feature. Always folding here is
+    // conservative and keeps sender/receiver validation protocol-stable.
+    path.to_lowercase()
+}
+
+fn validate_direct_metadata_budget(paths: impl Iterator<Item = String>) -> ResultType<()> {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for path in paths {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("direct transfer entry count overflow"))?;
+        bytes = bytes
+            .checked_add(path.len())
+            .ok_or_else(|| anyhow!("direct transfer metadata overflow"))?;
+        if count > DIRECT_TRANSFER_MAX_ENTRIES || bytes > DIRECT_TRANSFER_MAX_METADATA_BYTES {
+            bail!("direct transfer manifest is too large");
+        }
+        if path.len() > DIRECT_TRANSFER_MAX_PATH_BYTES
+            || path.split('/').count() > DIRECT_TRANSFER_MAX_DEPTH
+        {
+            bail!("direct transfer path exceeds safety limits");
+        }
+    }
+    Ok(())
+}
+
+/// Validate the metadata of an unsolicited host push before touching the
+/// controller filesystem. Only regular files are accepted and all names are
+/// relative to a separately validated root basename.
+pub fn validate_direct_transfer_layout(
+    root_name: &str,
+    is_directory: bool,
+    files: &[FileEntry],
+    empty_dirs: &[String],
+    declared_total_size: u64,
+) -> ResultType<()> {
+    validate_direct_path_component(root_name)?;
+    if root_name.encode_utf16().count() > 255 {
+        bail!("direct transfer root name is too long");
+    }
+    if files.len().saturating_add(empty_dirs.len()) > DIRECT_TRANSFER_MAX_ENTRIES {
+        bail!("direct transfer manifest has too many entries");
+    }
+    let mut total_size = 0u64;
+    let mut paths = HashSet::new();
+    let mut file_paths = Vec::with_capacity(files.len());
+    let mut directory_paths = Vec::with_capacity(empty_dirs.len());
+
+    if !is_directory {
+        if files.len() != 1 || !files[0].name.is_empty() || !empty_dirs.is_empty() {
+            bail!("invalid direct file transfer layout");
+        }
+    }
+
+    for file in files {
+        if file.entry_type.enum_value() != Ok(FileType::File) {
+            bail!("direct transfer accepts regular files only");
+        }
+        let normalized = if is_directory {
+            normalized_direct_relative_path(&file.name)?
+        } else {
+            String::new()
+        };
+        let collision_key = direct_collision_key(&normalized);
+        if !paths.insert(collision_key) {
+            bail!("duplicate direct transfer file path");
+        }
+        file_paths.push(normalized);
+        total_size = total_size
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow!("direct transfer size overflow"))?;
+    }
+
+    if is_directory {
+        for dir in empty_dirs {
+            let normalized = normalized_direct_relative_path(dir)?;
+            let collision_key = direct_collision_key(&normalized);
+            if !paths.insert(collision_key) {
+                bail!("duplicate direct transfer directory path");
+            }
+            directory_paths.push(normalized);
+        }
+    }
+
+    validate_direct_metadata_budget(file_paths.iter().chain(directory_paths.iter()).cloned())?;
+
+    let file_keys = file_paths
+        .iter()
+        .map(|path| direct_collision_key(path))
+        .collect::<HashSet<_>>();
+    let empty_dir_keys = directory_paths
+        .iter()
+        .map(|path| direct_collision_key(path))
+        .collect::<HashSet<_>>();
+    for path in file_keys.iter().chain(empty_dir_keys.iter()) {
+        let mut ancestor = String::new();
+        let components = path.split('/').collect::<Vec<_>>();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(component);
+            if file_keys.contains(&ancestor) || empty_dir_keys.contains(&ancestor) {
+                bail!("conflicting direct transfer path hierarchy");
+            }
+        }
+    }
+
+    if total_size != declared_total_size {
+        bail!("direct transfer size mismatch");
+    }
+    if total_size > DIRECT_TRANSFER_MAX_TOTAL_BYTES {
+        bail!("direct transfer exceeds the unattended size limit");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_direct_transfer_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn direct_source_identity<T: std::os::windows::io::AsRawHandle>(
+    file: &T,
+) -> ResultType<DirectSourceIdentity> {
+    let mut information = DirectByHandleFileInformation::default();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as _, &mut information as *mut _)
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        bail!("direct transfer source handle is not a regular non-reparse file");
+    }
+    Ok(DirectSourceIdentity {
+        volume_serial: information.dwVolumeSerialNumber as u64,
+        file_index: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+        file_size: ((information.nFileSizeHigh as u64) << 32) | information.nFileSizeLow as u64,
+        last_write_time: ((information.ftLastWriteTimeHigh as u64) << 32)
+            | information.ftLastWriteTimeLow as u64,
+    })
+}
+
+#[cfg(not(windows))]
+fn direct_source_identity(metadata: &std::fs::Metadata) -> ResultType<DirectSourceIdentity> {
+    Ok(DirectSourceIdentity {
+        file_size: metadata.len(),
+        ..Default::default()
+    })
+}
+
+#[cfg(windows)]
+fn snapshot_direct_source_identity(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> ResultType<DirectSourceIdentity> {
+    let file = std::fs::File::open(path)?;
+    let identity = direct_source_identity(&file)?;
+    let current = std::fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink()
+        || is_direct_transfer_reparse_point(&current)
+        || !current.is_file()
+        || current.file_size() != identity.file_size
+        || current.last_write_time() != identity.last_write_time
+        || metadata.file_size() != identity.file_size
+        || metadata.last_write_time() != identity.last_write_time
+    {
+        bail!("direct transfer source changed while creating its manifest");
+    }
+    Ok(identity)
+}
+
+#[cfg(not(windows))]
+fn snapshot_direct_source_identity(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> ResultType<DirectSourceIdentity> {
+    direct_source_identity(metadata)
+}
+
+#[cfg(not(windows))]
+fn is_direct_transfer_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn validate_direct_source_file(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
+    let base_metadata = std::fs::symlink_metadata(base)?;
+    if base_metadata.file_type().is_symlink() || is_direct_transfer_reparse_point(&base_metadata) {
+        bail!("direct transfer source root became a link or reparse point");
+    }
+
+    let source = if name.is_empty() {
+        base.clone()
+    } else {
+        let mut current = base.clone();
+        for component in direct_relative_components(name)? {
+            current.push(component);
+            let metadata = std::fs::symlink_metadata(&current)?;
+            if metadata.file_type().is_symlink() || is_direct_transfer_reparse_point(&metadata) {
+                bail!("direct transfer source path became a link or reparse point");
+            }
+        }
+        current
+    };
+    let source_metadata = std::fs::symlink_metadata(&source)?;
+    if !source_metadata.is_file()
+        || source_metadata.file_type().is_symlink()
+        || is_direct_transfer_reparse_point(&source_metadata)
+    {
+        bail!("direct transfer source is no longer a regular file");
+    }
+
+    if !name.is_empty() {
+        let canonical_base = std::fs::canonicalize(base)?;
+        let canonical_source = std::fs::canonicalize(&source)?;
+        if !canonical_source.starts_with(&canonical_base) {
+            bail!("direct transfer source escaped its selected root");
+        }
+    }
+    Ok(source)
+}
+
+fn collect_direct_transfer_directory(
+    directory: &Path,
+    relative: &Path,
+    files: &mut Vec<FileEntry>,
+    source_identities: &mut Vec<DirectSourceIdentity>,
+    empty_dirs: &mut Vec<String>,
+    metadata_bytes: &mut usize,
+    total_size: &mut u64,
+) -> ResultType<()> {
+    if relative.components().count() > DIRECT_TRANSFER_MAX_DEPTH {
+        bail!("direct transfer directory depth exceeds safety limit");
+    }
+    let mut child_count = 0usize;
+    for entry_result in std::fs::read_dir(directory)? {
+        let entry = entry_result?;
+        child_count = child_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("direct transfer entry count overflow"))?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || is_direct_transfer_reparse_point(&metadata) {
+            bail!("symbolic links and reparse points are not allowed in direct transfer");
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("direct transfer path is not valid UTF-8"))?;
+        validate_direct_path_component(&name)?;
+        let relative_path = relative.join(&name);
+        let protocol_path = relative_path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if protocol_path.len() > DIRECT_TRANSFER_MAX_PATH_BYTES {
+            bail!("direct transfer path exceeds safety limit");
+        }
+
+        if metadata.is_dir() {
+            collect_direct_transfer_directory(
+                &entry.path(),
+                &relative_path,
+                files,
+                source_identities,
+                empty_dirs,
+                metadata_bytes,
+                total_size,
+            )?;
+        } else if metadata.is_file() {
+            *metadata_bytes = metadata_bytes
+                .checked_add(protocol_path.len())
+                .ok_or_else(|| anyhow!("direct transfer metadata overflow"))?;
+            if files.len().saturating_add(empty_dirs.len()) >= DIRECT_TRANSFER_MAX_ENTRIES
+                || *metadata_bytes > DIRECT_TRANSFER_MAX_METADATA_BYTES
+            {
+                bail!("direct transfer manifest is too large");
+            }
+            let modified_time = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            *total_size = total_size
+                .checked_add(metadata.len())
+                .ok_or_else(|| anyhow!("direct transfer size overflow"))?;
+            if *total_size > DIRECT_TRANSFER_MAX_TOTAL_BYTES {
+                bail!("direct transfer exceeds the unattended size limit");
+            }
+            files.push(FileEntry {
+                entry_type: FileType::File.into(),
+                name: protocol_path,
+                size: metadata.len(),
+                modified_time,
+                ..Default::default()
+            });
+            source_identities.push(snapshot_direct_source_identity(&entry.path(), &metadata)?);
+        } else {
+            bail!("unsupported direct transfer filesystem entry");
+        }
+    }
+
+    if child_count == 0 && !relative.as_os_str().is_empty() {
+        let protocol_path = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        *metadata_bytes = metadata_bytes
+            .checked_add(protocol_path.len())
+            .ok_or_else(|| anyhow!("direct transfer metadata overflow"))?;
+        if files.len().saturating_add(empty_dirs.len()) >= DIRECT_TRANSFER_MAX_ENTRIES
+            || *metadata_bytes > DIRECT_TRANSFER_MAX_METADATA_BYTES
+        {
+            bail!("direct transfer manifest is too large");
+        }
+        empty_dirs.push(protocol_path);
+    }
+    Ok(())
+}
+
+/// Walk a selected source exactly once, failing on every unreadable child and
+/// refusing symlinks/reparse points. This prevents a partially enumerated
+/// folder from later being reported as a completed direct transfer.
+pub fn get_direct_transfer_manifest(source: &Path) -> ResultType<DirectTransferManifest> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || is_direct_transfer_reparse_point(&metadata) {
+        bail!("symbolic links and reparse points are not allowed in direct transfer");
+    }
+    let root_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("direct transfer source has no valid basename"))?
+        .to_owned();
+    validate_direct_path_component(&root_name)?;
+
+    let mut files = Vec::new();
+    let mut empty_dirs = Vec::new();
+    let mut source_identities = Vec::new();
+    let mut total_size = 0u64;
+    if metadata.is_file() {
+        total_size = metadata.len();
+        let modified_time = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        files.push(FileEntry {
+            entry_type: FileType::File.into(),
+            size: metadata.len(),
+            modified_time,
+            ..Default::default()
+        });
+        source_identities.push(snapshot_direct_source_identity(source, &metadata)?);
+    } else if metadata.is_dir() {
+        let mut metadata_bytes = 0usize;
+        collect_direct_transfer_directory(
+            source,
+            Path::new(""),
+            &mut files,
+            &mut source_identities,
+            &mut empty_dirs,
+            &mut metadata_bytes,
+            &mut total_size,
+        )?;
+    } else {
+        bail!("direct transfer source is not a regular file or directory");
+    }
+
+    validate_direct_transfer_layout(
+        &root_name,
+        metadata.is_dir(),
+        &files,
+        &empty_dirs,
+        total_size,
+    )?;
+    Ok(DirectTransferManifest {
+        root_name,
+        is_directory: metadata.is_dir(),
+        files,
+        empty_dirs,
+        total_size,
+        source_identities,
+    })
+}
+
+fn add_collision_suffix(root_name: &str, suffix: u32, is_directory: bool) -> String {
+    if suffix == 0 {
+        return root_name.to_owned();
+    }
+    if !is_directory {
+        let path = Path::new(root_name);
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(root_name);
+        if let Some(extension) = path.extension().and_then(|s| s.to_str()) {
+            return format!("{stem} ({suffix}).{extension}");
+        }
+    }
+    format!("{root_name} ({suffix})")
+}
+
+/// Atomically reserve a collision-free root below Downloads. Directory roots
+/// are created immediately; file roots reserve their `.download` staging file.
+pub fn reserve_direct_download_destination(
+    root_name: &str,
+    is_directory: bool,
+) -> ResultType<PathBuf> {
+    validate_direct_path_component(root_name)?;
+    let downloads = get_download_dir_strict()?;
+    for suffix in 0..10_000 {
+        let candidate = downloads.join(add_collision_suffix(root_name, suffix, is_directory));
+        if is_directory {
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            if candidate.exists() {
+                continue;
+            }
+            let staging = PathBuf::from(format!("{}.download", candidate.to_string_lossy()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging)
+            {
+                Ok(_) => return Ok(candidate),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    bail!("unable to reserve a unique Downloads destination")
+}
+
+pub fn create_direct_empty_directories(base: &PathBuf, empty_dirs: &[String]) -> ResultType<()> {
+    for dir in empty_dirs {
+        let components = direct_relative_components(dir)?;
+        let mut target = base.clone();
+        for component in components {
+            target.push(component);
+            match std::fs::symlink_metadata(&target) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        bail!("unsafe direct transfer directory component");
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&target)?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Release only artifacts reserved by `reserve_direct_download_destination`.
+/// A directory is removed only when still empty, so partially received user
+/// data is never recursively deleted during error handling.
+pub fn release_direct_download_reservation(destination: &PathBuf, is_directory: bool) {
+    if is_directory {
+        // Empty-directory manifests may have materialized several nested
+        // folders before a later validation/write failure. Remove only empty
+        // directories; never recursively delete a partially received file.
+        let _ = remove_all_empty_dir(destination);
+    } else {
+        let staging = PathBuf::from(format!("{}.download", destination.to_string_lossy()));
+        let digest = PathBuf::from(format!("{}.digest", destination.to_string_lossy()));
+        let _ = std::fs::remove_file(staging);
+        let _ = std::fs::remove_file(digest);
+    }
 }
 
 pub fn is_remote_drop_downloads_path(path: &str) -> bool {
@@ -510,6 +1153,26 @@ pub struct TransferJob {
     open_folder_on_done: bool,
     #[serde(skip_serializing)]
     digest: FileDigest,
+    // Preserve any source open/read failure until the whole multi-file job
+    // terminates. Otherwise a later successful EOF can incorrectly turn a
+    // partially failed transfer into a COMPLETED audit outcome.
+    #[serde(skip_serializing)]
+    transfer_error: Option<String>,
+    #[serde(skip_serializing)]
+    audit_had_skipped_file: bool,
+    #[serde(skip)]
+    never_overwrite_destination: bool,
+    #[serde(skip)]
+    strict_direct_transfer: bool,
+    #[serde(skip)]
+    direct_current_file_bytes: u64,
+    #[serde(skip)]
+    direct_current_file_eof_seen: bool,
+    // Local-only snapshot identities for direct-send sources. These are never
+    // serialized or put on the peer wire; they bind each opened handle back to
+    // the file seen by the strict manifest walk.
+    #[serde(skip)]
+    direct_source_identities: Vec<DirectSourceIdentity>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -526,6 +1189,15 @@ pub struct TransferJobMeta {
     pub file_num: i32,
     #[serde(default)]
     pub is_remote: bool,
+}
+
+/// Terminal outcome reported by the read side after all file blocks have been
+/// sent. Consumers that need transfer auditing can correlate this with their
+/// own job metadata without parsing the UI-oriented JSON progress log.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReadJobOutcome {
+    pub id: i32,
+    pub succeeded: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -717,6 +1389,46 @@ impl TransferJob {
         })
     }
 
+    pub fn new_direct_read(
+        id: i32,
+        source: PathBuf,
+        manifest: &DirectTransferManifest,
+    ) -> ResultType<Self> {
+        validate_direct_transfer_layout(
+            &manifest.root_name,
+            manifest.is_directory,
+            &manifest.files,
+            &manifest.empty_dirs,
+            manifest.total_size,
+        )?;
+        if manifest.source_identities.len() != manifest.files.len()
+            || manifest
+                .source_identities
+                .iter()
+                .zip(&manifest.files)
+                .any(|(identity, file)| identity.file_size != file.size)
+        {
+            bail!("direct transfer source snapshot is inconsistent");
+        }
+        Ok(Self {
+            id,
+            r#type: JobType::Generic,
+            remote: "Downloads".to_owned(),
+            data_source: DataSource::FilePath(source),
+            file_num: 0,
+            show_hidden: true,
+            is_remote: true,
+            files: manifest.files.clone(),
+            total_size: manifest.total_size,
+            // The receiver atomically reserves a unique destination, so this
+            // direct path never opens an overwrite-confirmation UI.
+            enable_overwrite_detection: false,
+            strict_direct_transfer: true,
+            direct_source_identities: manifest.source_identities.clone(),
+            ..Default::default()
+        })
+    }
+
     pub async fn get_buf_data(self) -> ResultType<Option<Vec<u8>>> {
         match self.data_stream {
             Some(DataStream::BufStream(mut bs)) => {
@@ -759,6 +1471,14 @@ impl TransferJob {
     #[inline]
     pub fn set_open_folder_on_done(&mut self, enabled: bool) {
         self.open_folder_on_done = enabled;
+    }
+
+    pub fn set_never_overwrite_destination(&mut self, enabled: bool) {
+        self.never_overwrite_destination = enabled;
+    }
+
+    pub fn set_strict_direct_transfer(&mut self, enabled: bool) {
+        self.strict_direct_transfer = enabled;
     }
 
     #[inline]
@@ -821,29 +1541,108 @@ impl TransferJob {
         }
     }
 
-    pub fn modify_time(&self) {
+    fn finalize_current_file(&self) -> ResultType<()> {
         if self.r#type == JobType::Printer {
-            return;
+            return Ok(());
         }
         if let DataSource::FilePath(p) = &self.data_source {
             let file_num = self.file_num as usize;
             if file_num < self.files.len() {
                 let entry = &self.files[file_num];
                 let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                    return;
+                    bail!("invalid destination path");
                 };
                 let download_path = format!("{}.download", get_string(&path));
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(digest_path).ok();
-                std::fs::rename(download_path, &path).ok();
+                if self.never_overwrite_destination && path.exists() {
+                    bail!("direct transfer destination already exists");
+                }
+                std::fs::rename(download_path, &path)?;
                 let mtime = if self.set_mtime_to_now {
                     filetime::FileTime::from_system_time(SystemTime::now())
                 } else {
                     filetime::FileTime::from_unix_time(entry.modified_time as _, 0)
                 };
-                filetime::set_file_mtime(&path, mtime).ok();
+                filetime::set_file_mtime(&path, mtime)?;
             }
         }
+        Ok(())
+    }
+
+    /// Flush and durably finalize the current destination file before a Done
+    /// acknowledgement is emitted. The file handle is dropped before rename so
+    /// Windows does not report success while leaving only a `.download` file.
+    pub async fn finalize_write(&mut self) -> ResultType<()> {
+        match self.data_stream.as_mut() {
+            Some(DataStream::FileStream(file)) => file.sync_all().await?,
+            Some(DataStream::BufStream(stream)) => stream.flush().await?,
+            None => return Ok(()),
+        }
+        if self.r#type != JobType::Printer {
+            self.data_stream.take();
+            self.finalize_current_file()?;
+        }
+        Ok(())
+    }
+
+    /// Finalize a direct Downloads write and verify every declared file before
+    /// the receiver sends its terminal acknowledgement. This also materializes
+    /// zero-byte files after their single explicit EOF block.
+    pub async fn finalize_direct_write(&mut self) -> ResultType<()> {
+        if let Some(entry) = usize::try_from(self.file_num)
+            .ok()
+            .and_then(|index| self.files.get(index))
+        {
+            if self.direct_current_file_bytes != entry.size || !self.direct_current_file_eof_seen {
+                bail!("direct transfer file ended before declared size");
+            }
+        }
+        self.finalize_write().await?;
+        if self.finished_size != self.total_size {
+            bail!("direct transfer ended before declared total size");
+        }
+        let DataSource::FilePath(base) = &self.data_source else {
+            bail!("direct transfer requires a filesystem destination");
+        };
+
+        for entry in &self.files {
+            let path = join_validated_path(base, &entry.name)?;
+            if entry.size == 0 && !path.exists() {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let staging = PathBuf::from(format!("{}.download", path.to_string_lossy()));
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staging)
+                    .or_else(|err| {
+                        if err.kind() == std::io::ErrorKind::AlreadyExists {
+                            std::fs::OpenOptions::new().write(true).open(&staging)
+                        } else {
+                            Err(err)
+                        }
+                    })?;
+                file.sync_all()?;
+                drop(file);
+                if self.never_overwrite_destination && path.exists() {
+                    bail!("direct transfer destination already exists");
+                }
+                std::fs::rename(&staging, &path)?;
+                let mtime = filetime::FileTime::from_unix_time(entry.modified_time as _, 0);
+                filetime::set_file_mtime(&path, mtime)?;
+            }
+
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("direct transfer destination is not a regular file");
+            }
+            if metadata.len() != entry.size {
+                bail!("direct transfer file size mismatch");
+            }
+        }
+        Ok(())
     }
 
     pub fn remove_download_file(&self) {
@@ -882,23 +1681,97 @@ impl TransferJob {
         if block.id != self.id {
             bail!("Wrong id");
         }
+        let file_num = usize::try_from(block.file_num).map_err(|_| anyhow!("Wrong file number"))?;
+        if matches!(&self.data_source, DataSource::FilePath(_)) && file_num >= self.files.len() {
+            bail!("Wrong file number");
+        }
+        if self.strict_direct_transfer && block.data.len() > DIRECT_TRANSFER_MAX_BLOCK_BYTES {
+            bail!("direct transfer wire block exceeds protocol limit");
+        }
+
+        let decoded = if block.compressed {
+            if self.strict_direct_transfer {
+                let remaining =
+                    self.files[file_num]
+                        .size
+                        .saturating_sub(if block.file_num == self.file_num {
+                            self.direct_current_file_bytes
+                        } else {
+                            0
+                        });
+                let limit = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(DIRECT_TRANSFER_MAX_BLOCK_BYTES);
+                Some(decompress_direct_transfer_block(&block.data, limit)?)
+            } else {
+                Some(decompress(&block.data))
+            }
+        } else {
+            None
+        };
+        let write_data: &[u8] = decoded.as_deref().unwrap_or(&block.data);
+
+        if self.strict_direct_transfer {
+            if write_data.len() > DIRECT_TRANSFER_MAX_BLOCK_BYTES {
+                bail!("direct transfer block exceeds protocol limit");
+            }
+            if block.file_num < self.file_num {
+                bail!("direct transfer file number moved backwards");
+            }
+            if block.file_num > self.file_num {
+                if block.file_num != self.file_num.saturating_add(1)
+                    || self.data_stream.is_none()
+                    || !self.direct_current_file_eof_seen
+                    || self.direct_current_file_bytes != self.files[self.file_num as usize].size
+                {
+                    bail!("direct transfer file sequence is incomplete");
+                }
+                self.direct_current_file_bytes = 0;
+                self.direct_current_file_eof_seen = false;
+            }
+            let remaining = self.files[file_num]
+                .size
+                .checked_sub(self.direct_current_file_bytes)
+                .ok_or_else(|| anyhow!("direct transfer file size underflow"))?;
+            let expected_block_size =
+                remaining.min(DIRECT_TRANSFER_MAX_BLOCK_BYTES as u64) as usize;
+            if expected_block_size == 0 {
+                if !write_data.is_empty() || self.direct_current_file_eof_seen {
+                    bail!("direct transfer emitted an invalid or duplicate EOF block");
+                }
+                self.direct_current_file_eof_seen = true;
+            } else if self.direct_current_file_eof_seen || write_data.len() != expected_block_size {
+                bail!("direct transfer block does not match declared chunk size");
+            }
+            let next_file_bytes = self
+                .direct_current_file_bytes
+                .checked_add(write_data.len() as u64)
+                .ok_or_else(|| anyhow!("direct transfer file size overflow"))?;
+            if next_file_bytes > self.files[file_num].size {
+                bail!("direct transfer exceeds declared file size");
+            }
+            let next_total = self
+                .finished_size
+                .checked_add(write_data.len() as u64)
+                .ok_or_else(|| anyhow!("direct transfer total size overflow"))?;
+            if next_total > self.total_size {
+                bail!("direct transfer exceeds declared total size");
+            }
+            self.direct_current_file_bytes = next_file_bytes;
+        }
         match &self.data_source {
             DataSource::FilePath(p) => {
-                let file_num = block.file_num as usize;
-                if file_num >= self.files.len() {
-                    bail!("Wrong file number");
-                }
+                let base_path = p.clone();
                 if file_num != self.file_num as usize || self.data_stream.is_none() {
-                    self.modify_time();
-                    if let Some(DataStream::FileStream(file)) = self.data_stream.as_mut() {
-                        file.sync_all().await?;
+                    if self.data_stream.is_some() {
+                        self.finalize_write().await?;
                     }
                     self.file_num = block.file_num;
                     let entry = &self.files[file_num];
                     let (path, digest_path) = if self.r#type == JobType::Printer {
-                        (p.to_string_lossy().to_string(), None)
+                        (base_path.to_string_lossy().to_string(), None)
                     } else {
-                        let path = join_validated_path(p, &entry.name)?;
+                        let path = join_validated_path(&base_path, &entry.name)?;
                         if let Some(pp) = path.parent() {
                             std::fs::create_dir_all(pp).ok();
                         }
@@ -925,22 +1798,12 @@ impl TransferJob {
                 }
             }
         }
-        if block.compressed {
-            let tmp = decompress(&block.data);
-            self.data_stream
-                .as_mut()
-                .ok_or(anyhow!("data stream is None"))?
-                .write_all(&tmp)
-                .await?;
-            self.finished_size += tmp.len() as u64;
-        } else {
-            self.data_stream
-                .as_mut()
-                .ok_or(anyhow!("file is None"))?
-                .write_all(&block.data)
-                .await?;
-            self.finished_size += block.data.len() as u64;
-        }
+        self.data_stream
+            .as_mut()
+            .ok_or(anyhow!("file is None"))?
+            .write_all(write_data)
+            .await?;
+        self.finished_size += write_data.len() as u64;
         self.transferred += block.data.len() as u64;
         Ok(())
     }
@@ -958,6 +1821,9 @@ impl TransferJob {
     /// Returns Ok(true) if job is done, Ok(false) otherwise.
     async fn open_data_stream(&mut self) -> ResultType<bool> {
         let file_num = self.file_num as usize;
+        let direct_file_name = self.files.get(file_num).map(|file| file.name.clone());
+        let direct_expected_identity = self.direct_source_identities.get(file_num).copied();
+        let direct_file_count = self.files.len();
         match &mut self.data_source {
             DataSource::FilePath(p) => {
                 if file_num >= self.files.len() {
@@ -966,8 +1832,58 @@ impl TransferJob {
                     return Ok(true);
                 };
                 if self.data_stream.is_none() {
-                    match File::open(Self::join(p, &self.files[file_num].name)).await {
+                    let source_path = if self.strict_direct_transfer {
+                        let file_name = direct_file_name
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("direct transfer source entry is missing"))?;
+                        match validate_direct_source_file(p, file_name) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                self.transfer_error = Some(err.to_string());
+                                self.file_num = direct_file_count as i32;
+                                self.file_confirmed = false;
+                                self.file_is_waiting = false;
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        Self::join(p, &self.files[file_num].name)
+                    };
+                    match File::open(&source_path).await {
                         Ok(file) => {
+                            if self.strict_direct_transfer {
+                                let validation: ResultType<()> = async {
+                                    // Revalidate the named path after open, then
+                                    // validate the opened handle itself. A path
+                                    // swap cannot make a different file pass the
+                                    // manifest identity comparison.
+                                    validate_direct_source_file(
+                                        p,
+                                        direct_file_name.as_deref().ok_or_else(|| {
+                                            anyhow!("direct transfer source entry is missing")
+                                        })?,
+                                    )?;
+                                    #[cfg(windows)]
+                                    let actual = direct_source_identity(&file)?;
+                                    #[cfg(not(windows))]
+                                    let actual = direct_source_identity(&file.metadata().await?)?;
+                                    let expected = direct_expected_identity.ok_or_else(|| {
+                                        anyhow!("direct transfer source identity is missing")
+                                    })?;
+                                    if actual != expected {
+                                        bail!("direct transfer source identity changed");
+                                    }
+                                    Ok(())
+                                }
+                                .await;
+                                if let Err(err) = validation {
+                                    self.transfer_error = Some(err.to_string());
+                                    self.file_num = direct_file_count as i32;
+                                    self.file_confirmed = false;
+                                    self.file_is_waiting = false;
+                                    return Err(err);
+                                }
+                            }
                             self.data_stream = Some(DataStream::FileStream(file));
                             self.file_confirmed = false;
                             self.file_is_waiting = false;
@@ -975,6 +1891,7 @@ impl TransferJob {
                         // On open error, behave the same as validation failure: advance
                         // to next file and return the error.
                         Err(err) => {
+                            self.transfer_error = Some(err.to_string());
                             self.file_num += 1;
                             self.file_confirmed = false;
                             self.file_is_waiting = false;
@@ -1080,6 +1997,7 @@ impl TransferJob {
                 .await
             {
                 Err(err) => {
+                    self.transfer_error = Some(err.to_string());
                     self.file_num += 1;
                     self.data_stream = None;
                     self.file_confirmed = false;
@@ -1206,11 +2124,26 @@ impl TransferJob {
         if self.job_skipped() {
             return Some("skipped".to_string());
         }
-        None
+        self.transfer_error.clone()
+    }
+
+    /// Conservative terminal status for immutable audit records. A partial
+    /// multi-file transfer with any skipped or unreadable item must not be
+    /// represented as if every requested file was completed.
+    pub fn audit_error(&self) -> Option<String> {
+        if self.audit_had_skipped_file {
+            return Some("one or more files were skipped".to_owned());
+        }
+        self.transfer_error.clone()
+    }
+
+    pub fn mark_audit_file_skipped(&mut self) {
+        self.audit_had_skipped_file = true;
     }
 
     pub fn set_file_skipped(&mut self) -> bool {
         log::debug!("skip file {} in job {}", self.file_num, self.id);
+        self.mark_audit_file_skipped();
         self.data_stream.take();
         self.set_file_confirmed(false);
         self.set_file_is_waiting(false);
@@ -1381,6 +2314,24 @@ pub fn new_receive(
 }
 
 #[inline]
+pub fn new_direct_receive(id: i32, manifest: &DirectTransferManifest) -> Message {
+    let mut action = FileAction::new();
+    action.set_direct_receive(DirectFileTransferReceiveRequest {
+        id,
+        destination: direct_file_transfer_receive_request::Destination::Downloads.into(),
+        root_name: manifest.root_name.clone(),
+        is_directory: manifest.is_directory,
+        files: manifest.files.clone(),
+        empty_dirs: manifest.empty_dirs.clone(),
+        total_size: manifest.total_size,
+        ..Default::default()
+    });
+    let mut msg_out = Message::new();
+    msg_out.set_file_action(action);
+    msg_out
+}
+
+#[inline]
 pub fn new_send(
     id: i32,
     r#type: JobType,
@@ -1451,11 +2402,12 @@ async fn init_jobs(jobs: &mut Vec<TransferJob>, stream: &mut crate::Stream) -> R
 pub async fn handle_read_jobs(
     jobs: &mut Vec<TransferJob>,
     stream: &mut crate::Stream,
-) -> ResultType<String> {
+) -> ResultType<(String, Vec<ReadJobOutcome>)> {
     init_jobs(jobs, stream).await?;
 
     let mut job_log = Default::default();
     let mut finished = Vec::new();
+    let mut outcomes = Vec::new();
     for job in jobs.iter_mut() {
         if job.is_last_job {
             continue;
@@ -1473,7 +2425,13 @@ pub async fn handle_read_jobs(
                 if job.job_completed() {
                     job_log = serialize_transfer_job(job, true, false, "");
                     finished.push(job.id());
-                    match job.job_error() {
+                    let audit_error = job.audit_error();
+                    outcomes.push(ReadJobOutcome {
+                        id: job.id(),
+                        succeeded: audit_error.is_none(),
+                    });
+                    let job_error = job.job_error();
+                    match job_error {
                         Some(err) => {
                             job_log = serialize_transfer_job(job, false, false, &err);
                             stream
@@ -1493,7 +2451,7 @@ pub async fn handle_read_jobs(
     for id in finished {
         let _ = remove_job(id, jobs);
     }
-    Ok(job_log)
+    Ok((job_log, outcomes))
 }
 
 pub fn remove_all_empty_dir(path: &Path) -> ResultType<()> {
@@ -1652,6 +2610,15 @@ mod tests {
         }
     }
 
+    fn direct_file_entry(name: &str, size: u64) -> FileEntry {
+        FileEntry {
+            entry_type: FileType::File.into(),
+            name: name.to_owned(),
+            size,
+            ..Default::default()
+        }
+    }
+
     fn validation_job() -> TransferJob {
         TransferJob::new_write(
             1,
@@ -1703,5 +2670,469 @@ mod tests {
         assert!(job
             .set_files(vec![file_entry("safe.txt"), file_entry("../../escape.txt")])
             .is_err());
+    }
+
+    #[test]
+    fn direct_layout_accepts_only_bounded_relative_regular_files() {
+        let files = vec![
+            direct_file_entry("report.xlsx", 7),
+            direct_file_entry("nested/image.png", 11),
+        ];
+        assert!(validate_direct_transfer_layout(
+            "Selected folder",
+            true,
+            &files,
+            &["empty/subfolder".to_owned()],
+            18,
+        )
+        .is_ok());
+
+        for invalid in [
+            "../escape.txt",
+            "/absolute.txt",
+            r"C:\absolute.txt",
+            "folder//empty-component.txt",
+        ] {
+            assert!(validate_direct_transfer_layout(
+                "Selected folder",
+                true,
+                &[direct_file_entry(invalid, 1)],
+                &[],
+                1,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn direct_layout_rejects_duplicate_and_conflicting_hierarchies() {
+        assert!(validate_direct_transfer_layout(
+            "folder",
+            true,
+            &[direct_file_entry("A.txt", 1), direct_file_entry("a.TXT", 1),],
+            &[],
+            2,
+        )
+        .is_err());
+        assert!(validate_direct_transfer_layout(
+            "folder",
+            true,
+            &[
+                direct_file_entry("node", 1),
+                direct_file_entry("node/child.txt", 1),
+            ],
+            &[],
+            2,
+        )
+        .is_err());
+        assert!(validate_direct_transfer_layout(
+            "folder",
+            true,
+            &[direct_file_entry("empty/child.txt", 1)],
+            &["empty".to_owned()],
+            1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_layout_rejects_wrong_total_and_unattended_size_over_limit() {
+        assert!(validate_direct_transfer_layout(
+            "report.bin",
+            false,
+            &[direct_file_entry("", 10)],
+            &[],
+            9,
+        )
+        .is_err());
+        assert!(validate_direct_transfer_layout(
+            "report.bin",
+            false,
+            &[direct_file_entry("", DIRECT_TRANSFER_MAX_TOTAL_BYTES + 1)],
+            &[],
+            DIRECT_TRANSFER_MAX_TOTAL_BYTES + 1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn strict_manifest_preserves_files_and_empty_directories() {
+        let test_dir =
+            std::env::temp_dir().join(format!("mdesk-direct-manifest-{}", uuid::Uuid::new_v4()));
+        let selected = test_dir.join("selected");
+        std::fs::create_dir_all(selected.join("nested/empty")).unwrap();
+        std::fs::write(selected.join("report.txt"), b"report").unwrap();
+        std::fs::write(selected.join("nested/image.bin"), b"image").unwrap();
+
+        let manifest = get_direct_transfer_manifest(&selected).unwrap();
+        assert_eq!(manifest.root_name, "selected");
+        assert!(manifest.is_directory);
+        assert_eq!(manifest.total_size, 11);
+        assert!(manifest.files.iter().any(|file| file.name == "report.txt"));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| file.name == "nested/image.bin"));
+        assert_eq!(manifest.empty_dirs, vec!["nested/empty"]);
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn transfer_error_is_preserved_for_terminal_outcome() {
+        let mut job = validation_job();
+        job.transfer_error = Some("source read failed".to_owned());
+
+        assert_eq!(job.job_error().as_deref(), Some("source read failed"));
+    }
+
+    #[test]
+    fn audit_does_not_mark_partially_skipped_multi_file_job_complete() {
+        let mut job = validation_job();
+        job.set_files(vec![file_entry("keep.txt"), file_entry("skip.txt")])
+            .unwrap();
+        job.set_file_skipped();
+        // Starting/confirming a later file resets the legacy "last file"
+        // marker, but the immutable audit accumulator must remain set.
+        job.set_file_confirmed(true);
+
+        assert!(job.job_error().is_none());
+        assert_eq!(
+            job.audit_error().as_deref(),
+            Some("one or more files were skipped")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_write_flushes_and_renames_download_file() {
+        let test_dir =
+            std::env::temp_dir().join(format!("mdesk-finalize-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let destination = test_dir.join("audit.txt");
+        let mut job = TransferJob::new_write(
+            7,
+            JobType::Generic,
+            String::new(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            false,
+            false,
+        )
+        .with_files(vec![FileEntry {
+            name: String::new(),
+            size: 5,
+            modified_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ..Default::default()
+        }])
+        .unwrap();
+
+        job.write(FileTransferBlock {
+            id: 7,
+            file_num: 0,
+            data: b"audit".to_vec().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        job.finalize_write().await.unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"audit");
+        assert!(!PathBuf::from(format!("{}.download", destination.display())).exists());
+
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn printer_memory_job_accepts_blocks_without_a_file_manifest() {
+        let mut job = TransferJob::new_write(
+            8,
+            JobType::Printer,
+            "printer".to_owned(),
+            DataSource::MemoryCursor(Cursor::new(Vec::new())),
+            0,
+            false,
+            true,
+            false,
+        );
+        job.write(FileTransferBlock {
+            id: 8,
+            file_num: 0,
+            data: b"print-data".to_vec().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(job.get_buf_data().await.unwrap().unwrap(), b"print-data");
+    }
+
+    #[tokio::test]
+    async fn direct_write_rejects_blocks_beyond_declared_file_size() {
+        let test_dir =
+            std::env::temp_dir().join(format!("mdesk-direct-limit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let destination = test_dir.join("bounded.bin");
+        let mut job = TransferJob::new_write(
+            -7,
+            JobType::Generic,
+            "bounded.bin".to_owned(),
+            DataSource::FilePath(destination),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(vec![direct_file_entry("", 3)])
+        .unwrap();
+        job.set_strict_direct_transfer(true);
+        job.set_never_overwrite_destination(true);
+
+        let err = job
+            .write(FileTransferBlock {
+                id: -7,
+                file_num: 0,
+                data: b"four".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("declared chunk size"));
+        assert!(!test_dir.join("bounded.bin.download").exists());
+        std::fs::remove_dir(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_write_bounds_decompressed_bytes_and_file_sequence() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "mdesk-direct-decompressed-limit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let destination = test_dir.join("bounded");
+        let mut compressed_job = TransferJob::new_write(
+            -9,
+            JobType::Generic,
+            "bounded".to_owned(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(vec![direct_file_entry("first.bin", 3)])
+        .unwrap();
+        compressed_job.set_strict_direct_transfer(true);
+        let err = compressed_job
+            .write(FileTransferBlock {
+                id: -9,
+                file_num: 0,
+                data: compress(b"four").into(),
+                compressed: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("declared size"));
+        assert!(!destination.join("first.bin.download").exists());
+
+        let mut short_block_job = TransferJob::new_write(
+            -12,
+            JobType::Generic,
+            "bounded".to_owned(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(vec![direct_file_entry("short.bin", 3)])
+        .unwrap();
+        short_block_job.set_strict_direct_transfer(true);
+        let err = short_block_job
+            .write(FileTransferBlock {
+                id: -12,
+                file_num: 0,
+                data: b"x".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("declared chunk size"));
+
+        let mut oversized_wire_job = TransferJob::new_write(
+            -13,
+            JobType::Generic,
+            "bounded".to_owned(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(vec![direct_file_entry(
+            "wire.bin",
+            DIRECT_TRANSFER_MAX_BLOCK_BYTES as u64,
+        )])
+        .unwrap();
+        oversized_wire_job.set_strict_direct_transfer(true);
+        let err = oversized_wire_job
+            .write(FileTransferBlock {
+                id: -13,
+                file_num: 0,
+                data: vec![0; DIRECT_TRANSFER_MAX_BLOCK_BYTES + 1].into(),
+                compressed: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("wire block"));
+
+        let mut sequence_job = TransferJob::new_write(
+            -10,
+            JobType::Generic,
+            "bounded".to_owned(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(vec![
+            direct_file_entry("first.bin", 1),
+            direct_file_entry("second.bin", 1),
+        ])
+        .unwrap();
+        sequence_job.set_strict_direct_transfer(true);
+        let err = sequence_job
+            .write(FileTransferBlock {
+                id: -10,
+                file_num: 1,
+                data: b"x".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sequence is incomplete"));
+        assert!(!destination.join("second.bin.download").exists());
+
+        std::fs::remove_dir(test_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn direct_read_rejects_a_source_replaced_after_manifest() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "mdesk-direct-source-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source = test_dir.join("source.bin");
+        std::fs::write(&source, b"first").unwrap();
+        let manifest = get_direct_transfer_manifest(&source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, b"other").unwrap();
+
+        let mut job = TransferJob::new_direct_read(-11, source, &manifest).unwrap();
+        let err = job.open_data_stream().await.unwrap_err();
+        assert!(err.to_string().contains("identity changed"));
+        assert_eq!(job.file_num(), job.files().len() as i32);
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_finalize_materializes_a_zero_byte_file() {
+        let test_dir =
+            std::env::temp_dir().join(format!("mdesk-direct-zero-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source = test_dir.join("source-zero.txt");
+        let destination = test_dir.join("received-zero.txt");
+        std::fs::write(&source, Vec::<u8>::new()).unwrap();
+        let manifest = get_direct_transfer_manifest(&source).unwrap();
+        let mut source_job = TransferJob::new_direct_read(-8, source, &manifest).unwrap();
+        let mut receiver_job = TransferJob::new_write(
+            -8,
+            JobType::Generic,
+            manifest.root_name.clone(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(manifest.files.clone())
+        .unwrap();
+        receiver_job.set_strict_direct_transfer(true);
+        receiver_job.set_never_overwrite_destination(true);
+
+        assert!(!source_job.open_data_stream().await.unwrap());
+        let eof = source_job.read().await.unwrap().unwrap();
+        assert!(eof.data.is_empty());
+        receiver_job.write(eof).await.unwrap();
+        assert!(source_job.open_data_stream().await.unwrap());
+        receiver_job.finalize_direct_write().await.unwrap();
+
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 0);
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_source_and_receiver_complete_data_and_single_eof_block() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "mdesk-direct-source-receiver-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let source = test_dir.join("source.bin");
+        let destination = test_dir.join("received.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let manifest = get_direct_transfer_manifest(&source).unwrap();
+        let mut source_job = TransferJob::new_direct_read(-14, source, &manifest).unwrap();
+        let mut receiver_job = TransferJob::new_write(
+            -14,
+            JobType::Generic,
+            manifest.root_name.clone(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(manifest.files.clone())
+        .unwrap();
+        receiver_job.set_strict_direct_transfer(true);
+        receiver_job.set_never_overwrite_destination(true);
+
+        let mut saw_eof = false;
+        loop {
+            if source_job.open_data_stream().await.unwrap() {
+                break;
+            }
+            let block = source_job.read().await.unwrap().unwrap();
+            if block.data.is_empty() {
+                saw_eof = true;
+            }
+            receiver_job.write(block).await.unwrap();
+        }
+        assert!(saw_eof);
+        let duplicate_eof = receiver_job
+            .write(FileTransferBlock {
+                id: -14,
+                file_num: 0,
+                data: Vec::new().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(duplicate_eof.to_string().contains("duplicate EOF"));
+
+        receiver_job.finalize_direct_write().await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"payload");
+        std::fs::remove_dir_all(test_dir).unwrap();
     }
 }

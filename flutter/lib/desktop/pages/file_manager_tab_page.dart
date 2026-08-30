@@ -58,6 +58,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
           tabController: tabController,
           forceRelay: params['forceRelay'],
           connToken: params['connToken'],
+          initialLocalDir: params['initialLocalDir'],
           initialRemoteDir: params['initialRemoteDir'],
           initialRemoteSelectedName: params['initialRemoteSelectedName'],
         )));
@@ -75,6 +76,16 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
         final args = jsonDecode(call.arguments);
         final id = args['id'];
         windowOnTop(windowId());
+        final existingPage = tabController.widget(id);
+        if (existingPage is FileManagerPage) {
+          await existingPage.openExplorerTransferRequest(
+            localDir: args['initialLocalDir'],
+            remoteDir: args['initialRemoteDir'],
+            remoteSelectedName: args['initialRemoteSelectedName'],
+          );
+          tabController.jumpToByKey(id, callOnSelected: false);
+          return;
+        }
         tabController.add(TabInfo(
             key: id,
             label: id,
@@ -97,6 +108,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
               tabController: tabController,
               forceRelay: args['forceRelay'],
               connToken: args['connToken'],
+              initialLocalDir: args['initialLocalDir'],
               initialRemoteDir: args['initialRemoteDir'],
               initialRemoteSelectedName: args['initialRemoteSelectedName'],
             )));

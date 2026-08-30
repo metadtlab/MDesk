@@ -127,6 +127,10 @@ pub struct ClipboardNonFile {
     // message.proto: ClipboardFormat
     pub format: i32,
     pub special_name: String,
+    // Privacy-safe allowlist category only. PID, executable basename/path and
+    // window title never cross this IPC boundary.
+    #[serde(default)]
+    pub source_application: crate::clipboard_audit::ClipboardSourceApplication,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -203,6 +207,11 @@ pub enum Data {
         audio: bool,
         file: bool,
         file_transfer_enabled: bool,
+        /// Explicit peer capability gate for host-initiated direct downloads.
+        /// Older controllers deserialize this as absent/false and must never
+        /// be selected for a direct transfer.
+        #[serde(default)]
+        direct_file_receive_supported: bool,
         restart: bool,
         recording: bool,
         block_input: bool,
@@ -266,6 +275,14 @@ pub enum Data {
     #[cfg(windows)]
     SyncWinCpuUsage(Option<f64>),
     FileTransferLog((String, String)),
+    /// Local destination finalization result used only by the server-side
+    /// enterprise audit pipeline. It is deliberately separate from the peer
+    /// transfer protocol so an accepted overwrite Skip can remain a normal UI
+    /// completion while the immutable audit record stays conservative.
+    FileTransferAuditOutcome {
+        id: i32,
+        succeeded: bool,
+    },
     #[cfg(windows)]
     ControlledSessionCount(usize),
     CmErr(String),
@@ -273,6 +290,14 @@ pub enum Data {
     OpenFileTransferFolder {
         path: String,
         selected_name: Option<String>,
+        result: Option<String>,
+    },
+    /// Starts a host-to-controller transfer from a source path that is valid
+    /// only inside the controlled host. The server connection must convert it
+    /// to privacy-safe metadata before sending anything over the peer wire.
+    #[cfg(windows)]
+    DirectFileTransfer {
+        source_path: String,
         result: Option<String>,
     },
     CheckHwcodec,
@@ -678,6 +703,20 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .send(&Data::OpenFileTransferFolder {
                         path: String::new(),
                         selected_name: None,
+                        result: Some(result)
+                    })
+                    .await
+            );
+        }
+        #[cfg(windows)]
+        Data::DirectFileTransfer { source_path, .. } => {
+            let result = crate::ui_cm_interface::start_direct_file_transfer(source_path)
+                .map(|_| String::new())
+                .unwrap_or_else(|err| err);
+            allow_err!(
+                stream
+                    .send(&Data::DirectFileTransfer {
+                        source_path: String::new(),
                         result: Some(result)
                     })
                     .await
@@ -1484,9 +1523,76 @@ pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 96);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_clipboard_ipc_without_source_application_defaults_to_unknown() {
+        let current = ClipboardNonFile {
+            compress: false,
+            content: bytes::Bytes::new(),
+            content_len: 0,
+            next_raw: false,
+            width: 0,
+            height: 0,
+            format: 0,
+            special_name: String::new(),
+            source_application: crate::clipboard_audit::ClipboardSourceApplication::FileManager,
+        };
+        let mut legacy_value = serde_json::to_value(current).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("source_application");
+
+        let decoded: ClipboardNonFile = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(
+            decoded.source_application,
+            crate::clipboard_audit::ClipboardSourceApplication::Unknown
+        );
+    }
+
+    #[test]
+    fn legacy_login_ipc_does_not_gain_direct_receive_capability() {
+        let current = Data::Login {
+            id: 1,
+            is_file_transfer: false,
+            is_view_camera: false,
+            is_terminal: false,
+            peer_id: "peer".to_owned(),
+            name: "controller".to_owned(),
+            ip: "127.0.0.1".to_owned(),
+            authorized: true,
+            port_forward: String::new(),
+            keyboard: true,
+            clipboard: true,
+            audio: true,
+            file: true,
+            file_transfer_enabled: true,
+            direct_file_receive_supported: true,
+            restart: true,
+            recording: true,
+            block_input: true,
+            from_switch: false,
+        };
+        let mut legacy_value = serde_json::to_value(current).unwrap();
+        legacy_value["c"]
+            .as_object_mut()
+            .unwrap()
+            .remove("direct_file_receive_supported");
+
+        let decoded: Data = serde_json::from_value(legacy_value).unwrap();
+        assert!(matches!(
+            decoded,
+            Data::Login {
+                direct_file_receive_supported: false,
+                ..
+            }
+        ));
     }
 }

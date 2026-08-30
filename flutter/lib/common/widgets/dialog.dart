@@ -1804,10 +1804,11 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
       close(true);
     }
 
-    Future<bool> set() async {
+    Future<bool> set({bool saveRecording = true}) async {
       if (isInProgress) return false;
       final recordingTitle = titleController.text.trim();
-      if (showRecordingNote &&
+      if (saveRecording &&
+          showRecordingNote &&
           !RegExp(r'[ㄱ-ㅎㅏ-ㅣ가-힣]').hasMatch(recordingTitle)) {
         setState(() {
           saveError = translate('Enter a Korean video title');
@@ -1819,7 +1820,7 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
         saveError = '';
       });
       final noteText = noteController.text.trim();
-      if (showRecordingNote) {
+      if (saveRecording && showRecordingNote) {
         final error = await bind.sessionSaveRecordingNote(
           sessionId: ffi.sessionId,
           title: recordingTitle,
@@ -1875,13 +1876,13 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
     }
     if (type == 'relay-hint' || type == 'relay-hint2') {
       buttons.add(dialogButton('Retry', onPressed: () async {
-        if (!await set()) return;
+        if (!await set(saveRecording: false)) return;
         close(true);
         ffi.ffiModel.reconnect(ffi.dialogManager, ffi.sessionId, false);
       }));
       if (type == 'relay-hint2') {
         buttons.add(dialogButton('Connect via relay', onPressed: () async {
-          if (!await set()) return;
+          if (!await set(saveRecording: false)) return;
           close(true);
           ffi.ffiModel.reconnect(ffi.dialogManager, ffi.sessionId, true);
         }));

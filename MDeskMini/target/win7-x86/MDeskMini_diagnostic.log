@@ -1,0 +1,35 @@
+﻿time=2026-08-16T00:46:50.902 epoch_ms=1786808810903 elapsed_ms=3 pid=34672 stage=log.bootstrap diagnostic_log=D:\IMedix\Rust\rustdesk\MDeskMini\target\win7-x86\MDeskMini_diagnostic.log
+time=2026-08-16T00:46:50.905 epoch_ms=1786808810905 elapsed_ms=6 pid=34672 stage=log.ready diagnostic_log=D:\IMedix\Rust\rustdesk\MDeskMini\target\win7-x86\MDeskMini_diagnostic.log internal_file_logger_ready=true max_level=Debug
+time=2026-08-16T00:46:50.907 epoch_ms=1786808810908 elapsed_ms=8 pid=34672 stage=process.start version=1.5.2 pid=34672 arch=x86 mode=serve
+time=2026-08-16T00:46:50.907 epoch_ms=1786808810908 elapsed_ms=8 pid=34672 stage=process.dpi.begin configuring DPI awareness
+time=2026-08-16T00:46:50.909 epoch_ms=1786808810909 elapsed_ms=9 pid=34672 stage=process.dpi.complete DPI awareness configured
+time=2026-08-16T00:46:50.909 epoch_ms=1786808810909 elapsed_ms=10 pid=34672 stage=serve.begin headless=false approve_mode=click api_configured=true password_configured=false
+time=2026-08-16T00:46:50.946 epoch_ms=1786808810946 elapsed_ms=47 pid=34672 stage=ui.waiting_window created
+time=2026-08-16T00:46:50.946 epoch_ms=1786808810947 elapsed_ms=47 pid=34672 stage=startup.progress percent=5 title=MDesk 준비중 message=프로그램을 초기화하고 있습니다.
+time=2026-08-16T00:46:50.952 epoch_ms=1786808810952 elapsed_ms=52 pid=34672 stage=runtime.global_init.begin starting global initialization
+time=2026-08-16T00:46:51.427 epoch_ms=1786808811427 elapsed_ms=527 pid=34672 stage=runtime.global_init.complete global initialization completed
+time=2026-08-16T00:46:51.427 epoch_ms=1786808811428 elapsed_ms=528 pid=34672 stage=runtime.custom_client.begin loading custom client settings
+time=2026-08-16T00:46:51.427 epoch_ms=1786808811428 elapsed_ms=528 pid=34672 stage=runtime.custom_client.complete custom client settings loaded
+time=2026-08-16T00:46:51.427 epoch_ms=1786808811428 elapsed_ms=528 pid=34672 stage=runtime.defaults.complete product defaults applied
+time=2026-08-16T00:46:51.436 epoch_ms=1786808811436 elapsed_ms=536 pid=34672 stage=runtime.windows_bootstrap.complete Windows bootstrap completed
+time=2026-08-16T00:46:51.436 epoch_ms=1786808811436 elapsed_ms=537 pid=34672 stage=runtime.ready local_peer_id=5270854
+time=2026-08-16T00:46:51.437 epoch_ms=1786808811437 elapsed_ms=537 pid=34672 stage=installed_mdesk.not_found continuing in portable host mode
+time=2026-08-16T00:46:51.438 epoch_ms=1786808811439 elapsed_ms=539 pid=34672 stage=startup.progress percent=30 title=MDesk 준비중 message=원격 접속 정책을 적용하고 있습니다.
+time=2026-08-16T00:46:51.445 epoch_ms=1786808811445 elapsed_ms=546 pid=34672 stage=policy.applied host acceptance policy applied
+time=2026-08-16T00:46:51.445 epoch_ms=1786808811446 elapsed_ms=546 pid=34672 stage=startup.progress percent=45 title=MDesk 준비중 message=인증번호를 확인하고 있습니다.
+time=2026-08-16T00:46:51.449 epoch_ms=1786808811450 elapsed_ms=550 pid=34672 stage=cert.clipboard.begin checking clipboard for certificate number
+time=2026-08-16T00:46:51.453 epoch_ms=1786808811453 elapsed_ms=554 pid=34672 stage=cert.clipboard.empty certificate number was not found
+time=2026-08-16T00:46:51.453 epoch_ms=1786808811454 elapsed_ms=554 pid=34672 stage=cert.not_available no verified clipboard certificate session
+time=2026-08-16T00:46:51.453 epoch_ms=1786808811454 elapsed_ms=554 pid=34672 stage=startup.progress percent=60 title=MDesk 준비중 message=원격 연결 허용 상태를 준비하고 있습니다.
+time=2026-08-16T00:46:51.457 epoch_ms=1786808811458 elapsed_ms=558 pid=34672 stage=host.accepting host accepting mode is enabled
+time=2026-08-16T00:46:51.458 epoch_ms=1786808811458 elapsed_ms=558 pid=34672 stage=portable_service.start requesting quick-support SYSTEM service
+time=2026-08-16T00:46:52.825 epoch_ms=1786808812825 elapsed_ms=1925 pid=34672 stage=portable_service.detected elapsed_ms=1004
+time=2026-08-16T00:46:52.825 epoch_ms=1786808812826 elapsed_ms=1926 pid=34672 stage=portable_service.ready SYSTEM portable service is ready
+time=2026-08-16T00:46:52.825 epoch_ms=1786808812826 elapsed_ms=1926 pid=34672 stage=startup.progress percent=72 title=MDesk 준비중 message=연결 관리자를 시작하고 있습니다.
+time=2026-08-16T00:46:52.831 epoch_ms=1786808812832 elapsed_ms=1932 pid=34672 stage=connection_manager.ready connection manager initialized
+time=2026-08-16T00:46:52.832 epoch_ms=1786808812832 elapsed_ms=1933 pid=34672 stage=startup.progress percent=82 title=MDesk 준비중 message=작업 표시줄 아이콘을 준비하고 있습니다.
+time=2026-08-16T00:46:52.859 epoch_ms=1786808812859 elapsed_ms=1959 pid=34672 stage=tray.ready tray icon created
+time=2026-08-16T00:46:52.859 epoch_ms=1786808812859 elapsed_ms=1959 pid=34672 stage=startup.progress percent=92 title=MDesk 준비중 message=원격 서버를 시작하고 있습니다.
+time=2026-08-16T00:46:52.863 epoch_ms=1786808812863 elapsed_ms=1963 pid=34672 stage=server.spawn starting host server thread
+time=2026-08-16T00:46:52.864 epoch_ms=1786808812864 elapsed_ms=1964 pid=34672 stage=startup.progress percent=100 title=MDesk 원격대기중 message=원격 연결 요청을 기다리는 중입니다.
+time=2026-08-16T00:46:52.864 epoch_ms=1786808812864 elapsed_ms=1964 pid=34672 stage=server.thread.begin host server thread entered

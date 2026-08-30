@@ -290,9 +290,13 @@ class DeviceRegisterService {
     required String userId,
     String? userPkid,
     required String remoteId,
+    bool remoteRegistration = false,
   }) async {
     try {
-      final url = Uri.parse('$apiServer/api/device/register/check');
+      final endpoint = remoteRegistration
+          ? '/api/device/remote/register/check'
+          : '/api/device/register/check';
+      final url = Uri.parse('$apiServer$endpoint');
       final bodyMap = <String, dynamic>{
         'remote_id': remoteId,
         'user_id': userId,
@@ -323,8 +327,12 @@ class DeviceRegisterService {
       if (response.statusCode == 401) {
         return DeviceRegisterResponse(
           success: false,
-          message: '인증이 만료되었습니다. 다시 로그인해주세요.',
-          error: 'UNAUTHORIZED',
+          message: remoteRegistration
+              ? '서버에서 토큰 없는 원격자 등록을 허용하지 않습니다.'
+              : '인증이 만료되었습니다. 다시 로그인해주세요.',
+          error: remoteRegistration
+              ? 'PUBLIC_REGISTRATION_DISABLED'
+              : 'UNAUTHORIZED',
           statusCode: 401,
         );
       }
@@ -469,6 +477,7 @@ class DeviceRegisterService {
         apiServer: server,
         userId: userId,
         remoteId: remoteId,
+        remoteRegistration: true,
       );
       if (limitCheck.limitDecision == false || limitCheck.isUnauthorized) {
         return limitCheck.limitDecision == false
@@ -476,7 +485,7 @@ class DeviceRegisterService {
             : limitCheck;
       }
 
-      final url = Uri.parse('$server/api/device/register');
+      final url = Uri.parse('$server/api/device/remote/register');
 
       final body = jsonEncode({
         'user_id': userId,
@@ -498,6 +507,15 @@ class DeviceRegisterService {
 
       debugPrint(
           'DeviceRegisterService: Register response - ${response.statusCode}, body=${response.body}');
+
+      if (response.statusCode == 401) {
+        return DeviceRegisterResponse(
+          success: false,
+          message: '서버에서 토큰 없는 원격자 등록을 허용하지 않습니다.',
+          error: 'PUBLIC_REGISTRATION_DISABLED',
+          statusCode: 401,
+        );
+      }
 
       return _parseRegisterResponse(response);
     } catch (e) {
@@ -593,7 +611,7 @@ class DeviceRegisterService {
         server = server.replaceFirst('http://', 'https://');
       }
 
-      final url = Uri.parse('$server/api/device/unregister');
+      final url = Uri.parse('$server/api/device/remote/unregister');
 
       final body = jsonEncode({
         'user_id': userId,
@@ -612,6 +630,15 @@ class DeviceRegisterService {
 
       debugPrint(
           'DeviceRegisterService: Unregister response - ${response.statusCode}, body=${response.body}');
+
+      if (response.statusCode == 401) {
+        return DeviceRegisterResponse(
+          success: false,
+          message: '서버에서 토큰 없는 원격자 등록 해제를 허용하지 않습니다.',
+          error: 'PUBLIC_REGISTRATION_DISABLED',
+          statusCode: 401,
+        );
+      }
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final Map<String, dynamic> result = jsonDecode(response.body);

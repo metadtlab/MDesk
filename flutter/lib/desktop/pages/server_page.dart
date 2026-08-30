@@ -768,28 +768,6 @@ class _CmControlPanelState extends State<_CmControlPanel> {
   Client get client => widget.client;
 
   @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance
-        .addPostFrameCallback((_) => _tryAutoAcceptIncoming());
-  }
-
-  /// ['click'] 만 원격 측 클릭 승인만 요구 — 자동 승인해도 됨.
-  /// ['password'], ['password-click'], 빈값(→Rust Both) 등은 비밀번호·양쪽 승인 경로가 있어
-  /// 자동 승인 시 제어측 비밀번호 없이 바로 연결되는 문제가 생김.
-  void _tryAutoAcceptIncoming() {
-    if (!mounted) return;
-    if (client.authorized) return;
-    final model = Provider.of<ServerModel>(context, listen: false);
-    if (model.approveMode != 'click') return;
-    model.sendLoginResponse(client, true);
-    if (bind.cmCanElevate()) {
-      handleElevate(context);
-      windowManager.minimize();
-    }
-  }
-
-  @override
   Widget build(BuildContext context) {
     return client.authorized
         ? client.disconnected
@@ -988,12 +966,29 @@ class _CmControlPanelState extends State<_CmControlPanel> {
   }
 
   buildUnAuthorized(BuildContext context) {
+    final model = Provider.of<ServerModel>(context);
+    final showAccept = model.approveMode != 'password';
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
+            if (showAccept)
+              Expanded(
+                child: buildButton(
+                  context,
+                  color: MyTheme.accent,
+                  onClick: () => handleAccept(context),
+                  text: 'Accept',
+                  icon: const Icon(
+                    Icons.check_rounded,
+                    color: Colors.white,
+                    size: 14,
+                  ),
+                  textColor: Colors.white,
+                ),
+              ),
             Expanded(
               child: buildButton(
                 context,
@@ -1073,6 +1068,15 @@ class _CmControlPanelState extends State<_CmControlPanel> {
 
   void handleDisconnect() {
     bind.cmCloseConnection(connId: client.id);
+  }
+
+  void handleAccept(BuildContext context) {
+    final model = Provider.of<ServerModel>(context, listen: false);
+    model.sendLoginResponse(client, true);
+    if (bind.cmCanElevate()) {
+      handleElevate(context);
+      windowManager.minimize();
+    }
   }
 
   void handleElevate(BuildContext context) {

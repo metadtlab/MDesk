@@ -5,6 +5,7 @@ set "PROJECT_DIR=%~dp0"
 set "SOURCE_EXE=%PROJECT_DIR%target\win7-x64\MDeskMini-Win7-x64.exe"
 set "TARGET_EXE=%PROJECT_DIR%target\win7-x64\MDeskMini-Win7-x64-UPX.exe"
 set "NEW_EXE=%PROJECT_DIR%target\win7-x64\MDeskMini-Win7-x64-UPX-new.exe"
+set "ADMIN_VERIFY_SCRIPT=%PROJECT_DIR%verify_admin_manifest.ps1"
 
 where upx >nul 2>nul
 if errorlevel 1 (
@@ -41,6 +42,12 @@ if errorlevel 1 (
 upx -t "%NEW_EXE%"
 if errorlevel 1 (
   echo ERROR: UPX integrity verification failed.
+  exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%NEW_EXE%"
+if errorlevel 1 (
+  echo ERROR: UPX output is missing the administrator manifest.
   exit /b 1
 )
 

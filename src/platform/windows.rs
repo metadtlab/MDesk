@@ -25,7 +25,7 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, process::CommandExt},
+        windows::{ffi::OsStringExt, fs::MetadataExt, process::CommandExt},
     },
     path::*,
     ptr::null_mut,
@@ -161,27 +161,40 @@ pub fn register_explorer_send_to_controller_menu() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let exe = exe.to_string_lossy().to_string();
     let icon = format!("\"{exe}\"");
-    let selected_command = format!("\"{exe}\" --send-to-controller \"%1\" --select");
-    let background_command = format!("\"{exe}\" --send-to-controller \"%V\"");
 
-    register_explorer_send_menu_key(
-        &format!("Software\\Classes\\*\\shell\\{EXPLORER_SEND_MENU_KEY}"),
-        &icon,
-        &selected_command,
-    )?;
-    register_explorer_send_menu_key(
-        &format!("Software\\Classes\\Directory\\shell\\{EXPLORER_SEND_MENU_KEY}"),
-        &icon,
-        &selected_command,
-    )?;
-    register_explorer_send_menu_key(
-        &format!("Software\\Classes\\Directory\\Background\\shell\\{EXPLORER_SEND_MENU_KEY}"),
-        &icon,
-        &background_command,
-    )?;
+    // A background verb receives `%V` (the current directory). In direct-send
+    // mode that would recursively transfer the entire folder without a file
+    // selection, so remove any legacy registration before exposing the two
+    // explicit-selection verbs.
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let background_key =
+        format!("Software\\Classes\\Directory\\Background\\shell\\{EXPLORER_SEND_MENU_KEY}");
+    match hkcu.delete_subkey_all(&background_key) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    for (key_path, command) in explorer_direct_send_menu_entries(&exe) {
+        register_explorer_send_menu_key(&key_path, &icon, &command)?;
+    }
 
     notify_shell_assoc_changed();
     Ok(())
+}
+
+fn explorer_direct_send_menu_entries(exe: &str) -> [(String, String); 2] {
+    let command = format!("\"{exe}\" --send-to-controller \"%1\" --select");
+    [
+        (
+            format!("Software\\Classes\\*\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+            command.clone(),
+        ),
+        (
+            format!("Software\\Classes\\Directory\\shell\\{EXPLORER_SEND_MENU_KEY}"),
+            command,
+        ),
+    ]
 }
 
 fn register_explorer_send_menu_key(key_path: &str, icon: &str, command: &str) -> io::Result<()> {
@@ -211,8 +224,8 @@ pub fn unregister_explorer_send_to_controller_menu() {
     notify_shell_assoc_changed();
 }
 
-pub fn send_explorer_path_to_controller(path: String, select_path: bool) -> Result<(), String> {
-    let (folder, selected_name) = explorer_transfer_target(&path, select_path)?;
+pub fn send_explorer_path_to_controller(path: String, _select_path: bool) -> Result<(), String> {
+    let source_path = explorer_direct_transfer_source(&path)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -222,9 +235,8 @@ pub fn send_explorer_path_to_controller(path: String, select_path: bool) -> Resu
         let mut conn = ipc::connect(1500, "_cm")
             .await
             .map_err(|_| "MDesk is not running or no remote session is active.".to_owned())?;
-        conn.send(&ipc::Data::OpenFileTransferFolder {
-            path: folder,
-            selected_name,
+        conn.send(&ipc::Data::DirectFileTransfer {
+            source_path,
             result: None,
         })
         .await
@@ -237,11 +249,11 @@ pub fn send_explorer_path_to_controller(path: String, select_path: bool) -> Resu
                 return Err("MDesk did not respond.".to_owned());
             }
             match conn.next_timeout(remaining.as_millis() as u64).await {
-                Ok(Some(ipc::Data::OpenFileTransferFolder {
+                Ok(Some(ipc::Data::DirectFileTransfer {
                     result: Some(result),
                     ..
                 })) if result.is_empty() => return Ok(()),
-                Ok(Some(ipc::Data::OpenFileTransferFolder {
+                Ok(Some(ipc::Data::DirectFileTransfer {
                     result: Some(result),
                     ..
                 })) => return Err(result),
@@ -253,48 +265,39 @@ pub fn send_explorer_path_to_controller(path: String, select_path: bool) -> Resu
     })
 }
 
-fn explorer_transfer_target(
-    path: &str,
-    select_path: bool,
-) -> Result<(String, Option<String>), String> {
+fn explorer_direct_transfer_source(path: &str) -> Result<String, String> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
     let trimmed = path.trim_matches('"').trim();
     if trimmed.is_empty() {
         return Err("No file or folder was selected.".to_owned());
     }
 
     let selected = PathBuf::from(trimmed);
-    let selected_name = selected
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|name| !name.is_empty());
+    if !selected.is_absolute() {
+        return Err("The selected path must be absolute.".to_owned());
+    }
 
-    let (folder, selected_name) = match fs::metadata(&selected) {
-        Ok(metadata) if metadata.is_dir() && select_path => (
-            selected
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| selected.clone()),
-            selected_name,
-        ),
-        Ok(metadata) if metadata.is_dir() => (selected, None),
-        Ok(_) => (
-            selected
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| "Selected file has no parent folder.".to_owned())?,
-            selected_name,
-        ),
-        Err(_) if selected.extension().is_some() || select_path => (
-            selected
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| "Selected file has no parent folder.".to_owned())?,
-            selected_name,
-        ),
-        Err(_) => (selected, None),
-    };
+    let source_metadata = fs::symlink_metadata(&selected)
+        .map_err(|err| format!("The selected file or folder is unavailable: {err}"))?;
+    if source_metadata.file_type().is_symlink()
+        || source_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("Symbolic links and reparse points cannot be transferred directly.".to_owned());
+    }
 
-    Ok((folder.to_string_lossy().to_string(), selected_name))
+    let selected = fs::canonicalize(&selected)
+        .map_err(|err| format!("The selected file or folder is unavailable: {err}"))?;
+    let metadata = fs::metadata(&selected)
+        .map_err(|err| format!("The selected file or folder is unavailable: {err}"))?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("Only a regular file or folder can be transferred.".to_owned());
+    }
+
+    selected
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "The selected path contains unsupported characters.".to_owned())
 }
 
 fn notify_shell_assoc_changed() {
@@ -4628,6 +4631,31 @@ pub mod remote_overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_direct_send_menu_requires_an_explicit_selection() {
+        let entries = explorer_direct_send_menu_entries(r"C:\Program Files\MDesk\MDesk.exe");
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|(key, _)| !key.contains("Directory\\Background")));
+        assert!(entries
+            .iter()
+            .all(|(_, command)| command.contains("\"%1\" --select")));
+        assert!(entries.iter().all(|(_, command)| !command.contains("%V")));
+    }
+
+    #[test]
+    fn explorer_direct_send_accepts_only_an_existing_absolute_source() {
+        assert!(explorer_direct_transfer_source("relative-file.txt").is_err());
+
+        let current_exe = std::env::current_exe().unwrap();
+        let validated = explorer_direct_transfer_source(current_exe.to_str().unwrap()).unwrap();
+        assert!(Path::new(&validated).is_absolute());
+        assert!(Path::new(&validated).is_file());
+    }
+
     #[test]
     fn test_uninstall_cert() {
         println!("uninstall driver certs: {:?}", cert::uninstall_cert());

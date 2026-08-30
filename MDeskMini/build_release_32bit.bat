@@ -8,6 +8,7 @@ set "TARGET=i686-pc-windows-msvc"
 set "VCPKG_TRIPLET=x86-windows-static"
 set "CARGO_TARGET_DIR=%PROJECT_DIR%target"
 set "OUTPUT=%CARGO_TARGET_DIR%\%TARGET%\release\mdeskmini.exe"
+set "ADMIN_VERIFY_SCRIPT=%PROJECT_DIR%verify_admin_manifest.ps1"
 
 echo ========================================
 echo MDeskMini 32-bit Windows release build
@@ -120,6 +121,12 @@ echo [4/5] Verifying output
 if not exist "%OUTPUT%" (
   echo ERROR: Build finished but the executable was not found:
   echo        %OUTPUT%
+  exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%OUTPUT%"
+if errorlevel 1 (
+  echo ERROR: Administrator manifest verification failed.
   exit /b 1
 )
 

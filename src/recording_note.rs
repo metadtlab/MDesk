@@ -21,6 +21,13 @@ const TAGS_ID: [u8; 4] = [0x12, 0x54, 0xC3, 0x67];
 const TITLE_ID: [u8; 2] = [0x7B, 0xA9];
 const TARGETS_ID: [u8; 2] = [0x63, 0xC0];
 
+#[derive(Clone)]
+pub struct RecordingUploadFile {
+    pub path: String,
+    pub source_connection_id: String,
+    pub connection_ticket: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct RecordingNoteContext {
     pub title: String,
@@ -32,7 +39,7 @@ pub struct RecordingNoteContext {
 
 pub struct RecordingNoteSaveResult {
     pub error: String,
-    pub files: Vec<String>,
+    pub files: Vec<RecordingUploadFile>,
 }
 
 #[derive(Serialize)]
@@ -46,10 +53,16 @@ struct RecordingNoteFile<'a> {
     video_file: String,
     saved_at: String,
     metadata_embedded: bool,
+    source_connection_id: &'a str,
+    upload_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_recording_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uploaded_at: Option<String>,
 }
 
 pub fn save_recording_notes(
-    files: Vec<String>,
+    files: Vec<RecordingUploadFile>,
     context: RecordingNoteContext,
     completion: Option<std::sync::mpsc::Sender<RecordingNoteSaveResult>>,
 ) {
@@ -82,7 +95,14 @@ pub fn save_recording_notes(
         let mut final_files = Vec::new();
 
         for file in files {
-            let path = PathBuf::from(&file);
+            let path = PathBuf::from(&file.path);
+            if !path.is_file() {
+                let error = format!("녹화 파일이 예상치 않게 사라졌습니다: {}", path.display());
+                log::warn!("{error}");
+                errors.push(error);
+                final_files.push(file);
+                continue;
+            }
             if !wait_until_file_is_stable(&path) {
                 let error = format!("녹화 파일 준비가 끝나지 않았습니다: {}", path.display());
                 log::warn!("{error}");
@@ -91,7 +111,7 @@ pub fn save_recording_notes(
                 continue;
             }
 
-            final_files.push(path.to_string_lossy().to_string());
+            final_files.push(file.clone());
 
             let metadata_embedded =
                 match set_video_metadata_with_retry(&path, &context.title, &context.comment) {
@@ -105,7 +125,12 @@ pub fn save_recording_notes(
                     }
                 };
 
-            let note = RecordingNoteFile {
+            let upload_id = crate::hbbs_http::recording_upload_v2::deterministic_upload_id(
+                &file.source_connection_id,
+                &path,
+            );
+            let sidecar = path.with_extension("mdesk.json");
+            let mut note = RecordingNoteFile {
                 schema_version: 1,
                 title: &context.title,
                 comment: &context.comment,
@@ -118,13 +143,22 @@ pub fn save_recording_notes(
                     .unwrap_or_else(|| path.to_string_lossy().to_string()),
                 saved_at: chrono::Local::now().to_rfc3339(),
                 metadata_embedded,
+                source_connection_id: &file.source_connection_id,
+                upload_id,
+                // A local sidecar is user-editable and therefore never
+                // authoritative proof that the server accepted this upload.
+                // Always issue the deterministic idempotent POST below.
+                server_recording_id: None,
+                uploaded_at: None,
             };
-            let sidecar = path.with_extension("mdesk.json");
-            match serde_json::to_vec_pretty(&note)
+            let local_note_saved = match serde_json::to_vec_pretty(&note)
                 .map_err(|err| err.to_string())
                 .and_then(|data| std::fs::write(&sidecar, data).map_err(|err| err.to_string()))
             {
-                Ok(()) => log::info!("Recording note saved: {}", sidecar.display()),
+                Ok(()) => {
+                    log::info!("Recording note saved: {}", sidecar.display());
+                    true
+                }
                 Err(err) => {
                     let error = format!(
                         "작업내용 파일 저장에 실패했습니다 ({}): {err}",
@@ -132,8 +166,54 @@ pub fn save_recording_notes(
                     );
                     log::error!("{error}");
                     errors.push(error);
+                    false
+                }
+            };
+
+            if local_note_saved && !metadata_embedded && is_webm_or_mkv(&path) {
+                // A supported container must have both its local note sidecar
+                // and embedded metadata finalized before any server upload.
+                continue;
+            }
+            if !local_note_saved {
+                continue;
+            }
+            match crate::hbbs_http::recording_upload_v2::upload_recording(
+                crate::hbbs_http::recording_upload_v2::RecordingUploadRequest {
+                    source_connection_id: &file.source_connection_id,
+                    ticket: &file.connection_ticket,
+                    title: &context.title,
+                    work_content: &context.comment,
+                    file_path: &path,
+                },
+            ) {
+                Ok(uploaded) => {
+                    note.server_recording_id = Some(uploaded.id.clone());
+                    note.uploaded_at = Some(chrono::Local::now().to_rfc3339());
+                    if let Ok(data) = serde_json::to_vec_pretty(&note) {
+                        if let Err(err) = std::fs::write(&sidecar, data) {
+                            log::warn!(
+                                "Failed to update recording upload receipt '{}': {err}",
+                                sidecar.display()
+                            );
+                        }
+                    }
+                    log::info!(
+                        "Recording uploaded: id={}, idempotent={}",
+                        uploaded.id,
+                        uploaded.idempotent
+                    );
+                }
+                Err(err) => {
+                    let error = format!("{} ({})", err, path.display());
+                    log::error!("Recording upload failed: {err}");
+                    errors.push(error);
                 }
             }
+        }
+
+        if final_files.is_empty() && errors.is_empty() {
+            errors.push("녹화 시간이 너무 짧아 서버에 저장할 영상이 없습니다.".to_owned());
         }
 
         if let Some(completion) = completion {
@@ -145,6 +225,17 @@ pub fn save_recording_notes(
                 .ok();
         }
     });
+}
+
+fn is_webm_or_mkv(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "webm" | "mkv"
+    )
 }
 
 fn wait_until_file_is_stable(path: &Path) -> bool {
@@ -582,7 +673,10 @@ fn encode_ebml_size(value: u64, requested_width: Option<usize>) -> Result<Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use super::{build_webm_tags, contains_korean, decode_ebml_size, encode_ebml_size};
+    use super::{
+        build_webm_tags, contains_korean, decode_ebml_size, encode_ebml_size, save_recording_notes,
+        RecordingNoteContext, RecordingNoteFile, RecordingUploadFile,
+    };
 
     #[test]
     fn recording_note_title_requires_korean() {
@@ -610,5 +704,55 @@ mod tests {
         assert!(tags
             .windows("원격 작업내용".len())
             .any(|part| part == "원격 작업내용".as_bytes()));
+    }
+
+    #[test]
+    fn local_sidecar_never_contains_the_connection_ticket() {
+        let note = RecordingNoteFile {
+            schema_version: 1,
+            title: "점검 영상",
+            comment: "작업 완료",
+            peer_id: "1301794",
+            session_id: 1,
+            role: "controller",
+            video_file: "recording.webm".to_owned(),
+            saved_at: "2026-08-16T17:00:00+09:00".to_owned(),
+            metadata_embedded: true,
+            source_connection_id: "45bc3c20-4bc4-4ea5-945d-3b62c061d04b",
+            upload_id: "fd1b07f1-9ca1-5dd5-bcba-f9da0e235ea2".to_owned(),
+            server_recording_id: None,
+            uploaded_at: None,
+        };
+        let raw = String::from_utf8(serde_json::to_vec(&note).unwrap()).unwrap();
+        assert!(!raw.contains("connection_ticket"));
+        assert!(!raw.contains("must-not-be-persisted"));
+    }
+
+    #[test]
+    fn unexpected_missing_segment_fails_closed_and_remains_retryable() {
+        let missing = std::env::temp_dir().join(format!(
+            "mdesk-removed-short-segment-{}.webm",
+            uuid::Uuid::new_v4()
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        save_recording_notes(
+            vec![RecordingUploadFile {
+                path: missing.to_string_lossy().to_string(),
+                source_connection_id: uuid::Uuid::new_v4().to_string(),
+                connection_ticket: "not-persisted".to_owned(),
+            }],
+            RecordingNoteContext {
+                title: "짧은 녹화".to_owned(),
+                comment: String::new(),
+                peer_id: "1301794".to_owned(),
+                session_id: 1,
+                role: "controller",
+            },
+            Some(tx),
+        );
+
+        let result = rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        assert!(result.error.contains("예상치 않게 사라졌습니다"));
+        assert_eq!(result.files.len(), 1);
     }
 }

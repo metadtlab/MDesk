@@ -1,0 +1,1 @@
+[2026-08-16 00:46:51.842649 +09:00] INFO [D:\IMedix\Rust\rustdesk\src\platform\windows.rs:2615] elevate: false -> Ok(true), run_as_system: false -> owner

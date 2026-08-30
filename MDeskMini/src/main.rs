@@ -11,8 +11,12 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
+use std::fs::{create_dir_all, remove_dir, remove_file, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{atomic::AtomicBool, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
@@ -41,7 +45,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    IsUserAnAdmin, Shell_NotifyIconW, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -56,6 +60,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const DEFAULT_CERT_VERIFY_URL: &str = "https://admin.787.kr/api/certno/verify";
 const DEFAULT_AGENTNUMUPDATE_BASE_URL: &str = "https://787.kr";
 const DEFAULT_API_HINT: &str = "https://admin.787.kr";
+// Cleanup-only values from the temporary internal-network build. These are never
+// selected as endpoints and can only be used to remove the exact stale settings.
+const ROLLED_BACK_PRIVATE_ID_SERVER: &str = "172.16.100.100:21116";
+const ROLLED_BACK_PRIVATE_RELAY_SERVER: &str = "172.16.100.100:21117";
 const READINESS_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 const RENDEZVOUS_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "windows")]
@@ -92,6 +100,33 @@ static PROGRESS_FILL_HWND: AtomicIsize = AtomicIsize::new(0);
 static PROGRESS_TRACK_BRUSH: AtomicIsize = AtomicIsize::new(0);
 #[cfg(target_os = "windows")]
 static PROGRESS_FILL_BRUSH: AtomicIsize = AtomicIsize::new(0);
+
+const DIAGNOSTIC_LOG_FILE: &str = "MDeskMini_diagnostic.log";
+const DIAGNOSTIC_LOG_FILTER: &str = "debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn";
+static DIAGNOSTIC_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static DIAGNOSTIC_STARTED_AT: OnceLock<Instant> = OnceLock::new();
+static DIAGNOSTIC_LOG_LOCK: Mutex<()> = Mutex::new(());
+static INTERNAL_FILE_LOGGER: OnceLock<hbb_common::flexi_logger::LoggerHandle> = OnceLock::new();
+static LOG_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Default)]
+struct DiagnosticSystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn GetLocalTime(system_time: *mut DiagnosticSystemTime);
+}
 
 #[derive(Parser)]
 #[command(name = "mdeskmini", about = "Minimal host runtime with accept popup")]
@@ -201,7 +236,6 @@ struct CertVerifyResponse {
 
 #[derive(Debug, Clone)]
 struct CertVerification {
-    cert_code: String,
     verify_url: String,
     peer_id: String,
     customer_id: String,
@@ -212,10 +246,58 @@ struct CertVerification {
 }
 
 fn main() {
-    #[cfg(target_os = "windows")]
-    enable_per_monitor_dpi_awareness();
-
+    let _secure_log_cleanup = SecureLogCleanup;
+    common::mark_mdeskmini_process_tree();
     let first_arg = std::env::args().nth(1);
+    let delegates_to_core_main = is_rustdesk_internal_arg(first_arg.as_deref())
+        || internal_mode_from_arg(first_arg.as_deref()).is_some();
+    if !delegates_to_core_main {
+        init_diagnostic_logging();
+        diagnostic_event(
+            "process.start",
+            &format!(
+                "version={VERSION} pid={} arch={} mode={}",
+                std::process::id(),
+                std::env::consts::ARCH,
+                first_arg.as_deref().unwrap_or("serve")
+            ),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let elevated = is_running_as_administrator();
+        if !delegates_to_core_main {
+            diagnostic_event(
+                "process.elevation",
+                &format!("required=true elevated={elevated}"),
+            );
+        }
+        if !elevated {
+            if !delegates_to_core_main {
+                diagnostic_event(
+                    "process.elevation_failed",
+                    "administrator token is required; refusing non-elevated startup",
+                );
+                show_error_popup(
+                    "MDeskMini",
+                    "MDeskMini는 관리자 권한으로만 실행할 수 있습니다.\nUAC 요청을 승인한 뒤 다시 실행해 주세요.",
+                );
+            }
+            secure_process_exit(1);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if !delegates_to_core_main {
+            diagnostic_event("process.dpi.begin", "configuring DPI awareness");
+        }
+        enable_per_monitor_dpi_awareness();
+        if !delegates_to_core_main {
+            diagnostic_event("process.dpi.complete", "DPI awareness configured");
+        }
+    }
 
     if is_rustdesk_internal_arg(first_arg.as_deref()) {
         let _ = librustdesk::core_main::core_main();
@@ -237,7 +319,13 @@ fn main() {
         return;
     }
 
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("{err}");
+            secure_process_exit(err.exit_code());
+        }
+    };
 
     match cli.command {
         Some(Commands::Serve {
@@ -256,6 +344,219 @@ fn main() {
         Some(Commands::SendToController { path }) => run_send_to_controller(path, false, false),
         None => run_serve(ServeOptions::default()),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn is_running_as_administrator() -> bool {
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+
+fn init_diagnostic_logging() {
+    let _ = DIAGNOSTIC_STARTED_AT.set(Instant::now());
+    let path = diagnostic_log_path();
+
+    if let Some(directory) = path.as_ref().and_then(|path| path.parent()) {
+        std::env::set_var("HBB_LOG_DIR", directory);
+    }
+    std::env::set_var("RUST_LOG", DIAGNOSTIC_LOG_FILTER);
+
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        diagnostic_event("process.panic", &panic_info.to_string());
+        default_panic_hook(panic_info);
+        cleanup_mdeskmini_logs();
+    }));
+
+    diagnostic_event(
+        "log.bootstrap",
+        &format!(
+            "diagnostic_log={}",
+            path.as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable".to_owned())
+        ),
+    );
+    let internal_file_logger_ready = match hbb_common::init_log(false, "") {
+        Some(handle) => INTERNAL_FILE_LOGGER.set(handle).is_ok(),
+        None => false,
+    };
+    if let Some(path) = path {
+        diagnostic_event(
+            "log.ready",
+            &format!(
+                "diagnostic_log={} internal_file_logger_ready={internal_file_logger_ready} max_level={:?}",
+                path.display(),
+                hbb_common::log::max_level()
+            ),
+        );
+    } else {
+        hbb_common::log::error!("[MDeskMini][log.failed] no writable diagnostic log path");
+    }
+}
+
+struct SecureLogCleanup;
+
+impl Drop for SecureLogCleanup {
+    fn drop(&mut self) {
+        cleanup_mdeskmini_logs();
+    }
+}
+
+fn secure_process_exit(code: i32) -> ! {
+    cleanup_mdeskmini_logs();
+    std::process::exit(code)
+}
+
+fn cleanup_mdeskmini_logs() {
+    if LOG_CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    let is_primary_process = DIAGNOSTIC_STARTED_AT.get().is_some();
+    let mut log_files = hbb_common::shutdown_log_and_get_files();
+    let mut helper_directories = Vec::new();
+
+    if is_primary_process {
+        if let Some(Some(path)) = DIAGNOSTIC_LOG_PATH.get() {
+            log_files.push(path.clone());
+        }
+
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(directory) = exe.parent() {
+                collect_mdeskmini_log_files(directory, &mut log_files);
+                for helper_name in ["portable-service", "elevate", "run-as-system", "whiteboard"] {
+                    let helper_directory = directory.join(helper_name);
+                    collect_mdeskmini_log_files(&helper_directory, &mut log_files);
+                    helper_directories.push(helper_directory);
+                }
+            }
+        }
+    }
+
+    let mut unique_files = HashSet::new();
+    log_files.retain(|path| unique_files.insert(path.clone()));
+
+    for _ in 0..5 {
+        log_files.retain(|path| match remove_file(path) {
+            Ok(()) => false,
+            Err(_) => path.exists(),
+        });
+        if log_files.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    for directory in helper_directories {
+        let _ = remove_dir(directory);
+    }
+}
+
+fn collect_mdeskmini_log_files(directory: &std::path::Path, output: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && is_mdeskmini_log_file_name(&entry.file_name().to_string_lossy()) {
+            output.push(path);
+        }
+    }
+}
+
+fn is_mdeskmini_log_file_name(file_name: &str) -> bool {
+    let file_name = file_name.to_ascii_lowercase();
+    file_name == DIAGNOSTIC_LOG_FILE.to_ascii_lowercase()
+        || (file_name.starts_with("mdeskmini")
+            && (file_name.ends_with(".log") || file_name.ends_with(".gz")))
+}
+
+fn diagnostic_log_path() -> Option<PathBuf> {
+    DIAGNOSTIC_LOG_PATH
+        .get_or_init(|| {
+            let mut directories = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    directories.push(parent.to_path_buf());
+                }
+            }
+            directories.push(Config::log_path());
+            directories.push(std::env::temp_dir().join("MDesk"));
+
+            for directory in directories {
+                if directory.as_os_str().is_empty() || create_dir_all(&directory).is_err() {
+                    continue;
+                }
+                let path = directory.join(DIAGNOSTIC_LOG_FILE);
+                if OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .is_ok()
+                {
+                    return Some(path);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn diagnostic_event(stage: &str, detail: &str) {
+    let elapsed_ms = DIAGNOSTIC_STARTED_AT
+        .get()
+        .map(|started| started.elapsed().as_millis())
+        .unwrap_or(0);
+    let epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let detail = detail.replace(['\r', '\n'], " ");
+    let line = format!(
+        "time={} epoch_ms={epoch_ms} elapsed_ms={elapsed_ms} pid={} stage={stage} {detail}",
+        diagnostic_local_time(),
+        std::process::id()
+    );
+
+    if let Ok(_guard) = DIAGNOSTIC_LOG_LOCK.lock() {
+        if let Some(path) = diagnostic_log_path() {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                if file
+                    .metadata()
+                    .map(|metadata| metadata.len() == 0)
+                    .unwrap_or(false)
+                {
+                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+                }
+                let _ = writeln!(file, "{line}");
+                let _ = file.flush();
+            }
+        }
+    }
+    hbb_common::log::info!("[MDeskMini][{stage}] {detail}");
+    hbb_common::log::logger().flush();
+}
+
+#[cfg(target_os = "windows")]
+fn diagnostic_local_time() -> String {
+    let mut value = DiagnosticSystemTime::default();
+    unsafe { GetLocalTime(&mut value) };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.milliseconds
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn diagnostic_local_time() -> String {
+    "local-time-unavailable".to_owned()
 }
 
 #[cfg(target_os = "windows")]
@@ -332,7 +633,7 @@ fn run_whiteboard_mode() {
 
 fn run_id() {
     if !init_runtime() {
-        std::process::exit(1);
+        secure_process_exit(1);
     }
     println!("{}", Config::get_id());
     common::global_clean();
@@ -345,7 +646,7 @@ fn run_send_to_controller(path: String, select_path: bool, show_errors: bool) {
             if show_errors {
                 show_error_popup("MDeskMini", "Failed to initialize MDeskMini.");
             }
-            std::process::exit(1);
+            secure_process_exit(1);
         }
 
         let result = run_send_to_controller_windows(path, select_path);
@@ -356,7 +657,7 @@ fn run_send_to_controller(path: String, select_path: bool, show_errors: bool) {
             if show_errors {
                 show_error_popup("MDeskMini", &err);
             }
-            std::process::exit(1);
+            secure_process_exit(1);
         }
     }
 
@@ -364,7 +665,7 @@ fn run_send_to_controller(path: String, select_path: bool, show_errors: bool) {
     {
         let _ = (path, select_path, show_errors);
         eprintln!("send-to-controller is only supported on Windows.");
-        std::process::exit(1);
+        secure_process_exit(1);
     }
 }
 
@@ -374,12 +675,39 @@ fn run_send_to_controller_windows(path: String, select_path: bool) -> Result<(),
 }
 
 fn run_serve(options: ServeOptions) {
+    diagnostic_event(
+        "serve.begin",
+        &format!(
+            "headless={} approve_mode={} api_configured={} password_configured={}",
+            options.headless,
+            options.approve_mode.as_config_value(),
+            options
+                .api
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            options
+                .password
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        ),
+    );
     #[cfg(target_os = "windows")]
     let mut waiting_window = if options.headless {
         None
     } else {
         WaitingWindow::spawn()
     };
+    #[cfg(target_os = "windows")]
+    diagnostic_event(
+        "ui.waiting_window",
+        if options.headless {
+            "disabled by headless mode"
+        } else if waiting_window.is_some() {
+            "created"
+        } else {
+            "creation failed"
+        },
+    );
     #[cfg(target_os = "windows")]
     update_startup_progress(
         waiting_window.as_ref(),
@@ -389,6 +717,7 @@ fn run_serve(options: ServeOptions) {
     );
 
     if !init_runtime_for_serve() {
+        diagnostic_event("runtime.failed", "serve runtime initialization failed");
         #[cfg(target_os = "windows")]
         update_startup_progress(
             waiting_window.as_ref(),
@@ -396,13 +725,19 @@ fn run_serve(options: ServeOptions) {
             "MDesk 준비 실패",
             "초기화에 실패했습니다.",
         );
-        std::process::exit(1);
+        secure_process_exit(1);
     }
+    diagnostic_event(
+        "runtime.ready",
+        &format!("local_peer_id={}", Config::get_id()),
+    );
 
     #[cfg(target_os = "windows")]
     if let Some(installed_exe) = installed_mdesk_executable() {
+        diagnostic_event("installed_mdesk.detected", &format!("path={installed_exe}"));
         let result = run_installed_mdesk_handoff(&options, waiting_window.as_ref(), &installed_exe);
         if let Err(err) = result {
+            diagnostic_event("installed_mdesk.handoff_failed", &err);
             eprintln!("installed MDesk handoff failed: {err}");
             update_startup_progress(
                 waiting_window.as_ref(),
@@ -421,8 +756,13 @@ fn run_serve(options: ServeOptions) {
             window.close();
         }
         common::global_clean();
+        diagnostic_event("process.exit", "installed MDesk handoff path completed");
         return;
     }
+    diagnostic_event(
+        "installed_mdesk.not_found",
+        "continuing in portable host mode",
+    );
 
     #[cfg(target_os = "windows")]
     platform::unregister_explorer_send_to_controller_menu();
@@ -435,6 +775,7 @@ fn run_serve(options: ServeOptions) {
         "원격 접속 정책을 적용하고 있습니다.",
     );
     apply_host_policy(&options);
+    diagnostic_event("policy.applied", "host acceptance policy applied");
 
     #[cfg(target_os = "windows")]
     update_startup_progress(
@@ -449,9 +790,16 @@ fn run_serve(options: ServeOptions) {
             // 인증 실패 메시지박스는 사용자에게 노출하지 않고 로그만 남긴다.
             // verify 자체는 Flutter UI / 후속 인스턴스에서 다시 시도되므로 그대로 진행한다.
             eprintln!("cert bootstrap failed (ignored): {err}");
+            diagnostic_event("cert.bootstrap_failed", &err);
             None
         }
     };
+    if cert_verification.is_none() {
+        diagnostic_event(
+            "cert.not_available",
+            "no verified clipboard certificate session",
+        );
+    }
     if let Some(verification) = cert_verification.clone() {
         report_readiness_stage_async(
             verification,
@@ -468,12 +816,17 @@ fn run_serve(options: ServeOptions) {
         "원격 연결 허용 상태를 준비하고 있습니다.",
     );
     ensure_host_accepting_mode();
+    diagnostic_event("host.accepting", "host accepting mode is enabled");
 
     #[cfg(target_os = "windows")]
     match ensure_portable_service_ready() {
-        Ok(()) => println!("SYSTEM portable service is ready"),
+        Ok(()) => {
+            println!("SYSTEM portable service is ready");
+            diagnostic_event("portable_service.ready", "SYSTEM portable service is ready");
+        }
         Err(err) => {
-            eprintln!("failed to prepare SYSTEM portable service; continuing without it: {err}")
+            eprintln!("failed to prepare SYSTEM portable service; continuing without it: {err}");
+            diagnostic_event("portable_service.failed", &err);
         }
     }
 
@@ -489,6 +842,7 @@ fn run_serve(options: ServeOptions) {
         "연결 관리자를 시작하고 있습니다.",
     );
     flutter_ffi::cm_init();
+    diagnostic_event("connection_manager.ready", "connection manager initialized");
     if let Some(verification) = cert_verification.clone() {
         report_readiness_stage_async(
             verification,
@@ -506,6 +860,15 @@ fn run_serve(options: ServeOptions) {
     );
     #[cfg(target_os = "windows")]
     let tray_icon = TrayIcon::spawn();
+    #[cfg(target_os = "windows")]
+    diagnostic_event(
+        "tray.ready",
+        if tray_icon.is_some() {
+            "tray icon created"
+        } else {
+            "tray icon creation failed"
+        },
+    );
 
     #[cfg(target_os = "windows")]
     update_startup_progress(
@@ -514,10 +877,21 @@ fn run_serve(options: ServeOptions) {
         "MDesk 준비중",
         "원격 서버를 시작하고 있습니다.",
     );
+    diagnostic_event("server.spawn", "starting host server thread");
+    diagnostic_event(
+        "audit.capability",
+        "connection_intent_v2=true reporter_login_required=false",
+    );
     let server_thread = thread::spawn(|| {
+        diagnostic_event("server.thread.begin", "host server thread entered");
         start_server(true, false);
+        diagnostic_event("server.thread.exit", "host server thread returned");
     });
     if let Some(verification) = cert_verification {
+        diagnostic_event(
+            "rendezvous.reporter_spawn",
+            &format!("peer_id={}", verification.verified_peer_id),
+        );
         spawn_rendezvous_ready_reporter(verification, options.api.clone().unwrap_or_default());
     }
 
@@ -534,6 +908,7 @@ fn run_serve(options: ServeOptions) {
     }
 
     let _ = server_thread.join();
+    diagnostic_event("server.joined", "host server thread joined");
     #[cfg(target_os = "windows")]
     platform::unregister_explorer_send_to_controller_menu();
     #[cfg(target_os = "windows")]
@@ -545,6 +920,7 @@ fn run_serve(options: ServeOptions) {
         tray_icon.close();
     }
     common::global_clean();
+    diagnostic_event("process.exit", "MDeskMini serve completed");
 }
 
 #[cfg(target_os = "windows")]
@@ -554,16 +930,32 @@ fn update_startup_progress(
     title: &str,
     body: &str,
 ) {
+    diagnostic_event(
+        "startup.progress",
+        &format!("percent={percent} title={title} message={body}"),
+    );
     if let Some(window) = waiting_window {
         window.set_progress(title, body, percent);
     }
 }
 
 fn init_runtime() -> bool {
+    diagnostic_event(
+        "runtime.global_init.begin",
+        "starting global initialization",
+    );
     if common::global_init() {
+        diagnostic_event(
+            "runtime.global_init.complete",
+            "global initialization completed",
+        );
         true
     } else {
         eprintln!("global initialization failed");
+        diagnostic_event(
+            "runtime.global_init.failed",
+            "global initialization returned false",
+        );
         false
     }
 }
@@ -573,14 +965,32 @@ fn init_runtime_for_serve() -> bool {
         return false;
     }
 
+    diagnostic_event(
+        "runtime.custom_client.begin",
+        "loading custom client settings",
+    );
     common::load_custom_client();
+    diagnostic_event(
+        "runtime.custom_client.complete",
+        "custom client settings loaded",
+    );
     config::apply_product_default_settings();
+    diagnostic_event("runtime.defaults.complete", "product defaults applied");
 
     #[cfg(target_os = "windows")]
     if !platform::windows::bootstrap() {
         eprintln!("windows bootstrap failed");
+        diagnostic_event(
+            "runtime.windows_bootstrap.failed",
+            "Windows bootstrap returned false",
+        );
         return false;
     }
+    #[cfg(target_os = "windows")]
+    diagnostic_event(
+        "runtime.windows_bootstrap.complete",
+        "Windows bootstrap completed",
+    );
 
     true
 }
@@ -615,6 +1025,10 @@ fn run_installed_mdesk_handoff(
     waiting_window: Option<&WaitingWindow>,
     installed_exe: &str,
 ) -> Result<(), String> {
+    diagnostic_event(
+        "installed_mdesk.handoff_begin",
+        &format!("path={installed_exe}"),
+    );
     update_startup_progress(
         waiting_window,
         15,
@@ -627,8 +1041,11 @@ fn run_installed_mdesk_handoff(
     );
 
     Command::new(installed_exe)
+        .env_remove(common::MDESKMINI_PROCESS_MARKER_ENV)
+        .env_remove(common::MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV)
         .spawn()
         .map_err(|err| format!("설치된 MDesk를 실행할 수 없습니다: {err}"))?;
+    diagnostic_event("installed_mdesk.spawned", "installed MDesk process spawned");
 
     update_startup_progress(
         waiting_window,
@@ -667,6 +1084,10 @@ fn run_installed_mdesk_handoff(
         "설치된 MDesk가 준비되었습니다. 원격 연결을 시작할 수 있습니다.",
     );
     thread::sleep(Duration::from_millis(700));
+    diagnostic_event(
+        "installed_mdesk.handoff_complete",
+        "remote ready was reported",
+    );
     Ok(())
 }
 
@@ -689,12 +1110,24 @@ fn wait_for_installed_mdesk_ready(
     while started_at.elapsed() < INSTALLED_MDESK_READY_TIMEOUT {
         match query_installed_mdesk_online_status(&runtime) {
             Ok((online, confirmed)) => {
+                diagnostic_event(
+                    "installed_mdesk.status",
+                    &format!(
+                        "online={online} confirmed={confirmed} elapsed_ms={}",
+                        started_at.elapsed().as_millis()
+                    ),
+                );
                 if !configuration_synced {
                     match sync_installed_mdesk_host_config(&runtime, options) {
                         Ok(()) => {
                             configuration_synced = true;
+                            diagnostic_event(
+                                "installed_mdesk.config_synced",
+                                "host configuration synchronized",
+                            );
                         }
                         Err(err) => {
+                            diagnostic_event("installed_mdesk.config_sync_failed", &err);
                             last_status = err;
                             thread::sleep(INSTALLED_MDESK_READY_POLL_INTERVAL);
                             continue;
@@ -723,6 +1156,7 @@ fn wait_for_installed_mdesk_ready(
                 }
             }
             Err(err) => {
+                diagnostic_event("installed_mdesk.status_error", &err);
                 last_status = err;
             }
         }
@@ -843,7 +1277,27 @@ fn sync_installed_mdesk_host_config(
     })
 }
 
+fn is_rolled_back_private_server(current: &str, rolled_back: &str) -> bool {
+    current.trim().eq_ignore_ascii_case(rolled_back)
+}
+
+fn clear_rolled_back_private_server_options() {
+    for (key, rolled_back) in [
+        ("custom-rendezvous-server", ROLLED_BACK_PRIVATE_ID_SERVER),
+        ("relay-server", ROLLED_BACK_PRIVATE_RELAY_SERVER),
+    ] {
+        if is_rolled_back_private_server(&Config::get_option(key), rolled_back) {
+            Config::set_option(key.to_owned(), String::new());
+            diagnostic_event(
+                "policy.rolled_back_endpoint_cleared",
+                &format!("cleared stale option={key}"),
+            );
+        }
+    }
+}
+
 fn apply_host_policy(options: &ServeOptions) {
+    clear_rolled_back_private_server_options();
     Config::set_option(
         "approve-mode".to_owned(),
         options.approve_mode.as_config_value().to_owned(),
@@ -871,11 +1325,20 @@ fn apply_host_policy(options: &ServeOptions) {
 fn apply_clipboard_cert_bootstrap(
     options: &ServeOptions,
 ) -> Result<Option<CertVerification>, String> {
+    diagnostic_event(
+        "cert.clipboard.begin",
+        "checking clipboard for certificate number",
+    );
     let Some(certnum) = clipboard_certnum() else {
+        diagnostic_event("cert.clipboard.empty", "certificate number was not found");
         return Ok(None);
     };
 
-    println!("clipboard certno detected: {certnum}");
+    println!("clipboard certno detected");
+    diagnostic_event(
+        "cert.clipboard.detected",
+        &format!("digit_count={}", certnum.len()),
+    );
 
     match verify_cert_number(&certnum, options.api.as_deref().unwrap_or_default()) {
         Ok(verification) => {
@@ -884,12 +1347,22 @@ fn apply_clipboard_cert_bootstrap(
             Config::set_option("custom-agentid".to_owned(), "0".to_owned());
             Config::set_option("custom-id".to_owned(), verification.customer_id.clone());
             println!(
-                "cert verify success: customer_id={} peer_id={} verified_peer_id={} cert_code={} url={}",
+                "cert verify success: customer_id={} peer_id={} verified_peer_id={} url={}",
                 verification.customer_id,
                 verification.peer_id,
                 verification.verified_peer_id,
-                verification.cert_code,
                 verification.verify_url
+            );
+            diagnostic_event(
+                "cert.verify.success",
+                &format!(
+                    "customer_id={} local_peer_id={} verified_peer_id={} session_id={} url={}",
+                    verification.customer_id,
+                    verification.peer_id,
+                    verification.verified_peer_id,
+                    verification.session_id,
+                    verification.verify_url
+                ),
             );
             Ok(Some(verification))
         }
@@ -924,8 +1397,14 @@ fn clear_clipboard_cert_if_matches(expected_certnum: &str) {
             return;
         }
         match clear_windows_clipboard() {
-            Ok(()) => println!("clipboard certno cleared"),
-            Err(err) => eprintln!("failed to clear clipboard certno: {err}"),
+            Ok(()) => {
+                println!("clipboard certno cleared");
+                diagnostic_event("cert.clipboard.cleared", "certificate number cleared");
+            }
+            Err(err) => {
+                eprintln!("failed to clear clipboard certno: {err}");
+                diagnostic_event("cert.clipboard.clear_failed", &err);
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -1060,6 +1539,11 @@ fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerificatio
     }
 
     let verify_url = build_cert_verify_url(api_hint);
+    let started_at = Instant::now();
+    diagnostic_event(
+        "cert.verify.request",
+        &format!("url={verify_url} local_peer_id={peer_id}"),
+    );
     let body = json!({
         "cert_code": cert_code.trim(),
         "peer_id": peer_id,
@@ -1081,6 +1565,15 @@ fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerificatio
     let text = response
         .text()
         .map_err(|err| format!("{verify_url}: response body read failed: {err}"))?;
+    diagnostic_event(
+        "cert.verify.response",
+        &format!(
+            "status={} elapsed_ms={} body_bytes={}",
+            status.as_u16(),
+            started_at.elapsed().as_millis(),
+            text.len()
+        ),
+    );
 
     if !status.is_success() {
         return Err(format!("{verify_url}: unexpected status {status}"));
@@ -1135,7 +1628,6 @@ fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerificatio
     }
 
     Ok(CertVerification {
-        cert_code: cert_code.trim().to_owned(),
         verify_url,
         peer_id,
         customer_id: customer_id.to_owned(),
@@ -1173,9 +1665,17 @@ fn report_readiness_stage_async(
     api_hint: String,
     stage: &'static str,
 ) {
+    diagnostic_event(
+        "readiness.progress_spawn",
+        &format!("stage={stage} peer_id={}", verification.verified_peer_id),
+    );
     thread::spawn(move || {
         if let Err(err) = report_readiness_stage(&verification, &api_hint, stage) {
             eprintln!("readiness progress failed: stage={stage} error={err}");
+            diagnostic_event(
+                "readiness.progress_failed",
+                &format!("stage={stage} error={err}"),
+            );
         }
     });
 }
@@ -1188,9 +1688,14 @@ fn report_readiness_stage(
     match post_cert_readiness(verification, api_hint, "progress", Some(stage), 2)? {
         ReadinessPostResult::Success(url) => {
             println!("readiness progress success: stage={stage} url={url}");
+            diagnostic_event(
+                "readiness.progress_success",
+                &format!("stage={stage} url={url}"),
+            );
         }
         ReadinessPostResult::LegacyEndpointUnavailable => {
             println!("readiness progress endpoint unavailable: stage={stage}");
+            diagnostic_event("readiness.progress_legacy", &format!("stage={stage}"));
         }
     }
     Ok(())
@@ -1198,6 +1703,10 @@ fn report_readiness_stage(
 
 fn spawn_rendezvous_ready_reporter(verification: CertVerification, api_hint: String) {
     thread::spawn(move || {
+        diagnostic_event(
+            "rendezvous.wait.begin",
+            &format!("peer_id={}", verification.verified_peer_id),
+        );
         let started_at = Instant::now();
         let mut next_wait_log = Duration::from_secs(5);
         while !is_rendezvous_registered() {
@@ -1205,6 +1714,10 @@ fn spawn_rendezvous_ready_reporter(verification: CertVerification, api_hint: Str
                 println!(
                     "waiting for rendezvous registration before ready signal: elapsed={}s",
                     started_at.elapsed().as_secs()
+                );
+                diagnostic_event(
+                    "rendezvous.wait.pending",
+                    &format!("elapsed_ms={}", started_at.elapsed().as_millis()),
                 );
                 next_wait_log += Duration::from_secs(10);
             }
@@ -1215,8 +1728,17 @@ fn spawn_rendezvous_ready_reporter(verification: CertVerification, api_hint: Str
             "rendezvous registration confirmed; reporting remote ready: peer_id={}",
             verification.verified_peer_id
         );
+        diagnostic_event(
+            "rendezvous.registered",
+            &format!(
+                "peer_id={} elapsed_ms={}",
+                verification.verified_peer_id,
+                started_at.elapsed().as_millis()
+            ),
+        );
         if let Err(err) = report_remote_ready(&verification, &api_hint) {
             eprintln!("remote ready report failed: {err}");
+            diagnostic_event("readiness.ready_failed", &err);
         }
     });
 }
@@ -1225,12 +1747,18 @@ fn report_remote_ready(verification: &CertVerification, api_hint: &str) -> Resul
     match post_cert_readiness(verification, api_hint, "ready", None, 5)? {
         ReadinessPostResult::Success(url) => {
             println!("remote ready success: url={url}");
+            diagnostic_event("readiness.ready_success", &format!("url={url}"));
             Ok(())
         }
         ReadinessPostResult::LegacyEndpointUnavailable => {
             println!("ready endpoint unavailable; using legacy agentnumupdate fallback");
+            diagnostic_event(
+                "readiness.ready_legacy",
+                "ready endpoint unavailable; starting legacy fallback",
+            );
             let agent_url = call_agentnumupdate(verification, api_hint)?;
             println!("legacy agentnumupdate success after ready: url={agent_url}");
+            diagnostic_event("readiness.legacy_success", &format!("url={agent_url}"));
             Ok(())
         }
     }
@@ -1269,10 +1797,28 @@ fn post_cert_readiness(
     let max_attempts = attempts.max(1);
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
+        let attempt_started = Instant::now();
+        diagnostic_event(
+            "readiness.http_request",
+            &format!(
+                "endpoint={endpoint} stage={} attempt={attempt}/{max_attempts} url={url}",
+                stage.unwrap_or("ready")
+            ),
+        );
         match client.post(&url).json(&body).send() {
             Ok(response) => {
                 let status = response.status();
                 let response_body = response.text().unwrap_or_default();
+                diagnostic_event(
+                    "readiness.http_response",
+                    &format!(
+                        "endpoint={endpoint} stage={} attempt={attempt}/{max_attempts} status={} elapsed_ms={} body_bytes={}",
+                        stage.unwrap_or("ready"),
+                        status.as_u16(),
+                        attempt_started.elapsed().as_millis(),
+                        response_body.len()
+                    ),
+                );
                 if status.is_success() {
                     return Ok(ReadinessPostResult::Success(url));
                 }
@@ -1280,7 +1826,8 @@ fn post_cert_readiness(
                     return Ok(ReadinessPostResult::LegacyEndpointUnavailable);
                 }
                 last_error = format!(
-                    "{url}: unexpected status {status} on attempt {attempt} body={response_body}"
+                    "{url}: unexpected status {status} on attempt {attempt} body_bytes={}",
+                    response_body.len()
                 );
                 if status.is_client_error() {
                     break;
@@ -1288,6 +1835,14 @@ fn post_cert_readiness(
             }
             Err(err) => {
                 last_error = format!("{url}: request failed on attempt {attempt}: {err}");
+                diagnostic_event(
+                    "readiness.http_error",
+                    &format!(
+                        "endpoint={endpoint} stage={} attempt={attempt}/{max_attempts} elapsed_ms={} error={err}",
+                        stage.unwrap_or("ready"),
+                        attempt_started.elapsed().as_millis()
+                    ),
+                );
             }
         }
 
@@ -1328,24 +1883,47 @@ fn call_agentnumupdate(verification: &CertVerification, api_hint: &str) -> Resul
         "connection_token": verification.connection_token,
     });
     for attempt in 1..=3 {
+        let attempt_started = Instant::now();
+        diagnostic_event(
+            "readiness.legacy_request",
+            &format!("attempt={attempt}/3 url={agent_url}"),
+        );
         let response = match client.post(&agent_url).json(&body).send() {
             Ok(response) => response,
             Err(err) => {
                 last_error = format!("{agent_url}: request failed on attempt {attempt}: {err}");
+                diagnostic_event(
+                    "readiness.legacy_error",
+                    &format!(
+                        "attempt={attempt}/3 elapsed_ms={} error={err}",
+                        attempt_started.elapsed().as_millis()
+                    ),
+                );
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
         };
 
         let status = response.status();
-        let body = response.text().unwrap_or_default();
+        let response_body = response.text().unwrap_or_default();
+        diagnostic_event(
+            "readiness.legacy_response",
+            &format!(
+                "attempt={attempt}/3 status={} elapsed_ms={} body_bytes={}",
+                status.as_u16(),
+                attempt_started.elapsed().as_millis(),
+                response_body.len()
+            ),
+        );
         if status.is_success() {
             return Ok(agent_url);
         }
 
         last_error = format!(
-            "{agent_url}: unexpected status {} on attempt {} body={}",
-            status, attempt, body
+            "{agent_url}: unexpected status {} on attempt {} body_bytes={}",
+            status,
+            attempt,
+            response_body.len()
         );
         thread::sleep(Duration::from_millis(500));
     }
@@ -1392,18 +1970,31 @@ fn ensure_host_accepting_mode() {
 #[cfg(target_os = "windows")]
 fn ensure_portable_service_ready() -> Result<(), String> {
     if platform::is_installed() {
+        diagnostic_event("portable_service.skip", "MDesk is installed");
         return Ok(());
     }
 
     if portable_service::client::running() {
+        diagnostic_event(
+            "portable_service.already_running",
+            "service responded immediately",
+        );
         return Ok(());
     }
 
+    diagnostic_event(
+        "portable_service.start",
+        "requesting quick-support SYSTEM service",
+    );
     portable_service::client::start_quick_support_portable_service()
         .map_err(|err| err.to_string())?;
     let started_at = Instant::now();
     while started_at.elapsed() < PORTABLE_SERVICE_READY_TIMEOUT {
         if portable_service::client::running() {
+            diagnostic_event(
+                "portable_service.detected",
+                &format!("elapsed_ms={}", started_at.elapsed().as_millis()),
+            );
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -1889,6 +2480,7 @@ fn monitor_pending_connections(
     #[cfg(target_os = "windows")]
     {
         println!("mini approval popup loop active");
+        diagnostic_event("connection.monitor.begin", "connection monitor loop active");
         let mut prompted: HashSet<i32> = HashSet::new();
         let mut had_remote_session = false;
         let mut idle_ticks_after_disconnect = 0u32;
@@ -1896,30 +2488,112 @@ fn monitor_pending_connections(
         let mut last_status_body = String::new();
         let mut connected_since: Option<Instant> = None;
         let mut minimized_after_connected = false;
+        let mut last_client_state_summary = String::new();
+        let mut empty_snapshot_reported = false;
+        let mut previous_pending_ids: HashSet<i32> = HashSet::new();
+        let mut previous_authorized_ids: HashSet<i32> = HashSet::new();
 
         while !server_thread.is_finished() {
             if let Some(window) = waiting_window {
                 if window.is_closed() {
                     println!("waiting window closed by user; exiting mdeskmini");
+                    diagnostic_event("ui.closed", "waiting window was closed by user");
                     platform::unregister_explorer_send_to_controller_menu();
                     common::global_clean();
-                    std::process::exit(0);
+                    secure_process_exit(0);
                 }
             }
 
             let snapshot = flutter_ffi::cm_get_clients_state();
             if snapshot.trim().is_empty() {
+                if !empty_snapshot_reported {
+                    diagnostic_event(
+                        "connection.snapshot_empty",
+                        "waiting for connection manager state",
+                    );
+                    empty_snapshot_reported = true;
+                }
                 thread::sleep(Duration::from_millis(300));
                 continue;
             }
+            empty_snapshot_reported = false;
 
             let clients: Vec<CmClient> = match serde_json::from_str(&snapshot) {
                 Ok(clients) => clients,
-                Err(_) => {
+                Err(err) => {
+                    diagnostic_event(
+                        "connection.snapshot_invalid",
+                        &format!("bytes={} error={err}", snapshot.len()),
+                    );
                     thread::sleep(Duration::from_millis(300));
                     continue;
                 }
             };
+
+            let client_state_summary = clients
+                .iter()
+                .map(|client| {
+                    format!(
+                        "id={} authorized={} disconnected={} peer_id={} name={} ip={}",
+                        client.id,
+                        client.authorized,
+                        client.disconnected,
+                        client.peer_id,
+                        client.name,
+                        client.ip
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if client_state_summary != last_client_state_summary {
+                diagnostic_event(
+                    "connection.state",
+                    if client_state_summary.is_empty() {
+                        "no clients"
+                    } else {
+                        &client_state_summary
+                    },
+                );
+                last_client_state_summary = client_state_summary;
+            }
+
+            let pending_ids: HashSet<i32> = clients
+                .iter()
+                .filter(|client| !client.authorized && !client.disconnected)
+                .map(|client| client.id)
+                .collect();
+            let authorized_ids: HashSet<i32> = clients
+                .iter()
+                .filter(|client| client.authorized && !client.disconnected)
+                .map(|client| client.id)
+                .collect();
+            for client in clients.iter().filter(|client| {
+                pending_ids.contains(&client.id) && !previous_pending_ids.contains(&client.id)
+            }) {
+                diagnostic_event(
+                    "connection.request_received",
+                    &format!(
+                        "client_id={} peer_id={} name={} ip={}",
+                        client.id, client.peer_id, client.name, client.ip
+                    ),
+                );
+            }
+            for client in clients.iter().filter(|client| {
+                authorized_ids.contains(&client.id) && !previous_authorized_ids.contains(&client.id)
+            }) {
+                diagnostic_event(
+                    "connection.authorized",
+                    &format!(
+                        "client_id={} peer_id={} name={} ip={}",
+                        client.id, client.peer_id, client.name, client.ip
+                    ),
+                );
+            }
+            for client_id in previous_authorized_ids.difference(&authorized_ids) {
+                diagnostic_event("connection.ended", &format!("client_id={client_id}"));
+            }
+            previous_pending_ids = pending_ids;
+            previous_authorized_ids = authorized_ids;
 
             let active_remote_sessions = clients
                 .iter()
@@ -1938,9 +2612,13 @@ fn monitor_pending_connections(
                 idle_ticks_after_disconnect += 1;
                 if idle_ticks_after_disconnect >= REMOTE_EXIT_IDLE_TICKS {
                     println!("all remote sessions ended; exiting mdeskmini");
+                    diagnostic_event(
+                        "connection.all_ended",
+                        &format!("idle_ticks={idle_ticks_after_disconnect}"),
+                    );
                     platform::unregister_explorer_send_to_controller_menu();
                     common::global_clean();
-                    std::process::exit(0);
+                    secure_process_exit(0);
                 }
             }
 
@@ -2018,6 +2696,14 @@ fn monitor_pending_connections(
 
                 had_remote_session = true;
 
+                diagnostic_event(
+                    "connection.auto_approve",
+                    &format!(
+                        "client_id={} peer_id={} name={} ip={}",
+                        client.id, client.peer_id, client.name, client.ip
+                    ),
+                );
+
                 flutter_ffi::cm_login_res(client.id, true);
             }
 
@@ -2025,6 +2711,10 @@ fn monitor_pending_connections(
         }
 
         platform::unregister_explorer_send_to_controller_menu();
+        diagnostic_event(
+            "connection.monitor.exit",
+            "server thread finished; monitor loop exited",
+        );
     }
 }
 
@@ -2126,6 +2816,26 @@ mod tests {
     }
 
     #[test]
+    fn rolled_back_private_server_cleanup_is_exact_match_only() {
+        assert!(is_rolled_back_private_server(
+            ROLLED_BACK_PRIVATE_ID_SERVER,
+            ROLLED_BACK_PRIVATE_ID_SERVER
+        ));
+        assert!(is_rolled_back_private_server(
+            " 172.16.100.100:21117 ",
+            ROLLED_BACK_PRIVATE_RELAY_SERVER
+        ));
+        assert!(!is_rolled_back_private_server(
+            "mdesk.imedixerp.co.kr:21116",
+            ROLLED_BACK_PRIVATE_ID_SERVER
+        ));
+        assert!(!is_rolled_back_private_server(
+            "172.16.100.101:21116",
+            ROLLED_BACK_PRIVATE_ID_SERVER
+        ));
+    }
+
+    #[test]
     fn native_clipboard_text_stops_at_utf16_null() {
         let units = "certno:3276"
             .encode_utf16()
@@ -2148,5 +2858,42 @@ mod tests {
             std::path::Path::new(r"C:\Program Files\MDesk\MDesk.exe"),
             std::path::Path::new(r"C:\Users\owner\Downloads\MDeskMini.exe")
         ));
+    }
+
+    #[test]
+    fn log_cleanup_only_matches_mdeskmini_owned_files() {
+        assert!(is_mdeskmini_log_file_name("MDeskMini_diagnostic.log"));
+        assert!(is_mdeskmini_log_file_name(
+            "MDeskMini-Win7-x64-UPX_rCURRENT.log"
+        ));
+        assert!(is_mdeskmini_log_file_name(
+            "mdeskmini_r2026-08-08_22-09-13.log.gz"
+        ));
+        assert!(!is_mdeskmini_log_file_name("customer_notes.log"));
+        assert!(!is_mdeskmini_log_file_name("MDeskMini.exe"));
+    }
+
+    #[test]
+    fn mdeskmini_firewall_bootstrap_is_inherited_only_after_first_attempt() {
+        let previous_process_marker = std::env::var_os(common::MDESKMINI_PROCESS_MARKER_ENV);
+        let previous_firewall_marker =
+            std::env::var_os(common::MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV);
+
+        std::env::remove_var(common::MDESKMINI_PROCESS_MARKER_ENV);
+        std::env::remove_var(common::MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV);
+        common::mark_mdeskmini_process_tree();
+        assert!(common::should_run_startup_firewall_bootstrap());
+
+        common::mark_startup_firewall_bootstrapped();
+        assert!(!common::should_run_startup_firewall_bootstrap());
+
+        match previous_process_marker {
+            Some(value) => std::env::set_var(common::MDESKMINI_PROCESS_MARKER_ENV, value),
+            None => std::env::remove_var(common::MDESKMINI_PROCESS_MARKER_ENV),
+        }
+        match previous_firewall_marker {
+            Some(value) => std::env::set_var(common::MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV, value),
+            None => std::env::remove_var(common::MDESKMINI_FIREWALL_BOOTSTRAPPED_ENV),
+        }
     }
 }

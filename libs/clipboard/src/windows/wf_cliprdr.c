@@ -45,6 +45,18 @@
 #define WF_CLIPRDR_MAX_STREAMS 16384
 
 /*
+ * Explorer commonly reads remote clipboard files in 256 KiB chunks. A remote
+ * round trip for every read severely limits throughput on relay connections.
+ * Keep the read-ahead response small enough that Explorer is not blocked for
+ * several seconds on a slow relay, and adapt it to the observed response time.
+ * This does not change the clipboard wire protocol.
+ */
+#define WF_CLIPRDR_READ_AHEAD_INITIAL_SIZE (512U * 1024U)
+#define WF_CLIPRDR_READ_AHEAD_MAX_SIZE (1024U * 1024U)
+#define WF_CLIPRDR_READ_AHEAD_FAST_MS 250ULL
+#define WF_CLIPRDR_READ_AHEAD_SLOW_MS 750ULL
+
+/*
  * Current Windows SDK import libraries forward CoTaskMemAlloc/Free to
  * combase.dll, which is unavailable on Windows 7. Resolve the documented
  * ole32.dll exports at runtime to keep the executable loadable on Win7.
@@ -254,6 +266,11 @@ struct _CliprdrStream
 	FILEDESCRIPTORW m_Dsc;
 	void *m_pData;
 	UINT32 m_connID;
+	BYTE *m_readAheadData;
+	ULONG m_readAheadSize;
+	ULONG m_readAheadOffset;
+	ULONG m_readAheadRequestSize;
+	ULARGE_INTEGER m_readAheadStart;
 };
 typedef struct _CliprdrStream CliprdrStream;
 
@@ -306,6 +323,7 @@ struct wf_clipboard
 	ULONG req_fsize;
 	char *req_fdata;
 	HANDLE req_fevent;
+	HANDLE req_fmutex;
 	BOOL req_f_received;
 
 	size_t nFiles;
@@ -339,7 +357,8 @@ static UINT cliprdr_send_lock(wfClipboard *clipboard);
 static UINT cliprdr_send_unlock(wfClipboard *clipboard);
 static UINT cliprdr_send_request_filecontents(wfClipboard *clipboard, UINT32 connID, const void *streamid,
 											  ULONG index, UINT32 flag, DWORD positionhigh,
-											  DWORD positionlow, ULONG request);
+											  DWORD positionlow, ULONG request, BYTE **responseData,
+											  ULONG *responseSize);
 
 static BOOL is_file_descriptor_from_remote();
 static BOOL is_set_by_instance(wfClipboard *clipboard);
@@ -420,50 +439,151 @@ static ULONG STDMETHODCALLTYPE CliprdrStream_Release(IStream *This)
 	}
 }
 
+static void CliprdrStream_ClearReadAhead(CliprdrStream *instance)
+{
+	if (!instance)
+		return;
+
+	if (instance->m_readAheadData)
+	{
+		free(instance->m_readAheadData);
+		instance->m_readAheadData = NULL;
+	}
+
+	instance->m_readAheadSize = 0;
+	instance->m_readAheadOffset = 0;
+	instance->m_readAheadStart.QuadPart = 0;
+}
+
 static HRESULT STDMETHODCALLTYPE CliprdrStream_Read(IStream *This, void *pv, ULONG cb,
 													ULONG *pcbRead)
 {
-	int ret;
+	UINT ret;
 	CliprdrStream *instance = (CliprdrStream *)This;
 	wfClipboard *clipboard;
 
-	if (!pv || !pcbRead || !instance)
+	if (!pcbRead || !instance || (!pv && cb > 0))
 		return E_INVALIDARG;
 
 	clipboard = (wfClipboard *)instance->m_pData;
 	*pcbRead = 0;
 
+	if (cb == 0)
+		return S_OK;
+
 	if (instance->m_lOffset.QuadPart >= instance->m_lSize.QuadPart)
 		return S_FALSE;
 
-	ret = cliprdr_send_request_filecontents(clipboard, instance->m_connID, (void *)This, instance->m_lIndex,
-											FILECONTENTS_RANGE, instance->m_lOffset.HighPart,
-											instance->m_lOffset.LowPart, cb);
-
-	if (ret < 0)
-		return E_FAIL;
-
-	if (clipboard->req_fdata)
+	while (*pcbRead < cb && instance->m_lOffset.QuadPart < instance->m_lSize.QuadPart)
 	{
-		CopyMemory(pv, clipboard->req_fdata, clipboard->req_fsize);
-		free(clipboard->req_fdata);
-		clipboard->req_fdata = NULL;
+		ULONG available = 0;
+		ULONG requested;
+		ULONG nextRequestSize;
+		ULONGLONG remaining;
+		ULONGLONG requestStarted;
+		ULONGLONG requestElapsed;
+		BYTE *responseData = NULL;
+		ULONG responseSize = 0;
+
+		if (instance->m_readAheadData &&
+			instance->m_lOffset.QuadPart >= instance->m_readAheadStart.QuadPart &&
+			instance->m_lOffset.QuadPart - instance->m_readAheadStart.QuadPart <
+				instance->m_readAheadSize)
+		{
+			ULONGLONG cachedOffset =
+				instance->m_lOffset.QuadPart - instance->m_readAheadStart.QuadPart;
+			instance->m_readAheadOffset = (ULONG)cachedOffset;
+			available = instance->m_readAheadSize - instance->m_readAheadOffset;
+		}
+		else
+		{
+			CliprdrStream_ClearReadAhead(instance);
+		}
+
+		if (available > 0)
+		{
+			ULONG wanted = cb - *pcbRead;
+			ULONG copied = available < wanted ? available : wanted;
+			CopyMemory((BYTE *)pv + *pcbRead,
+					   instance->m_readAheadData + instance->m_readAheadOffset, copied);
+			instance->m_readAheadOffset += copied;
+			instance->m_lOffset.QuadPart += copied;
+			*pcbRead += copied;
+
+			if (instance->m_readAheadOffset == instance->m_readAheadSize)
+				CliprdrStream_ClearReadAhead(instance);
+			continue;
+		}
+
+		remaining = instance->m_lSize.QuadPart - instance->m_lOffset.QuadPart;
+		nextRequestSize = instance->m_readAheadRequestSize;
+		if (nextRequestSize == 0)
+			nextRequestSize = WF_CLIPRDR_READ_AHEAD_INITIAL_SIZE;
+		if (nextRequestSize < cb)
+			nextRequestSize = cb;
+		if (nextRequestSize > WF_CLIPRDR_READ_AHEAD_MAX_SIZE &&
+			cb <= WF_CLIPRDR_READ_AHEAD_MAX_SIZE)
+			nextRequestSize = WF_CLIPRDR_READ_AHEAD_MAX_SIZE;
+		requested = remaining < nextRequestSize ? (ULONG)remaining : nextRequestSize;
+		requestStarted = GetTickCount64();
+		ret = cliprdr_send_request_filecontents(
+			clipboard, instance->m_connID, (void *)This, instance->m_lIndex,
+			FILECONTENTS_RANGE, instance->m_lOffset.HighPart, instance->m_lOffset.LowPart,
+			requested, &responseData, &responseSize);
+		requestElapsed = GetTickCount64() - requestStarted;
+
+		if (ret != CHANNEL_RC_OK)
+		{
+			if (responseData)
+				free(responseData);
+			return E_FAIL;
+		}
+
+		if (!responseData || responseSize == 0)
+		{
+			if (responseData)
+				free(responseData);
+			break;
+		}
+
+		if (responseSize > requested)
+		{
+			free(responseData);
+			return E_FAIL;
+		}
+
+		/*
+		 * A large synchronous response delays Explorer's first visible progress.
+		 * Grow only on fast links and fall back to Explorer's own request size on
+		 * slow links. This keeps latency bounded while still removing round trips
+		 * where the connection can actually sustain a larger window.
+		 */
+		if (responseSize == requested)
+		{
+			if (requestElapsed >= WF_CLIPRDR_READ_AHEAD_SLOW_MS && nextRequestSize > cb)
+			{
+				nextRequestSize /= 2;
+				if (nextRequestSize < cb)
+					nextRequestSize = cb;
+			}
+			else if (requestElapsed <= WF_CLIPRDR_READ_AHEAD_FAST_MS &&
+					 nextRequestSize < WF_CLIPRDR_READ_AHEAD_MAX_SIZE)
+			{
+				if (nextRequestSize > WF_CLIPRDR_READ_AHEAD_MAX_SIZE / 2)
+					nextRequestSize = WF_CLIPRDR_READ_AHEAD_MAX_SIZE;
+				else
+					nextRequestSize *= 2;
+			}
+		}
+		instance->m_readAheadRequestSize = nextRequestSize;
+
+		instance->m_readAheadData = responseData;
+		instance->m_readAheadSize = responseSize;
+		instance->m_readAheadOffset = 0;
+		instance->m_readAheadStart.QuadPart = instance->m_lOffset.QuadPart;
 	}
 
-	*pcbRead = clipboard->req_fsize;
-	// Check overflow, can not be a real case
-	if ((instance->m_lOffset.QuadPart + clipboard->req_fsize) < instance->m_lOffset.QuadPart) {
-		// It's better to crash to release the explorer.exe
-		// This is a critical error, because the explorer is waiting for the data
-		// and the m_lOffset is wrong(overflowed)
-		return S_FALSE;
-	}
-	instance->m_lOffset.QuadPart += clipboard->req_fsize;
-
-	if (clipboard->req_fsize < cb)
-		return S_FALSE;
-
-	return S_OK;
+	return *pcbRead == cb ? S_OK : S_FALSE;
 }
 
 static HRESULT STDMETHODCALLTYPE CliprdrStream_Write(IStream *This, const void *pv, ULONG cb,
@@ -479,36 +599,62 @@ static HRESULT STDMETHODCALLTYPE CliprdrStream_Write(IStream *This, const void *
 static HRESULT STDMETHODCALLTYPE CliprdrStream_Seek(IStream *This, LARGE_INTEGER dlibMove,
 													DWORD dwOrigin, ULARGE_INTEGER *plibNewPosition)
 {
+	LONGLONG move;
+	ULONGLONG base;
 	ULONGLONG newoffset;
 	CliprdrStream *instance = (CliprdrStream *)This;
 
 	if (!instance)
 		return E_INVALIDARG;
 
-	newoffset = instance->m_lOffset.QuadPart;
-
 	switch (dwOrigin)
 	{
 	case STREAM_SEEK_SET:
-		newoffset = dlibMove.QuadPart;
+		base = 0;
 		break;
 
 	case STREAM_SEEK_CUR:
-		newoffset += dlibMove.QuadPart;
+		base = instance->m_lOffset.QuadPart;
 		break;
 
 	case STREAM_SEEK_END:
-		newoffset = instance->m_lSize.QuadPart + dlibMove.QuadPart;
+		base = instance->m_lSize.QuadPart;
 		break;
 
 	default:
 		return E_INVALIDARG;
 	}
 
-	if (newoffset < 0 || newoffset >= instance->m_lSize.QuadPart)
+	move = dlibMove.QuadPart;
+	if (move < 0)
+	{
+		ULONGLONG magnitude = (ULONGLONG)(-(move + 1)) + 1;
+		if (magnitude > base)
+			return E_FAIL;
+		newoffset = base - magnitude;
+	}
+	else
+	{
+		if (base > ~(ULONGLONG)0 - (ULONGLONG)move)
+			return E_FAIL;
+		newoffset = base + (ULONGLONG)move;
+	}
+
+	if (newoffset > instance->m_lSize.QuadPart)
 		return E_FAIL;
 
 	instance->m_lOffset.QuadPart = newoffset;
+	if (instance->m_readAheadData &&
+		newoffset >= instance->m_readAheadStart.QuadPart &&
+		newoffset - instance->m_readAheadStart.QuadPart <= instance->m_readAheadSize)
+	{
+		instance->m_readAheadOffset =
+			(ULONG)(newoffset - instance->m_readAheadStart.QuadPart);
+	}
+	else
+	{
+		CliprdrStream_ClearReadAhead(instance);
+	}
 
 	if (plibNewPosition)
 		plibNewPosition->QuadPart = instance->m_lOffset.QuadPart;
@@ -618,6 +764,8 @@ static CliprdrStream *CliprdrStream_New(UINT32 connID, ULONG index, void *pData,
 	BOOL isDir = FALSE;
 	CliprdrStream *instance = NULL;
 	wfClipboard *clipboard = (wfClipboard *)pData;
+	BYTE *responseData = NULL;
+	ULONG responseSize = 0;
 
 	if (!(pData && dsc))
 	{
@@ -665,17 +813,15 @@ static CliprdrStream *CliprdrStream_New(UINT32 connID, ULONG index, void *pData,
 				/* get content size of this stream */
 				if (cliprdr_send_request_filecontents(clipboard, instance->m_connID, (void *)instance,
 													  instance->m_lIndex, FILECONTENTS_SIZE, 0, 0,
-													  8) == CHANNEL_RC_OK)
+													  8, &responseData, &responseSize) == CHANNEL_RC_OK &&
+					responseData && responseSize == sizeof(UINT64))
 				{
+					CopyMemory(&instance->m_lSize.QuadPart, responseData, sizeof(UINT64));
 					success = TRUE;
 				}
 
-				if (clipboard->req_fdata != NULL)
-				{
-					instance->m_lSize.QuadPart = *((LONGLONG *)clipboard->req_fdata);
-					free(clipboard->req_fdata);
-					clipboard->req_fdata = NULL;
-				}
+				if (responseData)
+					free(responseData);
 			}
 			else {
 				instance->m_lSize.QuadPart =
@@ -698,6 +844,7 @@ void CliprdrStream_Delete(CliprdrStream *instance)
 {
 	if (instance)
 	{
+		CliprdrStream_ClearReadAhead(instance);
 		free(instance->iStream.lpVtbl);
 		instance->iStream.lpVtbl = NULL;
 		free(instance);
@@ -1791,19 +1938,30 @@ static UINT cliprdr_send_data_request(UINT32 connID, wfClipboard *clipboard, UIN
 
 UINT cliprdr_send_request_filecontents(wfClipboard *clipboard, UINT32 connID, const void *streamid, ULONG index,
 									   UINT32 flag, DWORD positionhigh, DWORD positionlow,
-									   ULONG nreq)
+									   ULONG nreq, BYTE **responseData, ULONG *responseSize)
 {
 	UINT rc;
 	CLIPRDR_FILE_CONTENTS_REQUEST fileContentsRequest;
 
-	if (!clipboard || !clipboard->context || !clipboard->context->ClientFileContentsRequest)
+	if (!clipboard || !clipboard->context || !clipboard->context->ClientFileContentsRequest ||
+		!responseData || !responseSize || !clipboard->req_fmutex)
 		return ERROR_INTERNAL_ERROR;
+
+	*responseData = NULL;
+	*responseSize = 0;
+	if (WaitForSingleObject(clipboard->req_fmutex, INFINITE) != WAIT_OBJECT_0)
+		return ERROR_INTERNAL_ERROR;
+
+	if (clipboard->req_fdata)
+	{
+		free(clipboard->req_fdata);
+		clipboard->req_fdata = NULL;
+	}
+	clipboard->req_fsize = 0;
 
 	rc = try_reset_event(clipboard->req_fevent);
 	if (rc != ERROR_SUCCESS)
-	{
-		return rc;
-	}
+		goto exit;
 	clipboard->req_f_received = FALSE;
 
 	fileContentsRequest.connID = connID;
@@ -1820,11 +1978,29 @@ UINT cliprdr_send_request_filecontents(wfClipboard *clipboard, UINT32 connID, co
 	fileContentsRequest.msgFlags = 0;
 	rc = clipboard->context->ClientFileContentsRequest(clipboard->context, &fileContentsRequest);
 	if (rc != ERROR_SUCCESS)
+		goto exit;
+
+	rc = wait_response_event(connID, clipboard, clipboard->req_fevent,
+							 &clipboard->req_f_received, (void **)&clipboard->req_fdata);
+	if (rc == CHANNEL_RC_OK)
 	{
-		return rc;
+		*responseData = (BYTE *)clipboard->req_fdata;
+		*responseSize = clipboard->req_fsize;
+		clipboard->req_fdata = NULL;
+		clipboard->req_fsize = 0;
 	}
 
-	return wait_response_event(connID, clipboard, clipboard->req_fevent, &clipboard->req_f_received, (void **)&clipboard->req_fdata);
+exit:
+	if (rc != CHANNEL_RC_OK)
+	{
+		if (clipboard->req_fdata)
+			free(clipboard->req_fdata);
+		clipboard->req_fdata = NULL;
+		clipboard->req_fsize = 0;
+	}
+	if (!ReleaseMutex(clipboard->req_fmutex) && rc == CHANNEL_RC_OK)
+		rc = ERROR_INTERNAL_ERROR;
+	return rc;
 }
 
 static UINT cliprdr_send_response_filecontents(
@@ -3430,6 +3606,8 @@ BOOL wf_cliprdr_init(wfClipboard *clipboard, CliprdrClientContext *cliprdr)
 	if (!(clipboard->req_fevent = CreateEvent(NULL, TRUE, FALSE, NULL)))
 		goto error;
 	clipboard->req_f_received = FALSE;
+	if (!(clipboard->req_fmutex = CreateMutex(NULL, FALSE, NULL)))
+		goto error;
 
 	if (!(clipboard->thread = CreateThread(NULL, 0, cliprdr_thread_func, clipboard, 0, NULL)))
 		goto error;
@@ -3502,6 +3680,9 @@ BOOL wf_cliprdr_uninit(wfClipboard *clipboard, CliprdrClientContext *cliprdr)
 
 	if (clipboard->req_fevent)
 		CloseHandle(clipboard->req_fevent);
+
+	if (clipboard->req_fmutex)
+		CloseHandle(clipboard->req_fmutex);
 
 	clear_file_array(clipboard);
 	clear_format_map(clipboard);

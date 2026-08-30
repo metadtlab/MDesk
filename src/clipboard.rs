@@ -62,7 +62,11 @@ pub fn check_clipboard(
         Ok(content) => {
             if !content.is_empty() {
                 let mut msg = Message::new();
-                let clipboards = proto::create_multi_clipboards(content);
+                let mut clipboards = proto::create_multi_clipboards(content);
+                crate::clipboard_audit::set_clipboard_source_application(
+                    &mut clipboards.clipboards,
+                    crate::clipboard_audit::current_clipboard_source_application(),
+                );
                 msg.set_multi_clipboards(clipboards.clone());
                 *LAST_MULTI_CLIPBOARDS.lock().unwrap() = clipboards;
                 return Some(msg);
@@ -475,7 +479,12 @@ pub fn get_current_clipboard_msg(
     let mut multi_clipboards = LAST_MULTI_CLIPBOARDS.lock().unwrap();
     if multi_clipboards.clipboards.is_empty() {
         let mut ctx = ClipboardContext::new().ok()?;
-        *multi_clipboards = proto::create_multi_clipboards(ctx.get(side, true).ok()?);
+        let mut current = proto::create_multi_clipboards(ctx.get(side, true).ok()?);
+        crate::clipboard_audit::set_clipboard_source_application(
+            &mut current.clipboards,
+            crate::clipboard_audit::current_clipboard_source_application(),
+        );
+        *multi_clipboards = current;
     }
     if multi_clipboards.clipboards.is_empty() {
         return None;

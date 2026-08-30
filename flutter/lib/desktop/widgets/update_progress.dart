@@ -12,7 +12,7 @@ final _isExtracting = false.obs;
 /// GitHub 릴리스 페이지 URL이 아닌, 설치 파일의 직접 URL(예: `.exe`)을 앱 내에서 받은 뒤 설치를 진행합니다.
 /// [openInBrowserOnErrorUrl]: 다운로드 실패 시 브라우저로 열 주소(미지정이면 [downloadUrl]).
 void handleDirectDownloadUpdate(String downloadUrl,
-    {String? openInBrowserOnErrorUrl}) {
+    {String? openInBrowserOnErrorUrl, bool allowCancel = true}) {
   _isExtracting.value = false;
   final fallbackUrl = openInBrowserOnErrorUrl ?? downloadUrl;
   final SimpleWrapper downloadId = SimpleWrapper('');
@@ -27,7 +27,7 @@ void handleDirectDownloadUpdate(String downloadUrl,
             .marginSymmetric(horizontal: 8)
             .paddingOnly(top: 12),
         actions: [
-          if (_isExtracting.isFalse)
+          if (_isExtracting.isFalse && allowCancel)
             dialogButton(translate('Cancel'), onPressed: () async {
               onCanceled.value();
               await bind.mainSetCommon(

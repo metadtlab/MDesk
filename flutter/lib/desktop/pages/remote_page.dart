@@ -507,8 +507,9 @@ class _RemotePageState extends State<RemotePage>
 
   Widget _buildRemoteDropProgressPanel() {
     final jobs = _ffi.fileModel.jobController.jobTable
-        .where(
-            (job) => job.isRemoteDropDownload && job.type == JobType.transfer)
+        .where((job) =>
+            (job.isRemoteDropDownload || job.isDirectDownload) &&
+            job.type == JobType.transfer)
         .where((job) => job.state != JobState.done)
         .toList()
         .reversed
@@ -552,14 +553,20 @@ class _RemotePageState extends State<RemotePage>
                 Row(
                   children: [
                     Icon(
-                      Icons.file_upload_outlined,
+                      jobs.every((job) => job.isDirectDownload)
+                          ? Icons.file_download_outlined
+                          : Icons.file_upload_outlined,
                       size: 18,
                       color: Theme.of(context).colorScheme.primary,
                     ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        '\ud53c\uc6d0\uaca9\uc790 \ub2e4\uc6b4\ub85c\ub4dc \ud3f4\ub354\ub85c \ubcf5\uc0ac \uc911',
+                        jobs.every((job) => job.isDirectDownload)
+                            ? '\ub2e4\uc6b4\ub85c\ub4dc \ud3f4\ub354\ub85c \ubcf5\uc0ac \uc911'
+                            : jobs.every((job) => job.isRemoteDropDownload)
+                                ? '\ud53c\uc6d0\uaca9\uc790 \ub2e4\uc6b4\ub85c\ub4dc \ud3f4\ub354\ub85c \ubcf5\uc0ac \uc911'
+                                : '\ud30c\uc77c \ubcf5\uc0ac \uc911',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(

@@ -60,6 +60,7 @@ class FileManagerPage extends StatefulWidget {
       required this.isSharedPassword,
       this.tabController,
       this.connToken,
+      this.initialLocalDir,
       this.initialRemoteDir,
       this.initialRemoteSelectedName,
       this.forceRelay})
@@ -69,12 +70,25 @@ class FileManagerPage extends StatefulWidget {
   final bool? isSharedPassword;
   final bool? forceRelay;
   final String? connToken;
+  final String? initialLocalDir;
   final String? initialRemoteDir;
   final String? initialRemoteSelectedName;
   final DesktopTabController? tabController;
   final SimpleWrapper<State<FileManagerPage>?> _lastState = SimpleWrapper(null);
 
   FFI get ffi => (_lastState.value! as _FileManagerPageState)._ffi;
+
+  Future<void> openExplorerTransferRequest({
+    String? localDir,
+    String? remoteDir,
+    String? remoteSelectedName,
+  }) async {
+    await ffi.fileModel.openExplorerTransferRequest(
+      localDir: localDir,
+      remoteDir: remoteDir,
+      remoteSelectedName: remoteSelectedName,
+    );
+  }
 
   @override
   State<StatefulWidget> createState() {
@@ -100,6 +114,7 @@ class _FileManagerPageState extends State<FileManagerPage>
   void initState() {
     super.initState();
     _ffi = FFI(null);
+    _ffi.fileModel.initialLocalDir = widget.initialLocalDir;
     _ffi.fileModel.initialRemoteDir = widget.initialRemoteDir;
     _ffi.fileModel.initialRemoteSelectedName = widget.initialRemoteSelectedName;
     _ffi.start(widget.id,

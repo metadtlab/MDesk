@@ -24,6 +24,8 @@ use std::{
     sync::mpsc::{channel, RecvTimeoutError},
     time::Duration,
 };
+#[cfg(not(target_os = "android"))]
+use std::{sync::mpsc::Receiver, time::Instant};
 #[cfg(windows)]
 use tokio::runtime::Runtime;
 
@@ -37,6 +39,57 @@ struct Handler {
     stream: Option<ipc::ConnectionTmpl<parity_tokio_ipc::ConnectionClient>>,
     #[cfg(target_os = "windows")]
     rt: Option<Runtime>,
+}
+
+#[cfg(not(target_os = "android"))]
+const CLIPBOARD_LISTENER_QUIET_WINDOW: Duration = Duration::from_millis(INTERVAL);
+#[cfg(not(target_os = "android"))]
+const CLIPBOARD_LISTENER_BURST_HARD_CAP: Duration = Duration::from_secs(2);
+
+#[cfg(not(target_os = "android"))]
+enum ClipboardListenerBurstCompletion {
+    Ready,
+    Stop,
+    StopWithError(io::Error),
+    Disconnected,
+}
+
+/// Coalesces a listener notification burst before clipboard contents are read.
+/// Some applications (notably Excel) emit several `Next` callbacks for one
+/// logical copy. Waiting for a trailing quiet window makes that burst produce a
+/// single snapshot without retaining or fingerprinting clipboard contents.
+/// The hard cap prevents a noisy producer from postponing delivery forever.
+#[cfg(not(target_os = "android"))]
+fn coalesce_clipboard_listener_burst(
+    receiver: &Receiver<CallbackResult>,
+    quiet_window: Duration,
+    hard_cap: Duration,
+) -> ClipboardListenerBurstCompletion {
+    let started_at = Instant::now();
+    let hard_deadline = started_at + hard_cap;
+    let mut quiet_deadline = (started_at + quiet_window).min(hard_deadline);
+
+    loop {
+        let now = Instant::now();
+        let deadline = quiet_deadline.min(hard_deadline);
+        let Some(wait) = deadline.checked_duration_since(now) else {
+            return ClipboardListenerBurstCompletion::Ready;
+        };
+
+        match receiver.recv_timeout(wait) {
+            Ok(CallbackResult::Next) => {
+                quiet_deadline = (Instant::now() + quiet_window).min(hard_deadline);
+            }
+            Ok(CallbackResult::Stop) => return ClipboardListenerBurstCompletion::Stop,
+            Ok(CallbackResult::StopWithError(err)) => {
+                return ClipboardListenerBurstCompletion::StopWithError(err)
+            }
+            Err(RecvTimeoutError::Timeout) => return ClipboardListenerBurstCompletion::Ready,
+            Err(RecvTimeoutError::Disconnected) => {
+                return ClipboardListenerBurstCompletion::Disconnected
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -76,17 +129,42 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
         #[cfg(target_os = "windows")]
         rt: None,
     };
+    let mut stop_error = None;
 
     while sp.ok() {
         match rx_cb_result.recv_timeout(Duration::from_millis(INTERVAL)) {
             Ok(CallbackResult::Next) => {
-                #[cfg(feature = "unix-file-copy-paste")]
-                if sp.name() == FILE_NAME {
-                    handler.check_clipboard_file();
-                    continue;
-                }
-                if let Some(msg) = handler.get_clipboard_msg() {
-                    sp.send(msg);
+                let completion = coalesce_clipboard_listener_burst(
+                    &rx_cb_result,
+                    CLIPBOARD_LISTENER_QUIET_WINDOW,
+                    CLIPBOARD_LISTENER_BURST_HARD_CAP,
+                );
+
+                match completion {
+                    ClipboardListenerBurstCompletion::Ready => {
+                        #[cfg(feature = "unix-file-copy-paste")]
+                        if sp.name() == FILE_NAME {
+                            handler.check_clipboard_file();
+                        } else if let Some(msg) = handler.get_clipboard_msg() {
+                            sp.send(msg);
+                        }
+                        #[cfg(not(feature = "unix-file-copy-paste"))]
+                        if let Some(msg) = handler.get_clipboard_msg() {
+                            sp.send(msg);
+                        }
+                    }
+                    ClipboardListenerBurstCompletion::Stop => {
+                        log::debug!("Clipboard listener stopped");
+                        break;
+                    }
+                    ClipboardListenerBurstCompletion::StopWithError(err) => {
+                        stop_error = Some(err);
+                        break;
+                    }
+                    ClipboardListenerBurstCompletion::Disconnected => {
+                        log::error!("Clipboard listener disconnected");
+                        break;
+                    }
                 }
             }
             Ok(CallbackResult::Stop) => {
@@ -94,7 +172,8 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
                 break;
             }
             Ok(CallbackResult::StopWithError(err)) => {
-                bail!("Clipboard listener stopped with error: {}", err);
+                stop_error = Some(err);
+                break;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -106,7 +185,140 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
 
     clipboard_listener::unsubscribe(&sp.name());
 
+    if let Some(err) = stop_error {
+        bail!("Clipboard listener stopped with error: {}", err);
+    }
+
     Ok(())
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod clipboard_listener_burst_tests {
+    use super::*;
+    use std::sync::mpsc::TryRecvError;
+
+    #[test]
+    fn coalesces_all_queued_next_callbacks_into_one_ready_snapshot() {
+        let (sender, receiver) = channel();
+        for _ in 0..10 {
+            sender.send(CallbackResult::Next).unwrap();
+        }
+
+        assert!(matches!(receiver.recv(), Ok(CallbackResult::Next)));
+        assert!(matches!(
+            coalesce_clipboard_listener_burst(
+                &receiver,
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+            ),
+            ClipboardListenerBurstCompletion::Ready
+        ));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn callbacks_after_a_quiet_gap_start_a_new_snapshot() {
+        let (sender, receiver) = channel();
+
+        sender.send(CallbackResult::Next).unwrap();
+        assert!(matches!(receiver.recv(), Ok(CallbackResult::Next)));
+        assert!(matches!(
+            coalesce_clipboard_listener_burst(
+                &receiver,
+                Duration::from_millis(5),
+                Duration::from_millis(50),
+            ),
+            ClipboardListenerBurstCompletion::Ready
+        ));
+
+        sender.send(CallbackResult::Next).unwrap();
+        assert!(matches!(receiver.recv(), Ok(CallbackResult::Next)));
+        assert!(matches!(
+            coalesce_clipboard_listener_burst(
+                &receiver,
+                Duration::from_millis(5),
+                Duration::from_millis(50),
+            ),
+            ClipboardListenerBurstCompletion::Ready
+        ));
+    }
+
+    #[test]
+    fn preserves_stop_received_inside_a_burst() {
+        let (sender, receiver) = channel();
+        sender.send(CallbackResult::Stop).unwrap();
+
+        assert!(matches!(
+            coalesce_clipboard_listener_burst(
+                &receiver,
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+            ),
+            ClipboardListenerBurstCompletion::Stop
+        ));
+    }
+
+    #[test]
+    fn preserves_error_received_inside_a_burst() {
+        let (sender, receiver) = channel();
+        sender
+            .send(CallbackResult::StopWithError(io::Error::new(
+                io::ErrorKind::Other,
+                "listener failed",
+            )))
+            .unwrap();
+
+        match coalesce_clipboard_listener_burst(
+            &receiver,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        ) {
+            ClipboardListenerBurstCompletion::StopWithError(err) => {
+                assert_eq!(err.to_string(), "listener failed")
+            }
+            _ => panic!("listener error was not preserved"),
+        }
+    }
+
+    #[test]
+    fn preserves_disconnect_received_inside_a_burst() {
+        let (sender, receiver) = channel();
+        drop(sender);
+
+        assert!(matches!(
+            coalesce_clipboard_listener_burst(
+                &receiver,
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+            ),
+            ClipboardListenerBurstCompletion::Disconnected
+        ));
+    }
+
+    #[test]
+    fn hard_cap_prevents_a_continuous_burst_from_starving_delivery() {
+        let (sender, receiver) = channel();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..30 {
+                if sender.send(CallbackResult::Next).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let started_at = Instant::now();
+
+        assert!(matches!(
+            coalesce_clipboard_listener_burst(
+                &receiver,
+                Duration::from_millis(10),
+                Duration::from_millis(30),
+            ),
+            ClipboardListenerBurstCompletion::Ready
+        ));
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        producer.join().unwrap();
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -160,6 +372,7 @@ impl Handler {
                                         .unwrap_or(ClipboardFormat::Text)
                                         .into(),
                                     special_name: c.special_name,
+                                    source_application: c.source_application.to_proto().into(),
                                     ..Default::default()
                                 })
                                 .collect(),

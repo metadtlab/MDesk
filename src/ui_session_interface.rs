@@ -86,6 +86,7 @@ pub struct ChangeDisplayRecord {
     height: i32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     Connecting,
     Connected,
@@ -96,6 +97,13 @@ enum ConnectionState {
 pub struct ConnectionRoundState {
     round: u32,
     state: ConnectionState,
+    recording_finalize_results: HashMap<u32, RecordingFinalizeResult>,
+}
+
+#[derive(Clone)]
+struct RecordingFinalizeResult {
+    source_connection_id: String,
+    result: Result<(), String>,
 }
 
 impl ConnectionRoundState {
@@ -125,6 +133,43 @@ impl ConnectionRoundState {
             true
         }
     }
+
+    pub fn set_recording_finalize_result(
+        &mut self,
+        round: u32,
+        source_connection_id: String,
+        result: Result<(), String>,
+    ) {
+        self.recording_finalize_results.insert(
+            round,
+            RecordingFinalizeResult {
+                source_connection_id,
+                result,
+            },
+        );
+    }
+
+    pub fn recording_finalize_result(
+        &self,
+        round: u32,
+        source_connection_id: &str,
+    ) -> Option<Result<(), String>> {
+        self.recording_finalize_results
+            .get(&round)
+            .filter(|outcome| outcome.source_connection_id == source_connection_id)
+            .map(|outcome| outcome.result.clone())
+    }
+
+    pub fn recording_source_finalized(&self, source_connection_id: &str) -> bool {
+        self.recording_finalize_results.values().any(|outcome| {
+            outcome.source_connection_id == source_connection_id && outcome.result.is_ok()
+        })
+    }
+
+    pub fn invalidate_recording_source_finalize(&mut self, source_connection_id: &str) {
+        self.recording_finalize_results
+            .retain(|_, outcome| outcome.source_connection_id != source_connection_id);
+    }
 }
 
 impl Default for ConnectionRoundState {
@@ -132,7 +177,48 @@ impl Default for ConnectionRoundState {
         Self {
             round: 0,
             state: ConnectionState::Connecting,
+            recording_finalize_results: HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod recording_round_state_tests {
+    use super::ConnectionRoundState;
+
+    #[test]
+    fn recording_finalize_result_is_bound_to_round_and_source() {
+        let mut state = ConnectionRoundState::default();
+        let round_one = state.new_round();
+        state.set_recording_finalize_result(round_one, "source-one".to_owned(), Ok(()));
+
+        assert!(state
+            .recording_finalize_result(round_one, "source-one")
+            .unwrap()
+            .is_ok());
+        assert!(state
+            .recording_finalize_result(round_one, "source-two")
+            .is_none());
+        assert!(state.recording_source_finalized("source-one"));
+        assert!(!state.recording_source_finalized("source-two"));
+
+        let round_two = state.new_round();
+        state.set_recording_finalize_result(
+            round_two,
+            "source-two".to_owned(),
+            Err("flush failed".to_owned()),
+        );
+        assert!(state
+            .recording_finalize_result(round_two, "source-two")
+            .unwrap()
+            .is_err());
+        assert!(!state.recording_source_finalized("source-two"));
+        state.set_recording_finalize_result(round_two, "source-two".to_owned(), Ok(()));
+        assert!(state.recording_source_finalized("source-two"));
+        assert!(state.recording_source_finalized("source-one"));
+        state.invalidate_recording_source_finalize("source-two");
+        assert!(!state.recording_source_finalized("source-two"));
+        assert!(state.recording_source_finalized("source-one"));
     }
 }
 
@@ -449,21 +535,149 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::RecordScreen(start));
     }
 
+    pub fn register_recording_file(
+        &self,
+        path: String,
+        source_connection_id: String,
+        connection_ticket: String,
+    ) {
+        self.connection_round_state
+            .lock()
+            .unwrap()
+            .invalidate_recording_source_finalize(&source_connection_id);
+        self.lc.write().unwrap().track_recording_file_for_context(
+            path,
+            source_connection_id,
+            connection_ticket,
+        );
+    }
+
     pub fn save_recording_note(&self, title: String, comment: String) -> String {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (files, peer_id, session_id) = {
-            let mut lc = self.lc.write().unwrap();
-            lc.record_state = false;
+        let (
+            expected_round,
+            connection_state,
+            peer_id,
+            session_id,
+            expected_source_connection_id,
+            disconnected_finalize_result,
+        ) = {
+            let state = self.connection_round_state.lock().unwrap();
+            let lc = self.lc.read().unwrap();
+            let source_connection_id = lc.enterprise_audit_context().0;
             (
-                lc.recording_files.clone(),
+                state.round,
+                state.state,
                 lc.get_id().to_owned(),
                 lc.session_id,
+                source_connection_id.clone(),
+                state.recording_finalize_result(state.round, &source_connection_id),
             )
         };
-        // If the connection is still active, stop the recorder before updating
-        // the finalized file. If it has already disconnected, the recorder has
-        // already been dropped and the local save can still complete.
-        self.send(Data::RecordScreen(false));
+
+        if connection_state == ConnectionState::Disconnected {
+            match disconnected_finalize_result {
+                Some(Ok(())) => {}
+                Some(Err(err)) => {
+                    return format!("{err} 로컬 원본은 유지되며 다시 시도할 수 있습니다.");
+                }
+                None => {
+                    return "연결 종료 시 녹화 파일 마감 결과를 확인하지 못했습니다. 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                        .to_owned();
+                }
+            }
+        } else {
+            let (finalize_tx, finalize_rx) = std::sync::mpsc::channel();
+            self.send(Data::FinalizeRecording((
+                expected_round,
+                expected_source_connection_id.clone(),
+                finalize_tx,
+            )));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match finalize_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(Ok(())) => break,
+                    Ok(Err(err)) => {
+                        return format!("{err} 로컬 원본은 유지되며 다시 시도할 수 있습니다.");
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let state = self.connection_round_state.lock().unwrap();
+                        if state.state == ConnectionState::Disconnected
+                            && state.round == expected_round
+                        {
+                            match state.recording_finalize_result(
+                                expected_round,
+                                &expected_source_connection_id,
+                            ) {
+                                Some(Ok(())) => break,
+                                Some(Err(err)) => {
+                                    return format!(
+                                        "{err} 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                                    );
+                                }
+                                None => {}
+                            }
+                        } else if state.round != expected_round {
+                            return "재접속 중 연결 세대가 변경되어 녹화 저장을 중단했습니다. 연결을 종료한 뒤 다시 시도해 주세요. 로컬 원본은 유지됩니다."
+                                .to_owned();
+                        }
+                        drop(state);
+                        if std::time::Instant::now() >= deadline {
+                            return "녹화 파일 마감을 확인하지 못했습니다. 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                                .to_owned();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let state = self.connection_round_state.lock().unwrap();
+                        if state.state == ConnectionState::Disconnected
+                            && state.round == expected_round
+                        {
+                            match state.recording_finalize_result(
+                                expected_round,
+                                &expected_source_connection_id,
+                            ) {
+                                Some(Ok(())) => break,
+                                Some(Err(err)) => {
+                                    return format!(
+                                        "{err} 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                                    );
+                                }
+                                None => {}
+                            }
+                        }
+                        return "녹화 파일 마감 채널이 종료되었습니다. 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                            .to_owned();
+                    }
+                }
+            }
+        }
+        // Clone only after every tracked source has a successful recorder
+        // finalize outcome. Holding the round-state lock while checking the
+        // current source prevents reconnect from rotating the shared context
+        // between validation and snapshot.
+        let files = {
+            let state = self.connection_round_state.lock().unwrap();
+            if state.round != expected_round {
+                return "재접속 중 연결 세대가 변경되어 녹화 저장을 중단했습니다. 연결을 종료한 뒤 다시 시도해 주세요. 로컬 원본은 유지됩니다."
+                    .to_owned();
+            }
+            let lc = self.lc.read().unwrap();
+            if lc.enterprise_audit_context().0 != expected_source_connection_id {
+                return "녹화 연결 식별자가 변경되어 저장을 중단했습니다. 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                    .to_owned();
+            }
+            if lc
+                .recording_files
+                .iter()
+                .any(|file| !state.recording_source_finalized(&file.source_connection_id))
+            {
+                return "일부 녹화 세그먼트의 파일 마감을 확인하지 못했습니다. 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                    .to_owned();
+            }
+            lc.recording_files.clone()
+        };
+        let snapshot_files = files.clone();
+        let recording_file_count = files.len().max(1) as u64;
         crate::recording_note::save_recording_notes(
             files,
             crate::recording_note::RecordingNoteContext {
@@ -475,17 +689,38 @@ impl<T: InvokeUiSession> Session<T> {
             },
             Some(tx),
         );
-        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        let maximum_wait = std::time::Duration::from_secs(
+            recording_file_count
+                .saturating_mul(
+                    crate::hbbs_http::recording_upload_v2::UPLOAD_TIMEOUT.as_secs() + 30,
+                )
+                .saturating_add(60),
+        );
+        match rx.recv_timeout(maximum_wait) {
             Ok(result) => {
                 let mut lc = self.lc.write().unwrap();
-                if result.error.is_empty() {
-                    lc.recording_files.clear();
-                } else {
-                    lc.recording_files = result.files;
+                lc.recording_files.retain(|current| {
+                    !snapshot_files.iter().any(|snapshot| {
+                        snapshot.path == current.path
+                            && snapshot.source_connection_id == current.source_connection_id
+                    })
+                });
+                if !result.error.is_empty() {
+                    for retry in result.files {
+                        if !lc.recording_files.iter().any(|current| {
+                            current.path == retry.path
+                                && current.source_connection_id == retry.source_connection_id
+                        }) {
+                            lc.recording_files.push(retry);
+                        }
+                    }
                 }
                 result.error
             }
-            Err(_) => "녹화 작업내용 저장 시간이 초과되었습니다.".to_owned(),
+            Err(_) => {
+                "녹화 영상 서버 저장 시간이 초과되었습니다. 로컬 원본은 유지되며 다시 시도할 수 있습니다."
+                    .to_owned()
+            }
         }
     }
 
@@ -1329,11 +1564,18 @@ impl<T: InvokeUiSession> Session<T> {
         let cloned = self.clone();
         *cloned.audit_guid.lock().unwrap() = String::new();
         *cloned.last_audit_note.lock().unwrap() = String::new();
-        // override only if true
-        if true == force_relay {
-            self.lc.write().unwrap().force_relay = true;
+        {
+            let mut lc = self.lc.write().unwrap();
+            // Each connection round needs its own one-time intent. Existing
+            // recording files retain the old round snapshot captured when the
+            // recorder created them.
+            lc.rotate_enterprise_audit_context();
+            // override only if true
+            if force_relay {
+                lc.force_relay = true;
+            }
+            lc.peer_info = None;
         }
-        self.lc.write().unwrap().peer_info = None;
         self.reconnect_count.fetch_add(1, Ordering::SeqCst);
         let mut lock = self.thread.lock().unwrap();
         // No need to join the previous thread, because it will exit automatically.
@@ -1715,6 +1957,14 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn set_fingerprint(&self, fingerprint: String);
     fn job_error(&self, id: i32, err: String, file_num: i32);
     fn job_done(&self, id: i32, file_num: i32);
+    fn direct_file_transfer_started(
+        &self,
+        _id: i32,
+        _root_name: &str,
+        _file_count: usize,
+        _total_size: u64,
+    ) {
+    }
     fn clear_all_jobs(&self);
     fn new_message(&self, msg: String);
     fn update_transfer_list(&self);
@@ -1903,7 +2153,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         remember: bool,
         peer: &mut Stream,
     ) {
-        handle_login_from_ui(
+        if let Err(err) = handle_login_from_ui(
             self.lc.clone(),
             os_username,
             os_password,
@@ -1911,7 +2161,15 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             remember,
             peer,
         )
-        .await;
+        .await
+        {
+            self.msgbox(
+                "error",
+                "File Transfer Audit Required",
+                &err.to_string(),
+                "",
+            );
+        }
     }
 
     async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {

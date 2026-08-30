@@ -191,6 +191,7 @@ mod test {
                 key: "".to_owned(),
                 api: "".to_owned(),
                 relay: "".to_owned(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -200,6 +201,7 @@ mod test {
                 key: "".to_owned(),
                 api: "".to_owned(),
                 relay: "".to_owned(),
+                ..Default::default()
             }
         );
         // key in these tests is "foobar.,2" base64 encoded
@@ -213,6 +215,7 @@ mod test {
                 key: "Zm9vYmFyLiwyCg==".to_owned(),
                 api: "abc".to_owned(),
                 relay: "".to_owned(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -225,6 +228,7 @@ mod test {
                 key: "Zm9vYmFyLiwyCg==".to_owned(),
                 api: "".to_owned(),
                 relay: "".to_owned(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -237,6 +241,7 @@ mod test {
                 key: "Zm9vYmFyLiwyCg==".to_owned(),
                 api: "".to_owned(),
                 relay: "server.example.net".to_owned(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -249,6 +254,7 @@ mod test {
                 key: "Zm9vYmFyLiwyCg==".to_owned(),
                 api: "".to_owned(),
                 relay: "server.example.net".to_owned(),
+                ..Default::default()
             }
         );
         let lic = CustomServer {
@@ -256,6 +262,7 @@ mod test {
             key: "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=".to_owned(),
             api: "".to_owned(),
             relay: "".to_owned(),
+            ..Default::default()
         };
         assert_eq!(
             get_custom_server_from_string("rustdesk-licensed-0nI900VsFHZVBVdIlncwpHS4V0bOZ0dtVldrpVO4JHdCp0YV5WdzUGZzdnYRVjI6ISeltmIsISMuEjLx4SMiojI0N3boJye.exe")

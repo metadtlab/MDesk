@@ -1,5 +1,6 @@
 use clipboard::ClipboardFile;
 use hbb_common::message_proto::*;
+use hbb_common::protobuf::Enum;
 
 pub fn clip_2_msg(clip: ClipboardFile) -> Message {
     match clip {
@@ -143,7 +144,10 @@ pub fn clip_2_msg(clip: ClipboardFile) -> Message {
             })),
             ..Default::default()
         },
-        ClipboardFile::Files { files } => {
+        ClipboardFile::Files {
+            files,
+            source_application,
+        } => {
             let files = files
                 .iter()
                 .filter_map(|(f, s)| {
@@ -170,6 +174,11 @@ pub fn clip_2_msg(clip: ClipboardFile) -> Message {
                 union: Some(message::Union::Cliprdr(Cliprdr {
                     union: Some(cliprdr::Union::Files(CliprdrFiles {
                         files,
+                        source_application: ClipboardSourceApplication::from_i32(
+                            source_application,
+                        )
+                        .unwrap_or(ClipboardSourceApplication::ClipboardSourceUnknown)
+                        .into(),
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -423,5 +432,66 @@ pub mod unix_file_clip {
             }
         }
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_clipboard_source_application_is_a_closed_proto_enum() {
+        let message = clip_2_msg(ClipboardFile::Files {
+            files: vec![("report.pdf".to_owned(), 100)],
+            source_application: ClipboardSourceApplication::ClipboardSourceFileManager as i32,
+        });
+
+        let Some(message::Union::Cliprdr(cliprdr)) = message.union else {
+            panic!("missing cliprdr message");
+        };
+        let Some(cliprdr::Union::Files(files)) = cliprdr.union else {
+            panic!("missing files message");
+        };
+        assert_eq!(
+            files.source_application.enum_value(),
+            Ok(ClipboardSourceApplication::ClipboardSourceFileManager)
+        );
+
+        let unknown = clip_2_msg(ClipboardFile::Files {
+            files: vec![("report.pdf".to_owned(), 100)],
+            source_application: i32::MAX,
+        });
+        let Some(message::Union::Cliprdr(cliprdr)) = unknown.union else {
+            panic!("missing cliprdr message");
+        };
+        let Some(cliprdr::Union::Files(files)) = cliprdr.union else {
+            panic!("missing files message");
+        };
+        assert_eq!(
+            files.source_application.enum_value(),
+            Ok(ClipboardSourceApplication::ClipboardSourceUnknown)
+        );
+    }
+
+    #[test]
+    fn legacy_file_clipboard_ipc_defaults_source_application_to_unknown() {
+        let current = ClipboardFile::Files {
+            files: vec![("report.pdf".to_owned(), 100)],
+            source_application: ClipboardSourceApplication::ClipboardSourceFileManager as i32,
+        };
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy["c"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_application");
+
+        let decoded: ClipboardFile = serde_json::from_value(legacy).unwrap();
+        let ClipboardFile::Files {
+            source_application, ..
+        } = decoded
+        else {
+            panic!("missing files variant");
+        };
+        assert_eq!(source_application, 0);
     }
 }

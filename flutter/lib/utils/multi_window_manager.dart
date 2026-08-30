@@ -230,6 +230,7 @@ class RustDeskMultiWindowManager {
     bool? isRDP,
     bool? isSharedPassword,
     String? connToken,
+    String? initialLocalDir,
     String? initialRemoteDir,
     String? initialRemoteSelectedName,
   }) async {
@@ -250,6 +251,9 @@ class RustDeskMultiWindowManager {
     }
     if (connToken != null) {
       params['connToken'] = connToken;
+    }
+    if (initialLocalDir != null) {
+      params['initialLocalDir'] = initialLocalDir;
     }
     if (initialRemoteDir != null) {
       params['initialRemoteDir'] = initialRemoteDir;
@@ -300,6 +304,7 @@ class RustDeskMultiWindowManager {
     bool? isSharedPassword,
     bool? forceRelay,
     String? connToken,
+    String? initialLocalDir,
     String? initialRemoteDir,
     String? initialRemoteSelectedName,
   }) async {
@@ -312,6 +317,7 @@ class RustDeskMultiWindowManager {
       forceRelay: forceRelay,
       isSharedPassword: isSharedPassword,
       connToken: connToken,
+      initialLocalDir: initialLocalDir,
       initialRemoteDir: initialRemoteDir,
       initialRemoteSelectedName: initialRemoteSelectedName,
     );

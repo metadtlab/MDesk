@@ -1000,9 +1000,10 @@ class LegacyAb extends BaseAb {
         if (statusCode == 401) {
           // 로그인 직후에는 401 응답으로 인한 리셋 방지 (서버 호환성 문제일 수 있음)
           if (gFFI.userModel.isWithinLoginProtection()) {
-            debugPrint('LegacyAb: 401 ignored (within login protection period)');
+            debugPrint(
+                'LegacyAb: 401 ignored (within login protection period)');
           } else {
-            gFFI.userModel.reset(resetOther: true);
+            await gFFI.userModel.recoverUnauthorized();
           }
         }
       }
@@ -1457,9 +1458,10 @@ class Ab extends BaseAb {
         if (statusCode == 401) {
           // 로그인 직후에는 401 응답으로 인한 리셋 방지
           if (gFFI.userModel.isWithinLoginProtection()) {
-            debugPrint('Ab.pullAbImpl: 401 ignored (within login protection period)');
+            debugPrint(
+                'Ab.pullAbImpl: 401 ignored (within login protection period)');
           } else {
-            gFFI.userModel.reset(resetOther: true);
+            await gFFI.userModel.recoverUnauthorized();
           }
         }
       }
@@ -1509,9 +1511,10 @@ class Ab extends BaseAb {
         if (statusCode == 401) {
           // 로그인 직후에는 401 응답으로 인한 리셋 방지
           if (gFFI.userModel.isWithinLoginProtection()) {
-            debugPrint('Ab._fetchTags: 401 ignored (within login protection period)');
+            debugPrint(
+                'Ab._fetchTags: 401 ignored (within login protection period)');
           } else {
-            gFFI.userModel.reset(resetOther: true);
+            await gFFI.userModel.recoverUnauthorized();
           }
         }
       }

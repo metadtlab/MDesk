@@ -12,6 +12,7 @@ set "BUILD_OUTPUT=%CARGO_TARGET_DIR%\%TARGET%\release\mdeskmini.exe"
 set "DIST_DIR=%CARGO_TARGET_DIR%\win7-x64"
 set "DIST_OUTPUT=%DIST_DIR%\MDeskMini-Win7-x64.exe"
 set "VERIFY_SCRIPT=%PROJECT_DIR%win7\verify_win7_binary.ps1"
+set "ADMIN_VERIFY_SCRIPT=%PROJECT_DIR%verify_admin_manifest.ps1"
 
 echo ========================================
 echo MDeskMini Windows 7 SP1 64-bit build
@@ -162,6 +163,11 @@ if errorlevel 1 (
   echo ERROR: Windows 7 compatibility verification failed.
   exit /b 1
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%BUILD_OUTPUT%"
+if errorlevel 1 (
+  echo ERROR: Administrator manifest verification failed.
+  exit /b 1
+)
 
 echo.
 echo [6/6] Creating the separate Windows 7 distribution file
@@ -169,6 +175,11 @@ if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
 copy /y "%BUILD_OUTPUT%" "%DIST_OUTPUT%" >nul
 if errorlevel 1 (
   echo ERROR: Failed to create the distribution file.
+  exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%DIST_OUTPUT%"
+if errorlevel 1 (
+  echo ERROR: Distribution executable is missing the administrator manifest.
   exit /b 1
 )
 
