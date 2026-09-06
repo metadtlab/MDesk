@@ -639,6 +639,18 @@ message CliprdrFiles {
   ClipboardSourceApplication source_application = 2;
 }
 
+// v1 credit-controlled native clipboard file stream. No filesystem paths on wire.
+message CliprdrFileStream {
+  uint32 kind = 1; // 1=request, 2=block, 3=end, 4=credit, 5=cancel, 6=error, 7=descriptors request, 8=descriptors response
+  uint64 generation = 2;
+  uint64 request_id = 3;
+  uint32 index = 4;
+  uint64 offset = 5;
+  uint64 size = 6;
+  bytes data = 7;
+  bool compressed = 8;
+}
+
 message Cliprdr {
   oneof union {
     CliprdrMonitorReady ready = 1;
@@ -650,6 +662,7 @@ message Cliprdr {
     CliprdrFileContentsResponse file_contents_response = 7;
     CliprdrTryEmpty try_empty = 8;
     CliprdrFiles files = 9;
+    CliprdrFileStream file_stream = 10;
   }
 }
 

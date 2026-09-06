@@ -27,6 +27,7 @@ pub mod bytes_codec;
 pub use anyhow::{self, bail};
 pub use futures_util;
 pub mod config;
+pub mod mdesk_endpoints;
 pub mod fs;
 pub mod mem;
 pub use lazy_static;

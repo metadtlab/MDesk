@@ -162,6 +162,7 @@ impl Drop for SimpleCallOnReturn {
 }
 
 pub fn global_init() -> bool {
+    crate::connection_diagnostics::event("app", "", "process.start", &[]);
     #[cfg(target_os = "linux")]
     {
         if !crate::platform::linux::is_x11() {
@@ -235,6 +236,7 @@ pub fn is_running_portable() -> bool {
 }
 
 pub fn global_clean() {
+    crate::connection_diagnostics::flush();
     // 포터블 모드에서 설정 파일 삭제
     // 주의: 이 기능은 현재 비활성화됨 (실행 문제 방지)
     // 수동 삭제는 cleanup_portable_config() 함수 사용
@@ -1120,17 +1122,17 @@ pub fn get_custom_rendezvous_server(custom: String) -> String {
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         if !lic.host.is_empty() {
-            return lic.host.clone();
+            return hbb_common::mdesk_endpoints::canonical_server(&lic.host);
         }
     }
     if !custom.is_empty() {
-        return custom;
+        return hbb_common::mdesk_endpoints::canonical_server(&custom);
     }
     if !config::PROD_RENDEZVOUS_SERVER.read().unwrap().is_empty() {
-        return config::PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+        return hbb_common::mdesk_endpoints::canonical_server(&config::PROD_RENDEZVOUS_SERVER.read().unwrap());
     }
     // 기본 ID 서버 (Rendezvous 서버) 하드코딩
-    "mdesk.imedixerp.co.kr".to_owned()
+    hbb_common::mdesk_endpoints::SERVER_HOST.to_owned()
 }
 
 #[inline]
@@ -1172,7 +1174,7 @@ fn get_api_server_(api: String, _custom: String) -> String {
         return api.into();
     }
     // 기본 API 서버 (rendezvous 서버 기반으로 자동 생성하지 않음)
-    "https://admin.787.kr".to_owned()
+    hbb_common::mdesk_endpoints::API_URL.to_owned()
 }
 
 #[inline]

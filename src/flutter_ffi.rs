@@ -43,6 +43,8 @@ lazy_static::lazy_static! {
 const REMOTE_DROP_ACTION_DEDUP_MS: u64 = 1500;
 
 fn should_skip_recent_remote_drop_action(session_id: &SessionID, action_key: String) -> bool {
+    // Repeated delivery of one drop is a duplicate only within its session.
+    let action_key = format!("{}|{}", session_id, action_key);
     let now = Instant::now();
     let dedup_window = Duration::from_millis(REMOTE_DROP_ACTION_DEDUP_MS);
     let mut guard = REMOTE_DROP_ACTION_GUARD.lock().unwrap();

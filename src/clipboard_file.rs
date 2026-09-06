@@ -4,6 +4,23 @@ use hbb_common::protobuf::Enum;
 
 pub fn clip_2_msg(clip: ClipboardFile) -> Message {
     match clip {
+        ClipboardFile::FileStream(f) => {
+            let mut msg = Message::new();
+            let mut clip = Cliprdr::new();
+            clip.set_file_stream(CliprdrFileStream {
+                kind: f.kind,
+                generation: f.generation,
+                request_id: f.request_id,
+                index: f.index,
+                offset: f.offset,
+                size: f.size,
+                data: f.data.into(),
+                compressed: f.compressed,
+                ..Default::default()
+            });
+            msg.set_cliprdr(clip);
+            msg
+        }
         ClipboardFile::NotifyCallback {
             r#type,
             title,
@@ -191,6 +208,27 @@ pub fn clip_2_msg(clip: ClipboardFile) -> Message {
 
 pub fn msg_2_clip(msg: Cliprdr) -> Option<ClipboardFile> {
     match msg.union {
+        Some(cliprdr::Union::FileStream(f))
+            if f.request_id != 0
+                && f.generation != 0
+                && f.data.len()
+                    <= if f.kind == clipboard::file_stream::DESCRIPTORS_RESPONSE {
+                        4 + 16384 * 592
+                    } else {
+                        clipboard::file_stream::BLOCK_BYTES
+                    } =>
+        {
+            Some(ClipboardFile::FileStream(clipboard::file_stream::Frame {
+                kind: f.kind,
+                generation: f.generation,
+                request_id: f.request_id,
+                index: f.index,
+                offset: f.offset,
+                size: f.size,
+                data: f.data.into(),
+                compressed: f.compressed,
+            }))
+        }
         Some(cliprdr::Union::Ready(_)) => Some(ClipboardFile::MonitorReady),
         Some(cliprdr::Union::FormatList(data)) => {
             let mut format_list: Vec<(i32, String)> = Vec::new();
@@ -438,6 +476,59 @@ pub mod unix_file_clip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_wire_roundtrip_and_payload_limits() {
+        use clipboard::file_stream::{Frame, BLOCK, BLOCK_BYTES};
+        use hbb_common::protobuf::Message as _;
+        let original = Frame {
+            kind: BLOCK,
+            generation: u64::MAX - 1,
+            request_id: u64::MAX,
+            index: 12,
+            offset: 1u64 << 40,
+            size: (1u64 << 40) + BLOCK_BYTES as u64,
+            data: (0..BLOCK_BYTES).map(|i| i as u8).collect(),
+            compressed: false,
+        };
+        let encoded = clip_2_msg(ClipboardFile::FileStream(original.clone()))
+            .write_to_bytes()
+            .unwrap();
+        assert!(encoded.len() < BLOCK_BYTES + 128);
+        let Some(message::Union::Cliprdr(clip)) =
+            Message::parse_from_bytes(&encoded).unwrap().union
+        else {
+            panic!()
+        };
+        let Some(ClipboardFile::FileStream(decoded)) = msg_2_clip(clip) else {
+            panic!()
+        };
+        assert_eq!(
+            serde_json::to_value(original.clone()).unwrap(),
+            serde_json::to_value(decoded).unwrap()
+        );
+        for invalid in [
+            Frame {
+                data: vec![0; BLOCK_BYTES + 1],
+                ..original.clone()
+            },
+            Frame {
+                request_id: 0,
+                ..original.clone()
+            },
+            Frame {
+                generation: 0,
+                ..original
+            },
+        ] {
+            let Some(message::Union::Cliprdr(clip)) =
+                clip_2_msg(ClipboardFile::FileStream(invalid)).union
+            else {
+                panic!()
+            };
+            assert!(msg_2_clip(clip).is_none());
+        }
+    }
 
     #[test]
     fn file_clipboard_source_application_is_a_closed_proto_enum() {

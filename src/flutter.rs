@@ -50,16 +50,8 @@ lazy_static::lazy_static! {
 }
 
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
-#[derive(Default)]
-struct FileClipboardRouteState {
-    owner_peer_id: String,
-    requester_peer_id: String,
-    pending_format_list_echoes: HashSet<String>,
-}
-
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 lazy_static::lazy_static! {
-    static ref FILE_CLIPBOARD_ROUTE_STATE: RwLock<FileClipboardRouteState> = Default::default();
+    static ref FILE_CLIPBOARD_ROUTE_STATE: std::sync::Mutex<clipboard::route::FileRoute> = Default::default();
 }
 
 #[cfg(target_os = "windows")]
@@ -1516,93 +1508,35 @@ pub fn send_clipboard_msg_except_peer(source_peer_id: &str, msg: Message, _is_fi
 
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 #[cfg(not(target_os = "ios"))]
-pub fn relay_file_clipboard_msg_from_peer(
-    source_peer_id: &str,
-    msg: Message,
-    is_format_list: bool,
-    is_try_empty: bool,
-) -> bool {
-    if is_try_empty {
-        let mut state = FILE_CLIPBOARD_ROUTE_STATE.write().unwrap();
-        state.owner_peer_id.clear();
-        state.requester_peer_id.clear();
-        state.pending_format_list_echoes.clear();
-        drop(state);
-        send_clipboard_msg_except_peer(source_peer_id, msg, true);
-        return false;
-    }
-
-    if is_format_list {
-        let mut relayed = false;
-        let mut state = FILE_CLIPBOARD_ROUTE_STATE.write().unwrap();
-        if state.owner_peer_id != source_peer_id
-            && state.pending_format_list_echoes.remove(source_peer_id)
-        {
-            log::debug!(
-                "Ignore echoed file clipboard FormatList from peer {}",
-                source_peer_id
-            );
-            return true;
-        }
-
-        state.owner_peer_id = source_peer_id.to_owned();
-        state.requester_peer_id.clear();
-        state.pending_format_list_echoes.clear();
-        for s in sessions::get_sessions() {
-            if s.get_id() == source_peer_id {
-                continue;
-            }
-            if crate::is_support_file_copy_paste_num(s.lc.read().unwrap().version)
-                && s.is_file_clipboard_required()
-            {
-                state.pending_format_list_echoes.insert(s.get_id());
-                s.send(Data::Message(msg.clone()));
-                relayed = true;
-            }
-        }
-        return relayed;
-    }
-
-    let (owner_peer_id, requester_peer_id) = {
-        let state = FILE_CLIPBOARD_ROUTE_STATE.read().unwrap();
-        (state.owner_peer_id.clone(), state.requester_peer_id.clone())
-    };
-    if owner_peer_id.is_empty() {
-        return false;
-    }
-
-    if source_peer_id != owner_peer_id {
-        FILE_CLIPBOARD_ROUTE_STATE
-            .write()
-            .unwrap()
-            .pending_format_list_echoes
-            .remove(source_peer_id);
-        FILE_CLIPBOARD_ROUTE_STATE
-            .write()
-            .unwrap()
-            .requester_peer_id = source_peer_id.to_owned();
-        if let Some(owner) = sessions::get_session_by_peer_id(owner_peer_id, ConnType::DEFAULT_CONN)
-        {
-            if owner.is_file_clipboard_required() {
-                owner.send(Data::Message(msg));
-                return true;
-            }
-        }
-        return false;
-    }
-
-    if !requester_peer_id.is_empty() {
-        if let Some(requester) =
-            sessions::get_session_by_peer_id(requester_peer_id, ConnType::DEFAULT_CONN)
-        {
-            if requester.is_file_clipboard_required() {
-                requester.send(Data::Message(msg));
-                return true;
+pub fn relay_file_clipboard_msg_from_peer(source_peer_id: &str, clip: &mut clipboard::ClipboardFile) -> bool {
+    let targets = sessions::get_sessions().into_iter().filter(|s|
+        crate::is_support_file_copy_paste_num(s.lc.read().unwrap().version) && s.is_file_clipboard_required()
+    ).map(|s| s.get_id()).collect::<Vec<_>>();
+    let mut route = FILE_CLIPBOARD_ROUTE_STATE.lock().unwrap();
+    let (handled, forwards) = route.incoming(source_peer_id, clip, &targets);
+    for (peer, clip) in forwards {
+        if let Some(session) = sessions::get_session_by_peer_id(peer, ConnType::DEFAULT_CONN) {
+            if session.is_file_clipboard_required() {
+                session.send(Data::Message(crate::clipboard_file::clip_2_msg(clip)));
             }
         }
     }
+    handled
+}
 
-    false
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+pub fn route_local_file_clipboard(peer: &str, clip: clipboard::ClipboardFile) {
+    let mut route = FILE_CLIPBOARD_ROUTE_STATE.lock().unwrap();
+    if let Some(clip) = route.outgoing(peer, clip) {
+        if let Some(session) = sessions::get_session_by_peer_id(peer.to_owned(), ConnType::DEFAULT_CONN) {
+            session.send(Data::Message(crate::clipboard_file::clip_2_msg(clip)));
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+pub fn disconnect_file_clipboard(peer: &str) {
+    FILE_CLIPBOARD_ROUTE_STATE.lock().unwrap().disconnect(peer);
 }
 
 #[cfg(not(target_os = "ios"))]

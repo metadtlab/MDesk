@@ -248,6 +248,9 @@ struct CertVerification {
 fn main() {
     let _secure_log_cleanup = SecureLogCleanup;
     common::mark_mdeskmini_process_tree();
+    // Applies before internal --server/--cm dispatch too, without changing the
+    // installed client's preferences or the existing installed-MDesk handoff.
+    config::require_websocket_for_process();
     let first_arg = std::env::args().nth(1);
     let delegates_to_core_main = is_rustdesk_internal_arg(first_arg.as_deref())
         || internal_mode_from_arg(first_arg.as_deref()).is_some();
@@ -352,6 +355,9 @@ fn is_running_as_administrator() -> bool {
 }
 
 fn init_diagnostic_logging() {
+    librustdesk::connection_diagnostics::event("mini", "", "process.version", &[
+        ("build", env!("CARGO_PKG_VERSION")),
+    ]);
     let _ = DIAGNOSTIC_STARTED_AT.set(Instant::now());
     let path = diagnostic_log_path();
 
@@ -408,6 +414,8 @@ fn secure_process_exit(code: i32) -> ! {
 }
 
 fn cleanup_mdeskmini_logs() {
+    // The separate, sanitized connection timeline survives normal log cleanup.
+    librustdesk::connection_diagnostics::flush();
     if LOG_CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -504,6 +512,27 @@ fn diagnostic_log_path() -> Option<PathBuf> {
 }
 
 fn diagnostic_event(stage: &str, detail: &str) {
+    // Do not copy `detail`: legacy diagnostics can contain URLs/session tokens.
+    let stage_ms = detail.split_whitespace()
+        .find_map(|v| v.strip_prefix("elapsed_ms=").and_then(|v| v.parse::<u128>().ok()));
+    let status = detail.split_whitespace()
+        .find_map(|v| v.strip_prefix("status=").and_then(|v| v.parse::<u16>().ok()));
+    let progress = detail.split_whitespace()
+        .find_map(|v| v.strip_prefix("percent=").and_then(|v| v.parse::<u8>().ok()));
+    let peer = detail.split_whitespace().find_map(|v| {
+        v.strip_prefix("verified_peer_id=").or_else(|| v.strip_prefix("local_peer_id="))
+            .or_else(|| v.strip_prefix("peer_id="))
+    }).unwrap_or_default();
+    librustdesk::connection_diagnostics::event("mini", "", stage, &[
+        ("registered", if is_rendezvous_registered() { "true" } else { "false" }),
+        ("duration_ms", &stage_ms.map(|v| v.to_string()).unwrap_or_default()),
+        ("status", &status.map(|v| v.to_string()).unwrap_or_default()),
+        ("progress", &progress.map(|v| v.to_string()).unwrap_or_default()),
+        ("peer", peer),
+        ("reason", if stage.contains("failed") || stage.contains("error") {
+            librustdesk::connection_diagnostics::error_kind(detail)
+        } else { "" }),
+    ]);
     let elapsed_ms = DIAGNOSTIC_STARTED_AT
         .get()
         .map(|started| started.elapsed().as_millis())

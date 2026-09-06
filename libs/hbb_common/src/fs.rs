@@ -278,7 +278,7 @@ fn validate_direct_path_component(component: &str) -> ResultType<()> {
     Ok(())
 }
 
-fn decompress_direct_transfer_block(data: &[u8], limit: usize) -> ResultType<Vec<u8>> {
+pub fn decompress_direct_transfer_block(data: &[u8], limit: usize) -> ResultType<Vec<u8>> {
     let decoder = zstd::stream::read::Decoder::new(data)?;
     let read_limit = u64::try_from(limit)
         .unwrap_or(u64::MAX - 1)
@@ -1322,6 +1322,29 @@ fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
 }
 
 impl TransferJob {
+    /// Stream an already authorized, opened clipboard file. The caller owns
+    /// generation/path authorization; no remote path is accepted here.
+    pub async fn from_clipboard_file(file: std::fs::File, offset: u64, file_name: &str) -> ResultType<Self> {
+        let metadata = file.metadata()?;
+        let size = metadata.len();
+        if offset > size || !metadata.is_file() {
+            bail!("invalid clipboard file range");
+        }
+        let mut file = File::from_std(file);
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        Ok(Self {
+            r#type: JobType::Generic,
+            data_source: DataSource::FilePath(PathBuf::from("clipboard.bin")),
+            data_stream: Some(DataStream::FileStream(file)),
+            files: vec![FileEntry { name: file_name.to_owned(), size, ..Default::default() }],
+            total_size: size,
+            finished_size: offset,
+            file_confirmed: true,
+            enable_overwrite_detection: false,
+            ..Default::default()
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_write(
         id: i32,

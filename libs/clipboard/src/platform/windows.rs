@@ -6,9 +6,8 @@
 #![allow(deref_nullptr)]
 
 use crate::{
-    send_data, send_data_exclude, ClipboardFile, CliprdrError, CliprdrServiceContext,
-    ProgressPercent, ResultType, ERR_CODE_INVALID_PARAMETER, ERR_CODE_SEND_MSG,
-    ERR_CODE_SERVER_FUNCTION_NONE, VEC_MSG_CHANNEL,
+    send_data, ClipboardFile, CliprdrError, CliprdrServiceContext, ProgressPercent, ResultType,
+    ERR_CODE_INVALID_PARAMETER, ERR_CODE_SEND_MSG, ERR_CODE_SERVER_FUNCTION_NONE, VEC_MSG_CHANNEL,
 };
 use hbb_common::{allow_err, log};
 use std::{
@@ -16,6 +15,126 @@ use std::{
     ffi::{CStr, CString},
     result::Result,
 };
+
+extern "system" {
+    fn GetClipboardSequenceNumber() -> u32;
+    fn IsClipboardFormatAvailable(format: u32) -> i32;
+    fn RegisterClipboardFormatA(name: *const u8) -> u32;
+    fn GlobalAlloc(flags: u32, size: usize) -> *mut std::ffi::c_void;
+    fn GlobalLock(memory: *mut std::ffi::c_void) -> *mut u8;
+    fn GlobalUnlock(memory: *mut std::ffi::c_void) -> i32;
+    fn GlobalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+thread_local! { static METADATA_RESPONSE: std::cell::RefCell<Option<crate::file_stream::Frame>> = const { std::cell::RefCell::new(None) }; }
+
+#[no_mangle]
+pub unsafe extern "C" fn mdesk_clipboard_descriptors(
+    conn: u32,
+    generation: u64,
+    format: u32,
+    len: *mut usize,
+) -> *mut std::ffi::c_void {
+    if len.is_null() {
+        return std::ptr::null_mut();
+    }
+    *len = 0;
+    let Ok(data) = crate::file_stream::descriptors(conn as i32, generation, format) else {
+        return std::ptr::null_mut();
+    };
+    let memory = GlobalAlloc(0x42, data.len());
+    if memory.is_null() {
+        return memory;
+    }
+    let output = GlobalLock(memory);
+    if output.is_null() {
+        GlobalFree(memory);
+        return std::ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), output, data.len());
+    GlobalUnlock(memory);
+    *len = data.len();
+    memory
+}
+
+#[no_mangle]
+pub extern "C" fn mdesk_clipboard_remote_generation(conn: u32) -> u64 {
+    crate::file_stream::remote_generation(conn as i32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mdesk_clipboard_stream_read(
+    conn: u32,
+    generation: u64,
+    index: u32,
+    size: u64,
+    offset: u64,
+    output: *mut u8,
+    requested: u32,
+    read: *mut u32,
+    token: *mut u64,
+) -> i32 {
+    if output.is_null() || read.is_null() || token.is_null() {
+        return -1;
+    }
+    *read = 0;
+    match crate::file_stream::read(
+        conn as i32,
+        generation,
+        index,
+        size,
+        offset,
+        std::slice::from_raw_parts_mut(output, requested as usize),
+        &mut *token,
+    ) {
+        Ok(n) => {
+            *read = n as u32;
+            0
+        }
+        Err(e) => {
+            log::warn!("Native clipboard file read failed: {}", e);
+            crate::file_stream::release(conn as i32, *token);
+            *token = 0;
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mdesk_clipboard_stream_release(conn: u32, token: u64) {
+    crate::file_stream::release(conn as i32, token);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mdesk_clipboard_source_snapshot(
+    sequence: u32,
+    count: u32,
+    paths: *const *const u16,
+) {
+    use std::os::windows::ffi::OsStringExt;
+    if paths.is_null() || count > 16384 {
+        return;
+    }
+    let paths = std::slice::from_raw_parts(paths, count as usize)
+        .iter()
+        .map(|p| {
+            if p.is_null() {
+                return None;
+            }
+            let mut len = 0;
+            while len < 32768 && *p.add(len) != 0 {
+                len += 1;
+            }
+            if len == 32768 {
+                return None;
+            }
+            let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                std::slice::from_raw_parts(*p, len),
+            ));
+            path.is_absolute().then_some(path)
+        })
+        .collect();
+    crate::file_stream::snapshot(sequence, paths);
+}
 
 // only used error code will be recorded here
 /// success
@@ -639,6 +758,49 @@ pub fn server_clip_file(
 ) -> u32 {
     let mut ret = 0;
     match msg {
+        ClipboardFile::FileStream(frame) => {
+            let sequence = unsafe { GetClipboardSequenceNumber() };
+            if frame.kind == crate::file_stream::DESCRIPTORS_REQUEST {
+                if frame.request_id == 0
+                    || frame.generation == 0
+                    || !frame.data.is_empty()
+                    || frame.compressed
+                    || frame.index
+                        != unsafe { RegisterClipboardFormatA(b"FileGroupDescriptorW\0".as_ptr()) }
+                {
+                    crate::file_stream::reject(conn_id, &ClipboardFile::FileStream(frame));
+                    return 0;
+                }
+                if let Some(data) = crate::file_stream::cached_metadata(conn_id, frame.generation) {
+                    let _ = send_data(
+                        conn_id,
+                        ClipboardFile::FileStream(crate::file_stream::Frame {
+                            kind: crate::file_stream::DESCRIPTORS_RESPONSE,
+                            data,
+                            compressed: false,
+                            ..frame
+                        }),
+                    );
+                    return 0;
+                }
+                if !crate::file_stream::source_is_current(frame.generation, sequence) {
+                    let _ = send_data(
+                        conn_id,
+                        ClipboardFile::FileStream(crate::file_stream::Frame {
+                            kind: crate::file_stream::ERROR,
+                            data: vec![],
+                            ..frame
+                        }),
+                    );
+                } else {
+                    METADATA_RESPONSE.with(|s| *s.borrow_mut() = Some(frame.clone()));
+                    ret = server_format_data_request(context, conn_id, frame.index as i32);
+                    METADATA_RESPONSE.with(|s| s.borrow_mut().take());
+                }
+            } else {
+                crate::file_stream::handle(conn_id, frame, sequence);
+            }
+        }
         ClipboardFile::NotifyCallback { .. } => {
             // unreachable
         }
@@ -651,13 +813,19 @@ pub fn server_clip_file(
                 ret
             );
         }
-        ClipboardFile::FormatList { format_list } => {
+        ClipboardFile::FormatList { mut format_list } => {
+            crate::file_stream::set_remote_generation(
+                conn_id,
+                crate::file_stream::generation(&format_list),
+            );
+            format_list.retain(|(_, name)| !name.starts_with(crate::file_stream::FORMAT_PREFIX));
             log::debug!(
                 "server_format_list called, conn_id {}, format_list: {:?}",
                 conn_id,
                 &format_list
             );
-            send_data_exclude(conn_id as _, ClipboardFile::TryEmpty);
+            // A different peer may still be consuming the previous copy. Its
+            // transfer owns that generation until IStream::Release/cancel.
             ret = server_format_list(context, conn_id, format_list);
             log::debug!(
                 "server_format_list called, conn_id {}, return {}",
@@ -1124,6 +1292,16 @@ extern "C" fn client_format_list(
         conn_id,
         &format_list
     );
+    let generation =
+        crate::file_stream::announce(unsafe { GetClipboardSequenceNumber() }, unsafe {
+            IsClipboardFormatAvailable(15) != 0
+        });
+    if generation != 0 {
+        format_list.push((
+            0,
+            format!("{}{:016x}", crate::file_stream::FORMAT_PREFIX, generation),
+        ));
+    }
     let data = ClipboardFile::FormatList { format_list };
     // no need to handle result here
     if conn_id == 0 {
@@ -1222,6 +1400,26 @@ extern "C" fn client_format_data_response(
         conn_id,
         msg_flags
     );
+    if let Some(frame) = METADATA_RESPONSE.with(|s| s.borrow_mut().take()) {
+        if msg_flags == 1 {
+            crate::file_stream::remember_metadata(conn_id, frame.generation, &format_data);
+        }
+        return match send_data(
+            conn_id,
+            ClipboardFile::FileStream(crate::file_stream::Frame {
+                kind: if msg_flags == 1 {
+                    crate::file_stream::DESCRIPTORS_RESPONSE
+                } else {
+                    crate::file_stream::ERROR
+                },
+                data: format_data,
+                ..frame
+            }),
+        ) {
+            Ok(()) => 0,
+            Err(_) => ERR_CODE_SEND_MSG,
+        };
+    }
     let data = ClipboardFile::FormatDataResponse {
         msg_flags,
         format_data,

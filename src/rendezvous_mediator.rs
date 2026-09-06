@@ -51,6 +51,7 @@ pub fn is_rendezvous_registered() -> bool {
 fn mark_rendezvous_registered(host: &str) {
     if !RENDEZVOUS_REGISTERED.swap(true, Ordering::SeqCst) {
         log::info!("rendezvous registration ready: {host}");
+        crate::connection_diagnostics::event("host", "", "registration.ready", &[("server", host)]);
     }
 }
 
@@ -107,6 +108,7 @@ impl RendezvousMediator {
         scrap::codec::test_av1();
         loop {
             RENDEZVOUS_REGISTERED.store(false, Ordering::SeqCst);
+            crate::connection_diagnostics::event("host", "", "registration.reset", &[]);
             let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
@@ -122,6 +124,9 @@ impl RendezvousMediator {
                     let timeout = timeout.clone();
                     futs.push(tokio::spawn(async move {
                         if let Err(err) = Self::start(server, host).await {
+                            crate::connection_diagnostics::event("host", "", "registration.error", &[
+                                ("reason", crate::connection_diagnostics::error_kind(&err.to_string())),
+                            ]);
                             let err = format!("rendezvous mediator error: {err}");
                             // When user reboot, there might be below error, waiting too long
                             // (CONNECT_TIMEOUT 18s) will make user think there is bug
@@ -251,6 +256,10 @@ impl RendezvousMediator {
                     }
                     if timeout || (last_register_sent.is_none() && expired) {
                         if timeout {
+                            crate::connection_diagnostics::event("host", "", "registration.timeout", &[
+                                ("server", &host), ("attempt", &fails.to_string()),
+                                ("timeout_ms", &reg_timeout.to_string()),
+                            ]);
                             fails += 1;
                             if fails >= MAX_FAILS2 {
                                 Config::update_latency(&host, -1);
@@ -291,6 +300,7 @@ impl RendezvousMediator {
             Some(rendezvous_message::Union::RegisterPeerResponse(rpr)) => {
                 update_latency();
                 if rpr.request_pk {
+                    crate::connection_diagnostics::event("host", "", "registration.key_requested", &[("server", &self.host)]);
                     log::info!("request_pk received from {}", self.host);
                     self.register_pk(sink).await?;
                 } else {
@@ -414,6 +424,11 @@ impl RendezvousMediator {
     }
 
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
+        let _diagnostic = crate::connection_diagnostics::Span::lifetime("host", "", "registration.channel");
+        crate::connection_diagnostics::event("host", "", "registration.start", &[
+            ("server", &host), ("key_confirmed", &Config::get_key_confirmed().to_string()),
+            ("route", if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some()) || Config::is_proxy() || use_ws() || crate::is_udp_disabled() { "tcp" } else { "udp" }),
+        ]);
         log::info!("start rendezvous mediator of {}", host);
         //If the investment agent type is http or https, then tcp forwarding is enabled.
         if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
@@ -459,6 +474,7 @@ impl RendezvousMediator {
         socket_addr_v6: bytes::Bytes,
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&socket_addr);
+        let _diagnostic = crate::connection_diagnostics::Span::lifetime("host", &uuid, "relay.dispatch");
         log::info!(
             "create_relay requested from {:?}, relay_server: {}, uuid: {}, secure: {}",
             peer_addr,
@@ -578,6 +594,7 @@ impl RendezvousMediator {
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
         let relay = use_ws() || Config::is_proxy() || ph.force_relay;
+        crate::connection_diagnostics::event("host", "", "connection.requested", &[("force_relay", &relay.to_string())]);
         let mut socket_addr_v6 = Default::default();
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(peer_addr_v6, peer_addr, server.clone()).await;
@@ -722,19 +739,12 @@ impl RendezvousMediator {
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
         let mut relay_server = Config::get_option("relay-server");
         if relay_server.is_empty() {
-            // 하드코딩: 기본 Relay 서버 주소
-            relay_server = "mdesk.imedixerp.co.kr".to_string();
-            if !relay_server.contains(':') {
-                relay_server = format!("{}:{}", relay_server, config::RELAY_PORT);
-            }
-        }
-        if relay_server.is_empty() {
             relay_server = provided_by_rendezvous_server;
         }
         if relay_server.is_empty() {
             relay_server = crate::increase_port(&self.host, 1);
         }
-        relay_server
+        hbb_common::mdesk_endpoints::canonical_server(&relay_server)
     }
 }
 

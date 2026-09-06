@@ -986,6 +986,14 @@ where
     }
 
     pub async fn send(&mut self, data: &Data) -> ResultType<()> {
+        #[cfg(target_os = "windows")]
+        if let Data::ClipboardFile(clip @ ClipboardFile::FileStream(_)) = data {
+            use hbb_common::protobuf::Message as _;
+            let mut bytes = b"\0MDeskClipStream1\0".to_vec();
+            bytes.extend(crate::clipboard_file::clip_2_msg(clip.clone()).write_to_bytes()?);
+            self.inner.send(bytes.into()).await?;
+            return Ok(());
+        }
         let v = serde_json::to_vec(data)?;
         self.inner.send(bytes::Bytes::from(v)).await?;
         Ok(())
@@ -1012,6 +1020,26 @@ where
         match self.inner.next().await {
             Some(res) => {
                 let bytes = res?;
+                #[cfg(target_os = "windows")]
+                if let Some(payload) = bytes.strip_prefix(b"\0MDeskClipStream1\0") {
+                    use hbb_common::{
+                        message_proto::{message, Message},
+                        protobuf::Message as _,
+                    };
+                    if payload.len() > 4 + 16384 * 592 + 256 {
+                        bail!("clipboard IPC frame exceeds limit");
+                    }
+                    if let Some(message::Union::Cliprdr(clip)) =
+                        Message::parse_from_bytes(payload)?.union
+                    {
+                        if let Some(clip @ ClipboardFile::FileStream(_)) =
+                            crate::clipboard_file::msg_2_clip(clip)
+                        {
+                            return Ok(Some(Data::ClipboardFile(clip)));
+                        }
+                    }
+                    bail!("invalid clipboard IPC frame");
+                }
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(data) = serde_json::from_str::<Data>(s) {
                         return Ok(Some(data));
@@ -1523,6 +1551,51 @@ pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn streaming_ipc_preserves_frame_boundaries_and_legacy_messages() {
+        use clipboard::file_stream::{Frame, BLOCK, BLOCK_BYTES};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (a, b) = tokio::io::duplex(BLOCK_BYTES * 3);
+            let mut sender = ConnectionTmpl::new(a);
+            let mut receiver = ConnectionTmpl::new(b);
+            let bytes = vec![193; BLOCK_BYTES];
+            sender
+                .send(&Data::ClipboardFile(ClipboardFile::FileStream(Frame {
+                    kind: BLOCK,
+                    generation: 7,
+                    request_id: u64::MAX,
+                    size: BLOCK_BYTES as u64,
+                    data: bytes.clone(),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap();
+            sender
+                .send(&Data::Config((
+                    "clipboard-test".into(),
+                    Some("legacy".into()),
+                )))
+                .await
+                .unwrap();
+            let Some(Data::ClipboardFile(ClipboardFile::FileStream(frame))) =
+                receiver.next().await.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(frame.request_id, u64::MAX);
+            assert_eq!(frame.data, bytes);
+            assert!(
+                matches!(receiver.next().await.unwrap(), Some(Data::Config((name, Some(value))))
+                if name == "clipboard-test" && value == "legacy")
+            );
+        });
+    }
 
     #[test]
     fn verify_ffi_enum_data_size() {

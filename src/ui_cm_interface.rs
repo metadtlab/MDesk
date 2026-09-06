@@ -670,12 +670,14 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     let is_stopping_allowed = _clip.is_beginning_message();
                                     let is_clipboard_enabled = ContextSend::is_enabled();
                                     let file_transfer_enabled = self.file_transfer_enabled;
-                                    let stop = !is_stopping_allowed && !(is_clipboard_enabled && file_transfer_enabled);
+                                    let stop = (!is_stopping_allowed || matches!(&_clip, clipboard::ClipboardFile::FileStream(_)))
+                                        && !(is_clipboard_enabled && file_transfer_enabled);
                                     log::debug!(
                                         "Process clipboard message from client peer, stop: {}, is_stopping_allowed: {}, is_clipboard_enabled: {}, file_transfer_enabled: {}",
                                         stop, is_stopping_allowed, is_clipboard_enabled, file_transfer_enabled);
                                     if stop {
-                                        ContextSend::set_is_stopped();
+                                        clipboard::file_stream::disconnect(self.conn_id);
+                                        clipboard::file_stream::reject(self.conn_id, &_clip);
                                     } else {
                                         if !is_authorized {
                                             log::debug!("Clipboard message from client peer, but not authorized");
@@ -805,9 +807,11 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 "Process clipboard message from clip, stop: {}, is_stopping_allowed: {}, is_clipboard_enabled: {}, file_transfer_enabled: {}, file_transfer_enabled_peer: {}",
                                 stop, is_stopping_allowed, is_clipboard_enabled, file_transfer_enabled, file_transfer_enabled_peer);
                             if stop {
-                                ContextSend::set_is_stopped();
+                                clipboard::file_stream::disconnect(self.conn_id);
                             } else {
-                                if _clip.is_beginning_message() && crate::get_builtin_option(OPTION_ONE_WAY_FILE_TRANSFER) == "Y" {
+                                if _clip.is_beginning_message()
+                                    && !matches!(&_clip, clipboard::ClipboardFile::FileStream(_))
+                                    && crate::get_builtin_option(OPTION_ONE_WAY_FILE_TRANSFER) == "Y" {
                                     // If one way file transfer is enabled, don't send clipboard file to client
                                     // Don't call `ContextSend::set_is_stopped()`, because it will stop bidirectional file copy&paste.
                                 } else {
@@ -848,6 +852,8 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
             task_runner.run().await;
         }
         if task_runner.conn_id > 0 {
+            #[cfg(target_os = "windows")]
+            clipboard::file_stream::disconnect(task_runner.conn_id);
             task_runner
                 .cm
                 .remove_connection(task_runner.conn_id, task_runner.close);

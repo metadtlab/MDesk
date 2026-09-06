@@ -572,7 +572,10 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     let display_idx = vs.idx;
     let sp = vs.sp;
+    let mut diagnostic = crate::connection_diagnostics::Span::new("host", &display_idx.to_string(), "capture.initialize");
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+    diagnostic.success();
+    drop(diagnostic);
     #[cfg(windows)]
     if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
         log::info!("disable dxgi with option, fall back to gdi");
@@ -966,7 +969,10 @@ fn setup_encoder(
     let codec_format = Encoder::negotiated_codec();
     let recorder = get_recorder(record_incoming, display_idx, source == VideoSource::Camera);
     let use_i444 = Encoder::use_i444(&encoder_cfg);
+    let mut diagnostic = crate::connection_diagnostics::Span::new("host", &display_idx.to_string(), "encoder.initialize");
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
+    crate::connection_diagnostics::event("host", &display_idx.to_string(), "encoder.ready", &[("codec", &format!("{:?}", codec_format))]);
+    diagnostic.success();
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
 }
 

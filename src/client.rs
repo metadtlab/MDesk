@@ -206,12 +206,18 @@ impl Client {
         ),
         (i32, String),
     )> {
+        let session = interface.get_lch().read().unwrap().session_id.to_string();
+        let mut diagnostic = crate::connection_diagnostics::Span::new("controller", &session, "connect");
+        crate::connection_diagnostics::event("controller", &session, "connect.options", &[
+            ("peer", peer), ("force_relay", &interface.is_force_relay().to_string()),
+        ]);
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
         match Self::_start(peer, key, token, conn_type, interface.clone()).await {
             Err(err) => {
                 let err_str = err.to_string();
+                crate::connection_diagnostics::event("controller", &session, "connect.failed", &[("reason", crate::connection_diagnostics::error_kind(&err_str))]);
                 if err_str.starts_with("Failed") {
                     bail!(err_str + ": Please try later");
                 } else {
@@ -229,6 +235,8 @@ impl Client {
                         interface.get_lch().write().unwrap().set_direct_failure(n);
                     }
                 }
+                crate::connection_diagnostics::event("controller", &session, "transport.ready", &[("route", x.0.4)]);
+                diagnostic.success();
                 Ok((x.0, x.1))
             }
         }
@@ -285,6 +293,8 @@ impl Client {
             ));
         }
 
+        let session = interface.get_lch().read().unwrap().session_id.to_string();
+        let mut discovery = crate::connection_diagnostics::Span::new("controller", &session, "server.lookup");
         let other_server = interface.get_lch().read().unwrap().other_server.clone();
         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
             (a.as_ref(), b.as_ref(), c.as_ref(), "")
@@ -308,6 +318,9 @@ impl Client {
             }
         };
 
+        discovery.success();
+        drop(discovery);
+        let mut preparation = crate::connection_diagnostics::Span::new("controller", &session, "network.prepare");
         if crate::get_ipv6_punch_enabled() {
             crate::test_ipv6().await;
         }
@@ -332,6 +345,8 @@ impl Client {
         } else {
             (None, None)
         };
+        preparation.success();
+        drop(preparation);
         let fut = Self::_start_inner(
             peer.to_owned(),
             key.to_owned(),
@@ -390,6 +405,9 @@ impl Client {
         (i32, String),
         bool,
     )> {
+        let session = interface.get_lch().read().unwrap().session_id.to_string();
+        let mut id_connect = crate::connection_diagnostics::Span::new("controller", &session, "id_server.connect");
+        crate::connection_diagnostics::event("controller", &session, "id_server.selected", &[("server", &rendezvous_server)]);
         let mut start = Instant::now();
         let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
@@ -411,6 +429,8 @@ impl Client {
         }
         log::info!("rendezvous server: {}", rendezvous_server);
         let mut socket = socket?;
+        id_connect.success();
+        drop(id_connect);
         let my_addr = socket.local_addr();
         let mut signed_id_pk = Vec::new();
         let mut relay_server = "".to_owned();
@@ -485,6 +505,7 @@ impl Client {
         let mut force_relay_offline_deadline = None;
         while i < max_punch_attempts {
             i += 1;
+            crate::connection_diagnostics::event("controller", &session, "rendezvous.request", &[("attempt", &i.to_string())]);
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
                 i,
@@ -508,6 +529,7 @@ impl Client {
                                     bail!("ID does not exist");
                                 }
                                 Ok(punch_hole_response::Failure::OFFLINE) => {
+                                    crate::connection_diagnostics::event("controller", &session, "rendezvous.offline", &[]);
                                     if interface.is_force_relay() {
                                         let deadline = *force_relay_offline_deadline
                                             .get_or_insert_with(|| {
@@ -577,6 +599,7 @@ impl Client {
                         }
                     }
                     Some(rendezvous_message::Union::RelayResponse(rr)) => {
+                        crate::connection_diagnostics::event("controller", &session, "relay.assigned", &[("relay_uuid", &rr.uuid)]);
                         log::info!(
                             "relay requested from peer, time used: {:?}, relay_server: {}",
                             start.elapsed(),
@@ -768,6 +791,9 @@ impl Client {
         let start = std::time::Instant::now();
 
         let force_relay = interface.is_force_relay();
+        crate::connection_diagnostics::event("controller", &interface.get_lch().read().unwrap().session_id.to_string(), "direct.attempt", &[
+            ("force_relay", &force_relay.to_string()), ("timeout_ms", &connect_timeout.to_string()),
+        ]);
         let (mut conn, mut kcp, mut typ) = if force_relay {
             log::info!("P2P attempt skipped for relay-only connection");
             (Err(anyhow!("relay-only connection requested")), None, "")
@@ -798,6 +824,7 @@ impl Client {
 
         let mut direct = !conn.is_err();
         if force_relay || conn.is_err() {
+            crate::connection_diagnostics::event("controller", &interface.get_lch().read().unwrap().session_id.to_string(), "relay.fallback", &[]);
             if !relay_server.is_empty() {
                 conn = Self::request_relay(
                     peer_id,
@@ -933,6 +960,7 @@ impl Client {
         conn: &mut Stream,
         read_timeout: u64,
     ) -> ResultType<Option<Vec<u8>>> {
+        let mut diagnostic = crate::connection_diagnostics::Span::new("controller", peer_id, "secure_handshake");
         let rs_pk = get_rs_pk(if key.is_empty() {
             config::RS_PUB_KEY
         } else {
@@ -958,6 +986,7 @@ impl Client {
             None => {
                 // send an empty message out in case server is setting up secure and waiting for first message
                 conn.send(&Message::new()).await?;
+                diagnostic.success();
                 return Ok(option_pk);
             }
         };
@@ -1002,6 +1031,7 @@ impl Client {
                 bail!("Reset by the peer");
             }
         }
+        diagnostic.success();
         Ok(option_pk)
     }
 
@@ -1015,6 +1045,7 @@ impl Client {
         token: &str,
         conn_type: ConnType,
     ) -> ResultType<Stream> {
+        let mut diagnostic = crate::connection_diagnostics::Span::new("controller", peer, "relay.request");
         let mut succeed = false;
         let mut uuid = "".to_owned();
         let mut ipv4 = true;
@@ -1066,7 +1097,9 @@ impl Client {
         if !succeed {
             bail!("Timeout");
         }
-        Self::create_relay(peer, uuid, relay_server, key, conn_type, ipv4).await
+        let result = Self::create_relay(peer, uuid, relay_server, key, conn_type, ipv4).await;
+        if result.is_ok() { diagnostic.success(); }
+        result
     }
 
     /// Create a relay connection to the server.
@@ -1078,6 +1111,8 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
+        let mut diagnostic = crate::connection_diagnostics::Span::new("controller", &uuid, "relay.connect");
+        crate::connection_diagnostics::event("controller", &uuid, "relay.peer", &[("peer", peer), ("server", &relay_server)]);
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
@@ -1093,6 +1128,7 @@ impl Client {
             ..Default::default()
         });
         conn.send(&msg_out).await?;
+        diagnostic.success();
         Ok(conn)
     }
 
@@ -3274,6 +3310,8 @@ pub fn start_video_thread<F, T>(
         sync_cpu_usage();
         get_hwcodec_config();
         let mut video_handler = None;
+        let mut diagnostic_decoded = false;
+        let mut diagnostic_decode_error = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap_or_else(std::time::Instant::now);
         let mut count = 0;
         let mut duration = std::time::Duration::ZERO;
         let mut skip_beginning = 0;
@@ -3329,6 +3367,13 @@ pub fn start_video_thread<F, T>(
                             let format_changed = handler.decoder.format() != format;
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
+                                    if !diagnostic_decoded {
+                                        diagnostic_decoded = true;
+                                        crate::connection_diagnostics::event("controller", &session.lc.read().unwrap().session_id.to_string(), "video.first_decoded", &[
+                                            ("display", &display.to_string()), ("duration_ms", &start.elapsed().as_millis().to_string()),
+                                            ("codec", &format!("{:?}", format)),
+                                        ]);
+                                    }
                                     video_callback(
                                         display,
                                         &mut handler.rgb,
@@ -3364,6 +3409,10 @@ pub fn start_video_thread<F, T>(
                                     // 3. If the error does not occur. Switch from A to display B. The error occurs.
                                     //
                                     // to-do: fix the error
+                                    if diagnostic_decode_error.elapsed() >= std::time::Duration::from_secs(10) {
+                                        diagnostic_decode_error = std::time::Instant::now();
+                                        crate::connection_diagnostics::event("controller", &session.lc.read().unwrap().session_id.to_string(), "video.decode_error", &[("display", &display.to_string())]);
+                                    }
                                     log::error!("handle video frame error, {}", e);
                                     session.refresh_video(display as _);
                                 }
@@ -4113,16 +4162,21 @@ async fn send_login(
     password: Vec<u8>,
     peer: &mut Stream,
 ) -> ResultType<()> {
+    let session = lc.read().unwrap().session_id.to_string();
+    let mut diagnostic = crate::connection_diagnostics::Span::new("controller", &session, "login.send");
     prepare_connection_intent(lc.clone()).await?;
     let msg_out = lc
         .read()
         .unwrap()
         .create_login_msg(os_username, os_password, password);
     peer.send(&msg_out).await?;
+    diagnostic.success();
     Ok(())
 }
 
 async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> ResultType<()> {
+    let session = lc.read().unwrap().session_id.to_string();
+    let mut diagnostic = crate::connection_diagnostics::Span::new("controller", &session, "intent.prepare");
     let (target_rid, source_connection_id, connection_type, already_issued, require_verified) = {
         let lc = lc.read().unwrap();
         (
@@ -4140,6 +4194,8 @@ async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> Resul
         )
     };
     if already_issued || source_connection_id.is_empty() {
+        crate::connection_diagnostics::event("controller", &session, "intent.cached_or_skipped", &[]);
+        diagnostic.success();
         return Ok(());
     }
 
@@ -4151,6 +4207,7 @@ async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> Resul
     .await
     {
         Ok(Some(intent)) => {
+            diagnostic.success();
             let mut lc = lc.write().unwrap();
             if lc.audit_source_connection_id == intent.source_connection_id
                 && lc.audit_connection_ticket.is_empty()
@@ -4160,6 +4217,7 @@ async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> Resul
             Ok(())
         }
         Ok(None) => {
+            crate::connection_diagnostics::event("controller", &session, "intent.unavailable", &[]);
             if require_verified {
                 bail!(
                     "로그인 사용자의 {connection_type} 감사 이력을 확인할 수 없어 연결을 시작하지 않았습니다. API 서버 연결을 확인한 뒤 다시 시도하세요."
@@ -4171,6 +4229,7 @@ async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> Resul
             Ok(())
         }
         Err(err) => {
+            crate::connection_diagnostics::event("controller", &session, "intent.error", &[]);
             if require_verified {
                 bail!(
                     "{connection_type} 감사 티켓을 발급하지 못했습니다. API 서버 연결을 확인한 뒤 다시 시도하세요: {err}"

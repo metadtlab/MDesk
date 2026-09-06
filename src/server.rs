@@ -176,6 +176,10 @@ pub async fn create_tcp_connection(
 ) -> ResultType<()> {
     let mut stream = stream;
     let id = server.write().unwrap().get_new_id();
+    let mut diagnostic = crate::connection_diagnostics::Span::new("host", &id.to_string(), "secure_handshake");
+    crate::connection_diagnostics::event("host", &id.to_string(), "transport.accepted", &[
+        ("local_port", &stream.local_addr().port().to_string()),
+    ]);
     let (sk, pk) = Config::get_key_pair();
     if secure && pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
         let mut sk_ = [0u8; sign::SECRETKEYBYTES];
@@ -240,6 +244,8 @@ pub async fn create_tcp_connection(
         }
         log::info!("wake up macos");
     }
+    diagnostic.success();
+    drop(diagnostic);
     Connection::start(addr, stream, id, Arc::downgrade(&server)).await;
     Ok(())
 }
@@ -283,11 +289,16 @@ async fn create_relay_connection_(
     secure: bool,
     ipv4: bool,
 ) -> ResultType<()> {
+    let mut diagnostic = crate::connection_diagnostics::Span::new("host", &uuid, "relay.connect");
+    crate::connection_diagnostics::event("host", &uuid, "relay.selected", &[("server", &relay_server)]);
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
         CONNECT_TIMEOUT,
     )
     .await?;
+    crate::connection_diagnostics::event("host", &uuid, "relay.socket_ready", &[
+        ("local_port", &stream.local_addr().port().to_string()),
+    ]);
     let mut msg_out = RendezvousMessage::new();
     let licence_key = crate::get_key(true).await;
     msg_out.set_request_relay(RequestRelay {
@@ -296,6 +307,8 @@ async fn create_relay_connection_(
         ..Default::default()
     });
     stream.send(&msg_out).await?;
+    diagnostic.success();
+    drop(diagnostic);
     create_tcp_connection(server, stream, peer_addr, secure).await?;
     Ok(())
 }

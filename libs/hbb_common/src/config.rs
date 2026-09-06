@@ -107,7 +107,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["mdesk.imedixerp.co.kr"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &[crate::mdesk_endpoints::SERVER_HOST];
 pub const RS_PUB_KEY: &str = "trXi2YcqXDxjxREeM6y0qwu1lBzBC07LX1eisYNqR18=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
@@ -831,7 +831,12 @@ fn get_console_user_profile_path() -> Option<String> {
 impl Config2 {
     fn load() -> Config2 {
         let mut config = Config::load_::<Config2>("2");
-        let mut store = false;
+        let mut store = crate::mdesk_endpoints::migrate_options(&mut config.options);
+        let canonical = crate::mdesk_endpoints::canonical_server(&config.rendezvous_server);
+        if canonical != config.rendezvous_server {
+            config.rendezvous_server = canonical;
+            store = true;
+        }
         if let Some(mut socks) = config.socks {
             let (password, _, store2) =
                 decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
@@ -1289,8 +1294,9 @@ impl Config {
         }
         // 기본 ID 서버 (Rendezvous 서버) 하드코딩
         if rendezvous_server.is_empty() {
-            rendezvous_server = "mdesk.imedixerp.co.kr".to_owned();
+            rendezvous_server = crate::mdesk_endpoints::SERVER_HOST.to_owned();
         }
+        rendezvous_server = crate::mdesk_endpoints::canonical_server(&rendezvous_server);
         if !rendezvous_server.contains(':') {
             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
         }
@@ -1298,7 +1304,7 @@ impl Config {
     }
 
     pub fn get_rendezvous_servers() -> Vec<String> {
-        let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let s = crate::mdesk_endpoints::canonical_server(&EXE_RENDEZVOUS_SERVER.read().unwrap());
         if !s.is_empty() {
             return vec![s];
         }
@@ -1306,7 +1312,7 @@ impl Config {
         if !s.is_empty() {
             return vec![s];
         }
-        let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let s = crate::mdesk_endpoints::canonical_server(&PROD_RENDEZVOUS_SERVER.read().unwrap());
         if !s.is_empty() {
             return vec![s];
         }
@@ -1535,6 +1541,7 @@ impl Config {
         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
+        crate::mdesk_endpoints::migrate_options(&mut res);
         res
     }
 
@@ -1544,6 +1551,7 @@ impl Config {
     }
 
     pub fn set_options(mut v: HashMap<String, String>) {
+        crate::mdesk_endpoints::migrate_options(&mut v);
         // "key" 옵션의 빈 문자열 값을 임시로 보관
         let key_empty = v.get("key").map(|x| x.is_empty()).unwrap_or(false);
         Self::purify_options(&mut v);
@@ -1560,13 +1568,14 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
-        get_or(
+        let value = get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
             &DEFAULT_SETTINGS,
             k,
         )
-        .unwrap_or_default()
+        .unwrap_or_default();
+        crate::mdesk_endpoints::canonical_option(k, &value)
     }
 
     pub fn get_bool_option(k: &str) -> bool {
@@ -1574,6 +1583,7 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        let v = crate::mdesk_endpoints::canonical_option(&k, &v);
         // "key" 옵션은 빈 문자열도 저장하여 사용자가 명시적으로 키를 지웠음을 표시
         let is_key_option = k == "key";
         if !is_key_option && !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
@@ -3085,7 +3095,18 @@ pub fn persist_recording_options() {
     }
 }
 
+static REQUIRE_WEBSOCKET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Require WS for this Mini process only, including when saved/custom settings
+/// say N. Do not persist Y: an installed MDesk may share the same config files.
+pub fn require_websocket_for_process() {
+    REQUIRE_WEBSOCKET.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn use_ws() -> bool {
+    if REQUIRE_WEBSOCKET.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     let option = keys::OPTION_ALLOW_WEBSOCKET;
     option2bool(option, &Config::get_option(option))
 }

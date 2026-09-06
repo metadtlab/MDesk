@@ -12,6 +12,7 @@ import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import 'login.dart';
 import '../../utils/device_register_service.dart';
+import '../../utils/connection_diagnostics.dart';
 
 /// 상담사 추가 버튼·관련 안내 표시. 추후 사용 시 true로 변경.
 const bool _kShowAddCounselorButton = false;
@@ -756,6 +757,12 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   Future<void> _searchCertNo() async {
     if (_isSearchingCertStatus) return;
     _isSearchingCertStatus = true;
+    final diagnosticTimer = Stopwatch()..start();
+    var diagnosticResult = 'skipped';
+    var diagnosticStatus = 0;
+    ConnectionDiagnostics.event('readiness.poll.begin', fields: {
+      'ready': _certReadinessStage, 'has_cert': _certCode.isNotEmpty,
+    });
     try {
       final username = gFFI.userModel.userName.value;
       final mdeskId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
@@ -785,6 +792,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
           )
           .timeout(const Duration(seconds: 10));
 
+      diagnosticResult = 'response';
+      diagnosticStatus = response.statusCode;
       debugPrint(
           'CertNo Search Response: ${response.statusCode} - ${response.body}');
 
@@ -855,8 +864,14 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
         }
       }
     } catch (e) {
+      diagnosticResult = 'error';
       debugPrint('CertNo Search Error: $e');
     } finally {
+      ConnectionDiagnostics.event('readiness.poll.end', peer: _certReadinessRemoteId, fields: {
+        'duration_ms': diagnosticTimer.elapsedMilliseconds, 'result': diagnosticResult,
+        'status': diagnosticStatus, 'ready': _certReadinessStage,
+        'in_list': _containsReadyDirectRemoteId(_counselors, _certReadinessRemoteId),
+      });
       _isSearchingCertStatus = false;
     }
   }
@@ -1429,35 +1444,19 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
         return Padding(
           padding: EdgeInsets.fromLTRB(
-              horizontalPadding, compactHeight ? 12 : 20, horizontalPadding, 0),
+            horizontalPadding,
+            compactHeight ? 8 : 16,
+            horizontalPadding,
+            compactHeight ? 10 : 16,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                '상담원 번호 관리',
-                style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                '상담원 번호로 간편하게 관리',
-                style: TextStyle(
-                  fontSize: 14,
-                  color: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.color
-                      ?.withValues(alpha: 0.62),
-                ),
-              ),
-              const SizedBox(height: 12),
               Text.rich(
                 TextSpan(
                   style: TextStyle(
-                    fontSize: 14,
-                    height: 1.45,
+                    fontSize: compactHeight ? 13 : 14,
+                    height: 1.35,
                     color: Theme.of(context)
                         .textTheme
                         .bodyMedium
@@ -1480,21 +1479,22 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                 ),
                 softWrap: true,
               ),
+              SizedBox(height: compactHeight ? 6 : 12),
               Expanded(
                 child: Center(
                   child: SingleChildScrollView(
                     padding:
-                        EdgeInsets.symmetric(vertical: compactHeight ? 16 : 24),
+                        EdgeInsets.symmetric(vertical: compactHeight ? 6 : 20),
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Container(
                           width: cardWidth,
                           height: (compactHeight
-                                  ? (showReconnectButton ? 264 : 205)
+                                  ? (showReconnectButton ? 226 : 168)
                                   : (showReconnectButton ? 304 : 244)) +
                               (_certCode.isNotEmpty
-                                  ? (compactHeight ? 118 : 126)
+                                  ? (compactHeight ? 104 : 126)
                                   : 0),
                           decoration: BoxDecoration(
                             color: isDark
@@ -1519,20 +1519,20 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
                               Container(
-                                width: 48,
-                                height: 48,
+                                width: compactHeight ? 42 : 48,
+                                height: compactHeight ? 42 : 48,
                                 decoration: BoxDecoration(
                                   color: const Color(0xFF8B5CF6)
                                       .withValues(alpha: 0.11),
                                   shape: BoxShape.circle,
                                 ),
-                                child: const Icon(
+                                child: Icon(
                                   Icons.person_outline,
-                                  size: 28,
-                                  color: Color(0xFF8B5CF6),
+                                  size: compactHeight ? 24 : 28,
+                                  color: const Color(0xFF8B5CF6),
                                 ),
                               ),
-                              const SizedBox(height: 18),
+                              SizedBox(height: compactHeight ? 12 : 18),
                               AnimatedSwitcher(
                                 duration: const Duration(milliseconds: 180),
                                 child: Text(
@@ -1540,7 +1540,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                   key: ValueKey(displayNumber),
                                   maxLines: 1,
                                   style: TextStyle(
-                                    fontSize: 48,
+                                    fontSize: compactHeight ? 40 : 48,
                                     fontWeight: FontWeight.w800,
                                     color: Theme.of(context)
                                         .textTheme
@@ -1566,30 +1566,39 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                                 ),
                               ],
                               if (showReconnectButton) ...[
-                                const SizedBox(height: 20),
+                                SizedBox(height: compactHeight ? 14 : 20),
                                 _buildAgentNumberReconnectButton(context),
                               ],
                             ],
                           ),
                         ),
-                        SizedBox(height: compactHeight ? 26 : 52),
-                        _buildAgentNumberGenerateButton(context),
-                        if (hasError) ...[
-                          const SizedBox(height: 12),
-                          Text(
-                            _message,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              fontSize: 13,
-                              color: Color(0xFFD14343),
-                            ),
-                          ),
-                        ],
                       ],
                     ),
                   ),
                 ),
               ),
+              SizedBox(height: compactHeight ? 8 : 16),
+              Align(
+                alignment: Alignment.center,
+                child: _buildAgentNumberGenerateButton(
+                  context,
+                  compact: compactHeight,
+                ),
+              ),
+              if (hasError) ...[
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.center,
+                  child: Text(
+                    _message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: Color(0xFFD14343),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         );
@@ -1683,11 +1692,14 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     );
   }
 
-  Widget _buildAgentNumberGenerateButton(BuildContext context) {
+  Widget _buildAgentNumberGenerateButton(
+    BuildContext context, {
+    bool compact = false,
+  }) {
     final disabled = _isCertLoading;
     return SizedBox(
-      width: 204,
-      height: 58,
+      width: compact ? 196 : 204,
+      height: compact ? 50 : 58,
       child: DecoratedBox(
         decoration: BoxDecoration(
           gradient: disabled
@@ -2330,6 +2342,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
 
     _directRemotePromptId = cleanId;
     _lastPromptedDirectRemoteId = cleanId;
+    ConnectionDiagnostics.event('ready_dialog.shown', peer: cleanId, fields: {
+      'ready': _certReadinessStage, 'in_list': _containsReadyDirectRemoteId(_counselors, cleanId),
+    });
     debugPrint('Direct Remote: Showing ready prompt for $cleanId');
 
     try {
@@ -2358,6 +2373,10 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     if (_directRemotePromptId == cleanId) {
       _directRemotePromptId = '';
     }
+    ConnectionDiagnostics.event('ready_dialog.answered', peer: cleanId, fields: {
+      'result': shouldConnect == true ? 'connect' : 'cancel',
+      'ready': _certReadinessStage,
+    });
     if (!mounted || shouldConnect != true) {
       debugPrint('Direct Remote: Ready prompt dismissed for $cleanId');
       return;
@@ -2375,6 +2394,11 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
   void _connectToDirectRemote(String remoteId, {required bool automatically}) {
     final cleanId = remoteId.replaceAll(' ', '');
     if (cleanId.isEmpty || !mounted) return;
+    ConnectionDiagnostics.event('connect.clicked', peer: cleanId, fields: {
+      'automatic': automatically, 'ready': _certReadinessStage,
+      'has_cert': _certCode.isNotEmpty,
+      'in_list': _containsReadyDirectRemoteId(_counselors, cleanId),
+    });
     if (automatically && !_isConfirmedReadyRemoteId(cleanId)) {
       debugPrint(
           'Direct Remote: Automatic connect blocked until confirmed API ready for $cleanId');
@@ -2393,6 +2417,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
     });
     debugPrint(
         'Direct Remote: ${automatically ? 'Connecting after ready confirmation' : 'Connecting'} to MDeskMini $cleanId via relay');
+    ConnectionDiagnostics.event('connect.dispatched', peer: cleanId);
     connect(
       context,
       cleanId,

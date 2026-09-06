@@ -392,7 +392,7 @@ class _ConnectionPageState extends State<ConnectionPage>
         borderRadius: const BorderRadius.all(Radius.circular(13)),
         child: Container(
           width: 320 + 20 * 2,
-          padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
+          padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             color: glassTint,
             borderRadius: const BorderRadius.all(Radius.circular(13)),
@@ -401,8 +401,9 @@ class _ConnectionPageState extends State<ConnectionPage>
             color: Colors.transparent,
             child: Column(
               children: [
-                getConnectionPageTitle(context, false).marginOnly(bottom: 15),
+                getConnectionPageTitle(context, false).marginOnly(bottom: 10),
                 Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
                     Expanded(
                         child: RawAutocomplete<Peer>(
@@ -480,8 +481,8 @@ class _ConnectionPageState extends State<ConnectionPage>
                             focusNode: fieldFocusNode,
                             style: const TextStyle(
                               fontFamily: 'WorkSans',
-                              fontSize: 22,
-                              height: 1.4,
+                              fontSize: 18,
+                              height: 1.2,
                             ),
                             maxLines: 1,
                             cursorColor:
@@ -508,7 +509,7 @@ class _ConnectionPageState extends State<ConnectionPage>
                                       ?.withValues(alpha: 0.45),
                                 ),
                                 contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 15, vertical: 13),
+                                    horizontal: 14, vertical: 10),
                                 border: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
                                   borderSide: BorderSide.none,
@@ -612,34 +613,37 @@ class _ConnectionPageState extends State<ConnectionPage>
                         );
                       },
                     )),
-                  ],
-                ),
-                Obx(() {
-                  final isLoggedIn = gFFI.userModel.isLogin;
-                  return Padding(
-                    padding: const EdgeInsets.only(top: 13.0),
-                    child: Row(
-                        mainAxisAlignment: MainAxisAlignment.end,
+                    const SizedBox(width: 10),
+                    Obx(() {
+                      final isLoggedIn = gFFI.userModel.isLogin;
+                      return Row(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
                           SizedBox(
-                            height: 28.0,
+                            height: 40,
                             child: ElevatedButton(
                               onPressed: isLoggedIn
                                   ? () {
                                       onConnect();
                                     }
                                   : null,
+                              style: ElevatedButton.styleFrom(
+                                minimumSize: Size.zero,
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 14),
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              ),
                               child: Text(translate("Connect")),
                             ),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: 6),
                           Opacity(
                             opacity: isLoggedIn ? 1.0 : 0.5,
                             child: IgnorePointer(
                               ignoring: !isLoggedIn,
                               child: Container(
-                                height: 28.0,
-                                width: 28.0,
+                                height: 40,
+                                width: 34,
                                 decoration: BoxDecoration(
                                   border: Border.all(
                                       color: Theme.of(context).dividerColor),
@@ -731,9 +735,11 @@ class _ConnectionPageState extends State<ConnectionPage>
                               ),
                             ),
                           ),
-                        ]),
-                  );
-                }),
+                        ],
+                      );
+                    }),
+                  ],
+                ),
               ],
             ),
           ),

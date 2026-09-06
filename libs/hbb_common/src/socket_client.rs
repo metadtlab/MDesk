@@ -143,7 +143,7 @@ pub async fn connect_tcp<
             websocket::WsFramedStream::new(target_str, None, None, ms_timeout).await?,
         ));
     }
-    connect_tcp_local(target, None, ms_timeout).await
+    connect_tcp_local(target_str, None, ms_timeout).await
 }
 
 // This function connects directly to the target without checking for websocket endpoints.

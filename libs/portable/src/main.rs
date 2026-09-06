@@ -8,6 +8,9 @@ use std::{
 use bin_reader::BinaryReader;
 
 pub mod bin_reader;
+#[path = "../../../src/connection_diagnostics.rs"]
+#[allow(dead_code)] // Shared with the application, which uses more event helpers.
+mod connection_diagnostics;
 #[cfg(windows)]
 mod ui;
 
@@ -66,6 +69,7 @@ fn setup(
     _args: &Vec<String>,
     _ui: &mut bool,
 ) -> Option<PathBuf> {
+    let mut diagnostic = connection_diagnostics::Span::new("launcher", "", "unpack");
     let dir = if let Some(dir) = dir {
         dir
     } else {
@@ -79,6 +83,11 @@ fn setup(
     };
 
     let mut ts = 0;
+    let mut diagnostic_ts = 0;
+    connection_diagnostics::event("launcher", "", "unpack.cache", &[
+        ("ready", &is_timestamp_matches(&dir, &mut diagnostic_ts).to_string()),
+        ("files", &reader.files.len().to_string()),
+    ]);
     if clear || !is_timestamp_matches(&dir, &mut ts) {
         #[cfg(windows)]
         if _args.is_empty() {
@@ -95,6 +104,7 @@ fn setup(
     win::copy_runtime_broker(&dir);
     #[cfg(linux)]
     reader.configure_permission(&dir);
+    diagnostic.success();
     Some(dir.join(&reader.exe))
 }
 
@@ -160,6 +170,10 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
             .stderr(Stdio::inherit());
     }
     let _child = cmd.spawn();
+    connection_diagnostics::event("launcher", "", "child.spawn", &[
+        ("result", if _child.is_ok() { "ok" } else { "error" }),
+    ]);
+    connection_diagnostics::flush();
 
     #[cfg(windows)]
     if _ui {

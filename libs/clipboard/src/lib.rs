@@ -23,6 +23,8 @@ use thiserror::Error;
 ))]
 pub mod context_send;
 pub mod platform;
+pub mod file_stream;
+pub mod route;
 #[cfg(any(
     target_os = "windows",
     all(target_os = "macos", feature = "unix-file-copy-paste")
@@ -97,6 +99,7 @@ pub enum CliprdrError {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
 pub enum ClipboardFile {
+    FileStream(file_stream::Frame),
     NotifyCallback {
         r#type: String,
         title: String,
@@ -156,6 +159,9 @@ lazy_static::lazy_static! {
 
 impl ClipboardFile {
     pub fn is_stopping_allowed(&self) -> bool {
+        if let Self::FileStream(frame) = self {
+            return matches!(frame.kind, file_stream::REQUEST | file_stream::DESCRIPTORS_REQUEST);
+        }
         matches!(
             self,
             ClipboardFile::MonitorReady
@@ -165,6 +171,9 @@ impl ClipboardFile {
     }
 
     pub fn is_beginning_message(&self) -> bool {
+        if let Self::FileStream(frame) = self {
+            return matches!(frame.kind, file_stream::REQUEST | file_stream::DESCRIPTORS_REQUEST);
+        }
         matches!(
             self,
             ClipboardFile::MonitorReady | ClipboardFile::FormatList { .. }

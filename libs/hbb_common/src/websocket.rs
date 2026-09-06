@@ -330,6 +330,8 @@ pub fn is_ws_endpoint(endpoint: &str) -> bool {
  * @return The converted WebSocket endpoint
  */
 pub fn check_ws(endpoint: &str) -> String {
+    let canonical = crate::mdesk_endpoints::canonical_server(endpoint);
+    let endpoint = canonical.as_str();
     if !use_ws() {
         return endpoint.to_string();
     }
@@ -381,11 +383,7 @@ pub fn check_ws(endpoint: &str) -> String {
     };
     let protocol = if is_domain {
         let api_server = Config::get_option("api-server");
-        if api_server.starts_with("https") {
-            "wss"
-        } else {
-            "ws"
-        }
+        crate::mdesk_endpoints::websocket_scheme(&endpoint_host, &api_server)
     } else {
         "ws"
     };
@@ -406,6 +404,9 @@ mod tests {
         Config::set_option("custom-rendezvous-server".to_string(), "".to_string());
         Config::set_option("relay-server".to_string(), "".to_string());
         Config::set_option("api-server".to_string(), "".to_string());
+        // The public MDesk proxy requires WSS even with a blank optional API field.
+        assert_eq!(check_ws("787.kr:21116"), "wss://787.kr/ws/id");
+        assert_eq!(check_ws("mdesk.imedixerp.co.kr:21117"), "wss://787.kr/ws/relay");
         assert_eq!(check_ws("127.0.0.1:21115"), "ws://127.0.0.1:21118");
         assert_eq!(check_ws("127.0.0.1:21116"), "ws://127.0.0.1:21118");
         assert_eq!(check_ws("127.0.0.1:21117"), "ws://127.0.0.1:21119");

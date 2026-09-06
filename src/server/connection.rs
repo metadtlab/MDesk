@@ -505,6 +505,9 @@ impl Connection {
         id: i32,
         server: super::ServerPtrWeak,
     ) {
+        let _diagnostic = crate::connection_diagnostics::Span::lifetime("host", &id.to_string(), "connection");
+        let mut diagnostic_first_video = true;
+        let mut diagnostic_sample = Instant::now();
         let _raii_id = raii::ConnectionID::new(id);
         let hash = Hash {
             salt: Config::get_salt(),
@@ -895,7 +898,13 @@ impl Connection {
                                     | clipboard::ClipboardFile::FileContentsRequest { .. }
                                     | clipboard::ClipboardFile::FileContentsResponse { .. }
                             );
-                            if in_drop_grace && is_file_related_clip {
+                            // Generation-bound streaming has its own request IDs,
+                            // flow control and cancellation; only legacy traffic
+                            // needs the historical drop workaround.
+                            let streaming_advertisement = matches!(&clip,
+                                clipboard::ClipboardFile::FormatList { format_list }
+                                    if clipboard::file_stream::generation(format_list) != 0);
+                            if in_drop_grace && is_file_related_clip && !streaming_advertisement {
                                 log::info!(
                                     "Skip outbound cliprdr message within remote-drop grace period to avoid connection drop: {:?}",
                                     std::mem::discriminant(&clip)
@@ -1076,6 +1085,14 @@ impl Connection {
                     }
                 }
                 Some((instant, value)) = rx_video.recv() => {
+                    let diagnostic_sending_first = diagnostic_first_video
+                        && matches!(&value.union, Some(message::Union::VideoFrame(_)));
+                    if diagnostic_sending_first {
+                        diagnostic_first_video = false;
+                        crate::connection_diagnostics::event("host", &conn.lr.session_id.to_string(), "video.first_queued", &[
+                            ("duration_ms", &instant.elapsed().as_millis().to_string()),
+                        ]);
+                    }
                     if !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
@@ -1084,6 +1101,9 @@ impl Connection {
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
+                    }
+                    if diagnostic_sending_first {
+                        crate::connection_diagnostics::event("host", &conn.lr.session_id.to_string(), "video.first_sent", &[]);
                     }
                 },
                 Some((instant, value)) = rx.recv() => {
@@ -1220,6 +1240,15 @@ impl Connection {
                     conn.update_supported_encoding();
                 }
                 _ = test_delay_timer.tick() => {
+                    if diagnostic_sample.elapsed() >= Duration::from_secs(10) {
+                        diagnostic_sample = Instant::now();
+                        let qos = video_service::VIDEO_QOS.lock().unwrap();
+                        crate::connection_diagnostics::event("host", &conn.lr.session_id.to_string(), "video.sample", &[
+                            ("delay_ms", &conn.network_delay.to_string()),
+                            ("fps", &qos.fps().to_string()), ("bitrate", &qos.bitrate().to_string()),
+                            ("authorized", &conn.authorized.to_string()),
+                        ]);
+                    }
                     if last_recv_time.elapsed() >= SEC30 {
                         conn.on_close("Timeout", true).await;
                         break;
@@ -2425,6 +2454,7 @@ impl Connection {
     }
 
     async fn send_logon_response(&mut self) {
+        let _diagnostic = crate::connection_diagnostics::Span::lifetime("host", &self.lr.session_id.to_string(), "login.response");
         if self.authorized {
             return;
         }
@@ -2465,6 +2495,7 @@ impl Connection {
             return;
         }
         self.authorized = true;
+        crate::connection_diagnostics::event("host", &self.lr.session_id.to_string(), "login.authorized", &[("peer", &self.lr.my_id)]);
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -3113,6 +3144,7 @@ impl Connection {
     }
 
     async fn send_login_error<T: std::string::ToString>(&mut self, err: T) {
+        crate::connection_diagnostics::event("host", &self.lr.session_id.to_string(), "login.rejected", &[("reason", crate::connection_diagnostics::error_kind(&err.to_string()))]);
         let mut msg_out = Message::new();
         let mut res = LoginResponse::new();
         res.set_error(err.to_string());
@@ -3682,6 +3714,9 @@ impl Connection {
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            crate::connection_diagnostics::event("host", &lr.session_id.to_string(), "login.received", &[
+                ("peer", &lr.my_id), ("local_id", &self.inner.id().to_string()),
+            ]);
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
@@ -4330,6 +4365,24 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 Some(message::Union::Cliprdr(clip)) => {
+                    #[cfg(target_os = "windows")]
+                    if let Some(cliprdr::Union::FileStream(f)) = &clip.union {
+                        if matches!(f.kind, clipboard::file_stream::REQUEST | clipboard::file_stream::DESCRIPTORS_REQUEST)
+                            && (!self.file_transfer_enabled() || !self.clipboard_enabled()
+                                || crate::get_builtin_option(keys::OPTION_ONE_WAY_FILE_TRANSFER) == "Y")
+                        {
+                            let mut failure = f.clone();
+                            failure.kind = clipboard::file_stream::ERROR;
+                            failure.data.clear();
+                            failure.compressed = false;
+                            let mut response = Cliprdr::new();
+                            response.set_file_stream(failure);
+                            let mut message = Message::new();
+                            message.set_cliprdr(response);
+                            self.send(message).await;
+                            return true;
+                        }
+                    }
                     // 드래그앤드롭으로 호스트가 막 파일을 받은 직후의 grace 기간 동안에는
                     // 클라이언트→호스트 방향으로 들어오는 cliprdr 메시지도 무시해 connection
                     // 안정성을 보장한다. (호스트 paste 시 OS가 wf_cliprdr를 통해 발생시키는
@@ -4340,7 +4393,13 @@ impl Connection {
                         let in_drop_grace = self.last_remote_drop_recv_at.map_or(false, |t| {
                             t.elapsed() < Duration::from_millis(REMOTE_DROP_CLIPRDR_GRACE_MS)
                         });
-                        if in_drop_grace {
+                        let streaming_message = match &clip.union {
+                            Some(cliprdr::Union::FileStream(_)) => true,
+                            Some(cliprdr::Union::FormatList(list)) => list.formats.iter().any(|f|
+                                f.format.starts_with(clipboard::file_stream::FORMAT_PREFIX)),
+                            _ => false,
+                        };
+                        if in_drop_grace && !streaming_message {
                             log::info!(
                                 "Skip inbound cliprdr message within remote-drop grace period to avoid connection drop"
                             );
@@ -6077,6 +6136,10 @@ impl Connection {
             return;
         }
         self.closed = true;
+        crate::connection_diagnostics::event("host", &self.lr.session_id.to_string(), "connection.closed", &[
+            ("authorized", &self.authorized.to_string()),
+            ("reason", if reason == "Timeout" { "timeout" } else if reason == "Peer close" { "peer_close" } else { "other" }),
+        ]);
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //

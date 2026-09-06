@@ -71,6 +71,7 @@ pub struct Remote<T: InvokeUiSession> {
     job_status_samples: HashMap<(bool, i32), JobStatusSample>,
     is_connected: bool,
     first_frame: bool,
+    diagnostic_first_received: bool,
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     client_conn_id: i32, // used for file clipboard
     data_count: Arc<AtomicUsize>,
@@ -167,6 +168,7 @@ impl<T: InvokeUiSession> Remote<T> {
             job_status_samples: Default::default(),
             is_connected: false,
             first_frame: false,
+            diagnostic_first_received: false,
             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
             client_conn_id: 0,
             data_count: Arc::new(AtomicUsize::new(0)),
@@ -188,6 +190,11 @@ impl<T: InvokeUiSession> Remote<T> {
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
         self.connection_round = round;
+        self.diagnostic_first_received = false;
+        let diagnostic_session = self.handler.lc.read().unwrap().session_id.to_string();
+        let _diagnostic_round = crate::connection_diagnostics::Span::lifetime("controller", &diagnostic_session, "session");
+        crate::connection_diagnostics::event("controller", &diagnostic_session, "session.round", &[("round", &round.to_string())]);
+        let mut diagnostic_sample = Instant::now();
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -343,6 +350,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             fps_instant = Instant::now();
                             let mut speed = self.data_count.swap(0, Ordering::Relaxed);
                             speed = speed * 1000 / elapsed as usize;
+                            let diagnostic_speed = speed;
                             let speed = format!("{:.2}kB/s", speed as f32 / 1024 as f32);
 
                             let fps = self.video_threads.iter().map(|(k, v)| {
@@ -352,6 +360,19 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.frame_count.write().unwrap() = 0;
                             });
+                            if diagnostic_sample.elapsed() >= Duration::from_secs(10) {
+                                diagnostic_sample = Instant::now();
+                                for (display, thread) in &self.video_threads {
+                                    crate::connection_diagnostics::event("controller", &diagnostic_session, "video.sample", &[
+                                        ("bytes_per_sec", &diagnostic_speed.to_string()),
+                                        ("display", &display.to_string()),
+                                        ("fps", &fps.get(display).copied().unwrap_or(0).to_string()),
+                                        ("decode_fps", &format!("{:?}", *thread.decode_fps.read().unwrap())),
+                                        ("queue", &thread.video_queue.read().unwrap().len().to_string()),
+                                        ("codec", &format!("{:?}", self.video_format)),
+                                    ]);
+                                }
+                            }
                             self.fps_control(direct, fps.clone());
                             let chroma = self.chroma.read().unwrap().clone();
                             let chroma = match chroma {
@@ -430,6 +451,10 @@ impl<T: InvokeUiSession> Remote<T> {
 
         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
         if self.handler.is_default() && _set_disconnected_ok {
+            #[cfg(target_os = "windows")]
+            clipboard::file_stream::disconnect(self.client_conn_id);
+            #[cfg(feature = "flutter")]
+            crate::flutter::disconnect_file_clipboard(&self.handler.get_id());
             crate::clipboard::try_empty_clipboard_files(ClipboardSide::Client, self.client_conn_id);
         }
     }
@@ -437,7 +462,7 @@ impl<T: InvokeUiSession> Remote<T> {
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     async fn handle_local_clipboard_msg(
         &self,
-        peer: &mut Stream,
+        _peer: &mut Stream,
         msg: Option<clipboard::ClipboardFile>,
     ) {
         match msg {
@@ -477,7 +502,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     if stop {
                         #[cfg(target_os = "windows")]
                         {
-                            ContextSend::set_is_stopped();
+                            clipboard::file_stream::disconnect(self.client_conn_id);
                         }
                     } else {
                         #[cfg(target_os = "windows")]
@@ -486,8 +511,16 @@ impl<T: InvokeUiSession> Remote<T> {
                             // to-do: Show msgbox with "Don't show again" option
                         };
                         log::debug!("Send system clipboard message to remote");
-                        let msg = crate::clipboard_file::clip_2_msg(clip);
-                        allow_err!(peer.send(&msg).await);
+                        #[cfg(feature = "flutter")]
+                        {
+                            crate::flutter::route_local_file_clipboard(&self.handler.get_id(), clip);
+                            return;
+                        }
+                        #[cfg(not(feature = "flutter"))]
+                        {
+                            let msg = crate::clipboard_file::clip_2_msg(clip);
+                            allow_err!(_peer.send(&msg).await);
+                        }
                     }
                 }
             },
@@ -1667,6 +1700,10 @@ impl<T: InvokeUiSession> Remote<T> {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
+                    if !self.diagnostic_first_received {
+                        self.diagnostic_first_received = true;
+                        crate::connection_diagnostics::event("controller", &self.handler.lc.read().unwrap().session_id.to_string(), "video.first_received", &[]);
+                    }
                     if !self.first_frame {
                         self.first_frame = true;
                         self.handler.close_success();
@@ -1705,6 +1742,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
                 Some(message::Union::LoginResponse(lr)) => match lr.union {
                     Some(login_response::Union::Error(err)) => {
+                        crate::connection_diagnostics::event("controller", &self.handler.lc.read().unwrap().session_id.to_string(), "login.rejected", &[]);
                         if err == client::REQUIRE_2FA {
                             self.handler.lc.write().unwrap().enable_trusted_devices =
                                 lr.enable_trusted_devices;
@@ -1714,6 +1752,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(login_response::Union::PeerInfo(pi)) => {
+                        crate::connection_diagnostics::event("controller", &self.handler.lc.read().unwrap().session_id.to_string(), "login.accepted", &[]);
                         if self.recording_source_connection_id.is_empty()
                             || self.recording_connection_ticket.is_empty()
                         {
@@ -2833,23 +2872,36 @@ impl<T: InvokeUiSession> Remote<T> {
         _peer: &mut Stream,
     ) {
         log::debug!("handling cliprdr msg from server peer");
-        let Some(clip) = crate::clipboard_file::msg_2_clip(clip) else {
+        let Some(mut clip) = crate::clipboard_file::msg_2_clip(clip) else {
             log::warn!("failed to decode cliprdr msg from server peer");
             return;
         };
+
+        // Check the source session before any cross-peer routing. A disabled
+        // peer must not ask another connection to serve its copied files.
+        if !self.handler.is_file_clipboard_required()
+            && (clip.is_beginning_message() || matches!(&clip, clipboard::ClipboardFile::FileStream(_)))
+        {
+            if let clipboard::ClipboardFile::FileStream(f) = clip {
+                if matches!(f.kind, clipboard::file_stream::REQUEST | clipboard::file_stream::DESCRIPTORS_REQUEST) {
+                    let mut f = f;
+                    f.kind = clipboard::file_stream::ERROR;
+                    f.data.clear();
+                    f.compressed = false;
+                    allow_err!(_peer.send(&crate::clipboard_file::clip_2_msg(clipboard::ClipboardFile::FileStream(f))).await);
+                }
+            }
+            #[cfg(target_os = "windows")]
+            clipboard::file_stream::disconnect(self.client_conn_id);
+            return;
+        }
 
         #[cfg(feature = "flutter")]
         let is_format_list = matches!(&clip, clipboard::ClipboardFile::FormatList { .. });
 
         #[cfg(feature = "flutter")]
         {
-            let relay_msg = crate::clipboard_file::clip_2_msg(clip.clone());
-            if crate::flutter::relay_file_clipboard_msg_from_peer(
-                &self.handler.get_id(),
-                relay_msg,
-                is_format_list,
-                matches!(&clip, clipboard::ClipboardFile::TryEmpty),
-            ) {
+            if crate::flutter::relay_file_clipboard_msg_from_peer(&self.handler.get_id(), &mut clip) {
                 return;
             }
         }
