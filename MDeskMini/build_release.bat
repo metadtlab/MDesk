@@ -11,6 +11,9 @@ if not exist "%MANIFEST%" (
   exit /b 1
 )
 
+call "%PROJECT_DIR%..\setup_windows_x64_env.bat"
+if errorlevel 1 exit /b 1
+
 echo Building mdeskmini release...
 echo Project: %PROJECT_DIR%
 

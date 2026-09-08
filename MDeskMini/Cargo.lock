@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "MDesk"
-version = "1.5.8"
+version = "1.5.9"
 dependencies = [
  "android-wakelock",
  "android_logger",
@@ -72,7 +72,6 @@ dependencies = [
  "reqwest",
  "ringbuf",
  "rpassword",
- "runas",
  "rust-pulsectl",
  "sciter-rs",
  "scrap",
@@ -4475,7 +4474,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "mdeskmini"
-version = "0.2.1"
+version = "0.1.2"
 dependencies = [
  "MDesk",
  "clap 4.6.0",
@@ -5693,8 +5692,8 @@ dependencies = [
 
 [[package]]
 name = "parity-tokio-ipc"
-version = "0.7.3-5"
-source = "git+https://github.com/rustdesk-org/parity-tokio-ipc#c8c8bbcbabf9be1201c53afb0269b92b9b02d291"
+version = "0.7.3-6"
+source = "git+https://github.com/rustdesk-org/parity-tokio-ipc?rev=d0ae39bffe5d5a3e8d82a1b6bcb1ca5a9b2f1c01#d0ae39bffe5d5a3e8d82a1b6bcb1ca5a9b2f1c01"
 dependencies = [
  "futures",
  "libc",
@@ -6802,18 +6801,6 @@ checksum = "327b72899159dfae8060c51a1f6aebe955245bcd9cc4997eed0f623caea022e4"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "runas"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96d6b6c505282b007a9b009f2aa38b2fd0359b81a0430ceacc60f69ade4c6a0"
-dependencies = [
- "libc",
- "security-framework-sys",
- "which",
- "windows-sys 0.48.0",
 ]
 
 [[package]]

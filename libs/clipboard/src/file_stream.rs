@@ -50,7 +50,6 @@ mod windows {
     use hbb_common::{anyhow::anyhow, bail, fs::TransferJob, ResultType};
     use std::{
         collections::{HashMap, HashSet, VecDeque},
-        fs::File,
         path::PathBuf,
         sync::{Arc, Condvar, Mutex},
         time::{Duration, Instant},
@@ -372,7 +371,7 @@ mod windows {
                     if window.0.lock().unwrap().cancelled {
                         bail!("clipboard stream cancelled");
                     }
-                    let file = File::open(&path)?;
+                    let file = hbb_common::fs::open_file_for_read(&path)?;
                     let audit_path = path.to_string_lossy().to_string();
                     let metadata = file.metadata()?;
                     if !metadata.is_file() || metadata.len() != f.size {

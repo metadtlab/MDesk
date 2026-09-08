@@ -25,7 +25,39 @@ extern "system" {
     fn GlobalUnlock(memory: *mut std::ffi::c_void) -> i32;
     fn GlobalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
+#[link(name = "kernel32")]
+extern "system" {
+    fn FindFirstFileW(path: *const u16, data: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mdesk_clipboard_find_first_file(
+    path: *const u16, data: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    let denied = -1isize as *mut std::ffi::c_void;
+    if path.is_null() || data.is_null() { return denied; }
+    hbb_common::fs::with_user_file_access(|| {
+        let handle = FindFirstFileW(path, data);
+        if handle == denied { return Err(std::io::Error::last_os_error().into()); }
+        Ok(handle)
+    }).unwrap_or(denied)
+}
 thread_local! { static METADATA_RESPONSE: std::cell::RefCell<Option<crate::file_stream::Frame>> = const { std::cell::RefCell::new(None) }; }
+
+#[no_mangle]
+pub unsafe extern "C" fn mdesk_clipboard_open_file_for_read(path: *const u16) -> *mut std::ffi::c_void {
+    use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::IntoRawHandle};
+    let denied = -1isize as *mut std::ffi::c_void;
+    if path.is_null() { return denied; }
+    let mut length = 0;
+    while length < 32768 && *path.add(length) != 0 { length += 1; }
+    if length == 32768 { return denied; }
+    let path = std::ffi::OsString::from_wide(std::slice::from_raw_parts(path, length));
+    hbb_common::fs::with_user_file_access(|| {
+        Ok(std::fs::OpenOptions::new().read(true).share_mode(1)
+            .custom_flags(0x02000000).open(std::path::Path::new(&path))?)
+    }).map(|file| file.into_raw_handle()).unwrap_or(denied)
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn mdesk_clipboard_descriptors(

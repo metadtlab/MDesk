@@ -1491,8 +1491,8 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                         Container(
                           width: cardWidth,
                           height: (compactHeight
-                                  ? (showReconnectButton ? 226 : 168)
-                                  : (showReconnectButton ? 304 : 244)) +
+                                  ? (showReconnectButton ? 172 : 114)
+                                  : (showReconnectButton ? 238 : 178)) +
                               (_certCode.isNotEmpty
                                   ? (compactHeight ? 104 : 126)
                                   : 0),
@@ -1518,21 +1518,6 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                           child: Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              Container(
-                                width: compactHeight ? 42 : 48,
-                                height: compactHeight ? 42 : 48,
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF8B5CF6)
-                                      .withValues(alpha: 0.11),
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Icon(
-                                  Icons.person_outline,
-                                  size: compactHeight ? 24 : 28,
-                                  color: const Color(0xFF8B5CF6),
-                                ),
-                              ),
-                              SizedBox(height: compactHeight ? 12 : 18),
                               AnimatedSwitcher(
                                 duration: const Duration(milliseconds: 180),
                                 child: Text(

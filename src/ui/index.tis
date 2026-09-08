@@ -38,7 +38,7 @@ const default_option_lang = is_custom_client ? 'default' : '';
 const default_option_yes = is_custom_client ? 'Y' : '';
 const default_option_no = is_custom_client ? 'N' : '';
 const default_option_whitelist = is_custom_client ? ',' : '';
-const default_option_approve_mode = is_custom_client ? 'password-click' : '';
+const default_option_approve_mode = 'password-click';
 
 const grey_text_style = "color:#888;";
 

@@ -22,8 +22,6 @@ use crate::{
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use crate::{common::DEVICE_NAME, flutter::connection_manager::start_channel};
 use cidr_utils::cidr::IpCidr;
-#[cfg(target_os = "linux")]
-use hbb_common::platform::linux::run_cmds;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
@@ -302,6 +300,18 @@ pub enum AuthConnType {
     Terminal,
 }
 
+impl AuthConnType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::FileTransfer => "file_transfer",
+            Self::PortForward => "port_forward",
+            Self::ViewCamera => "view_camera",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 /// 피원격지(호스트) 관점 접속 인증 방식 — `[AccessAudit]` 로그용
 #[derive(Debug, Clone, Copy)]
 enum AccessAuthMethod {
@@ -447,6 +457,7 @@ pub struct Connection {
     tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
     terminal_service_id: String,
     terminal_persistent: bool,
+    scope_violation_messages: HashSet<&'static str>,
     // The user token must be set when terminal is enabled.
     // 0 indicates SYSTEM user
     // other values indicate current user
@@ -633,6 +644,7 @@ impl Connection {
             tx_post_seq,
             terminal_service_id: "".to_owned(),
             terminal_persistent: false,
+            scope_violation_messages: HashSet::new(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
             terminal_generic_service: None,
@@ -2795,10 +2807,9 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
         self.send(msg_out).await;
-        if let Some(o) = self.options_in_login.take() {
-            self.update_options(&o).await;
-        }
+        self.update_scoped_login_options().await;
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
+            self.keyboard = false;
             let dir = if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
                 &dir
             } else {
@@ -3637,6 +3648,19 @@ impl Connection {
         )
     }
 
+    fn reset_session_scope_for_login(&mut self) {
+        self.file_transfer = None;
+        self.port_forward_socket = None;
+        self.port_forward_address.clear();
+        self.view_camera = false;
+        self.terminal = false;
+        self.terminal_persistent = false;
+        self.terminal_service_id.clear();
+        self.options_in_login = None;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        { self.terminal_user_token = None; }
+    }
+
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
         log::info!(
@@ -3714,11 +3738,20 @@ impl Connection {
                 return false;
             }
         }
+        if self.authorized {
+            if matches!(msg.union.as_ref(), Some(message::Union::LoginRequest(_) | message::Union::SwitchSidesResponse(_))) {
+                return true;
+            }
+            if let Some(message) = self.authorized_scope_violation(&msg) {
+                return self.handle_authorized_scope_violation(message).await;
+            }
+        }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
             crate::connection_diagnostics::event("host", &lr.session_id.to_string(), "login.received", &[
                 ("peer", &lr.my_id), ("local_id", &self.inner.id().to_string()),
             ]);
+            self.reset_session_scope_for_login();
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
@@ -4304,7 +4337,7 @@ impl Connection {
                     self.update_auto_disconnect_timer();
                 }
                 Some(message::Union::Clipboard(cb)) => {
-                    if self.clipboard {
+                    if self.should_handle_text_clipboard_message() && self.clipboard_enabled() {
                         // Don't audit on receipt: a clipboard arriving here (direct or
                         // relayed via multi-session sync) does not mean the operator
                         // pasted on this host. Cache it and log only on real paste.
@@ -4346,6 +4379,9 @@ impl Connection {
                     }
                 }
                 Some(message::Union::MultiClipboards(_mcb)) => {
+                    if !self.should_handle_text_clipboard_message() || !self.clipboard_enabled() {
+                        return true;
+                    }
                     // Cache only; logged on real paste. See Clipboard branch above.
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.clipboard {
@@ -4898,15 +4934,17 @@ impl Connection {
                     }
                     #[cfg(windows)]
                     Some(misc::Union::ToggleVirtualDisplay(t)) => {
-                        self.toggle_virtual_display(t).await;
+                        if !self.view_camera { self.toggle_virtual_display(t).await; }
                     }
                     Some(misc::Union::TogglePrivacyMode(t)) => {
-                        self.toggle_privacy_mode(t).await;
+                        if !self.view_camera { self.toggle_privacy_mode(t).await; }
                     }
                     Some(misc::Union::ChatMessage(c)) => {
                         // 화이트보드 메시지 처리
                         if c.text.starts_with("##WB##") {
-                            self.handle_whiteboard_message(&c.text);
+                            if self.authed_conn_type() == Some(AuthConnType::Remote) {
+                                self.handle_whiteboard_message(&c.text);
+                            }
                         } else {
                             self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
                             self.chat_unanswered = true;
@@ -4914,17 +4952,23 @@ impl Connection {
                         self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::Option(o)) => {
-                        self.update_options(&o).await;
+                        if self.authed_conn_type() == Some(AuthConnType::Remote) {
+                            self.update_options(&o).await;
+                        } else if let Some(option) = self.scoped_update_option_message(&o) {
+                            self.update_options(&option).await;
+                        }
                     }
                     Some(misc::Union::RefreshVideo(r)) => {
-                        if r {
+                        if r && self.should_handle_render_broadcast_message() {
                             // Refresh all videos.
                             // Compatibility with old versions and sciter(remote).
                             self.refresh_video_display(None);
                         }
                     }
                     Some(misc::Union::RefreshVideoDisplay(display)) => {
-                        self.refresh_video_display(Some(display as usize));
+                        if self.should_handle_render_broadcast_message() {
+                            self.refresh_video_display(Some(display as usize));
+                        }
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -4987,10 +5031,16 @@ impl Connection {
                         }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::ChangeResolution(r)) => self.change_resolution(None, &r),
+                    Some(misc::Union::ChangeResolution(r)) => {
+                        if !self.view_camera {
+                            self.change_resolution(None, &r);
+                        }
+                    }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeDisplayResolution(dr)) => {
-                        self.change_resolution(Some(dr.display as _), &dr.resolution)
+                        if !self.view_camera {
+                            self.change_resolution(Some(dr.display as _), &dr.resolution);
+                        }
                     }
                     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -5076,6 +5126,7 @@ impl Connection {
                 Some(message::Union::ScreenshotRequest(request)) => {
                     if let Some(tx) = self.inner.tx.clone() {
                         crate::video_service::set_take_screenshot(
+                            self.video_source(),
                             request.display as _,
                             request.sid.clone(),
                             tx,
@@ -5367,7 +5418,7 @@ impl Connection {
                 self.switch_display_to(display_idx, server.clone());
 
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                if s.width != 0 && s.height != 0 {
+                if !self.view_camera && s.width != 0 && s.height != 0 {
                     self.change_resolution(
                         None,
                         &Resolution {
@@ -6402,6 +6453,390 @@ impl Connection {
         false
     }
 
+    fn should_handle_render_broadcast_message(&self) -> bool {
+        matches!(
+            self.authed_conn_type(),
+            Some(AuthConnType::Remote | AuthConnType::ViewCamera)
+        )
+    }
+
+    fn should_handle_text_clipboard_message(&self) -> bool {
+        matches!(self.authed_conn_type(), Some(AuthConnType::Remote))
+    }
+
+    fn scoped_update_option_message(&self, option: &OptionMessage) -> Option<OptionMessage> {
+        match self.authed_conn_type() {
+            Some(AuthConnType::ViewCamera) => Self::scoped_view_camera_option(option).0,
+            Some(AuthConnType::Terminal) => Self::scoped_terminal_login_option(option).0,
+            Some(AuthConnType::Remote | AuthConnType::FileTransfer | AuthConnType::PortForward)
+            | None => None,
+        }
+    }
+
+    fn authed_conn_type(&self) -> Option<AuthConnType> {
+        self.authed_conn_id.as_ref().map(|id| id.conn_type())
+    }
+
+    async fn handle_authorized_scope_violation(&mut self, message: &'static str) -> bool {
+        let conn_type = self
+            .authed_conn_type()
+            .map(AuthConnType::as_str)
+            .unwrap_or("unknown");
+        let is_first = self.scope_violation_messages.insert(message);
+        if is_first {
+            log::warn!(
+                "Received out-of-scope message in {} session: {}",
+                conn_type,
+                message
+            );
+        } else {
+            log::debug!(
+                "Received repeated out-of-scope message in {} session: {}",
+                conn_type,
+                message
+            );
+        }
+        // Ignore denied messages without disconnecting legacy broadcast senders.
+        true
+    }
+
+    fn authorized_scope_violation(&self, msg: &Message) -> Option<&'static str> {
+        let Some(conn_type) = self.authed_conn_type() else {
+            return (!Self::is_connection_housekeeping_message(msg)).then_some("session.auth_type");
+        };
+        Self::authorized_message_scope_violation(conn_type, msg)
+    }
+
+    async fn update_scoped_login_options(&mut self) {
+        let Some(option) = self.options_in_login.take() else {
+            return;
+        };
+        let Some(conn_type) = self.authed_conn_type() else {
+            // Unreachable, but just in case, we drop the options if the connection type is unknown.
+            log::warn!(
+                "Dropping scoped login options because authorized connection type is unknown"
+            );
+            return;
+        };
+        let (scoped, violation) = Self::scoped_login_option(conn_type, &option);
+        if let Some(message) = violation {
+            log::debug!(
+                "Filtering {} session login options outside scope: {}",
+                conn_type.as_str(),
+                message
+            );
+        }
+        if let Some(option) = scoped {
+            self.update_options(&option).await;
+        }
+    }
+
+    fn scoped_login_option(
+        conn_type: AuthConnType,
+        option: &OptionMessage,
+    ) -> (Option<OptionMessage>, Option<&'static str>) {
+        match conn_type {
+            AuthConnType::Remote => (Some(option.clone()), None),
+            AuthConnType::ViewCamera => Self::scoped_view_camera_option(option),
+            AuthConnType::Terminal => Self::scoped_terminal_login_option(option),
+            AuthConnType::FileTransfer | AuthConnType::PortForward => {
+                let violation = Self::option_has_any_field(option).then_some("login.option");
+                (None, violation)
+            }
+        }
+    }
+
+    fn scoped_terminal_login_option(
+        option: &OptionMessage,
+    ) -> (Option<OptionMessage>, Option<&'static str>) {
+        let mut scoped = OptionMessage::new();
+        let mut violation = false;
+        match option.terminal_persistent.enum_value() {
+            Ok(value) => scoped.terminal_persistent = value.into(),
+            Err(_) => violation = true,
+        }
+        if Self::option_has_non_terminal_login_field(option) {
+            violation = true;
+        }
+        let scoped = Self::option_has_any_field(&scoped).then_some(scoped);
+        (scoped, violation.then_some("login.option"))
+    }
+
+    fn authorized_message_scope_violation(
+        conn_type: AuthConnType,
+        msg: &Message,
+    ) -> Option<&'static str> {
+        if Self::is_connection_housekeeping_message(msg) {
+            return None;
+        }
+        // Legacy clients can broadcast render-refresh messages to all opened sessions.
+        // Clipboard messages may also be broadcast to FileTransfer/Terminal sessions while
+        // the client still considers text clipboard sync required, and handlers ignore them.
+        let noop_compat = match conn_type {
+            AuthConnType::FileTransfer | AuthConnType::Terminal => {
+                Self::is_render_broadcast_noop_compat_message(msg)
+                    || Self::is_text_clipboard_noop_compat_message(msg)
+            }
+            AuthConnType::PortForward => Self::is_render_broadcast_noop_compat_message(msg),
+            AuthConnType::ViewCamera => Self::is_text_clipboard_noop_compat_message(msg),
+            _ => false,
+        };
+        if noop_compat {
+            return None;
+        }
+        let allowed = match conn_type {
+            AuthConnType::Remote => true,
+            AuthConnType::FileTransfer => Self::is_file_transfer_scoped_message(msg),
+            AuthConnType::PortForward => false,
+            AuthConnType::ViewCamera => Self::is_view_camera_scoped_message(msg),
+            AuthConnType::Terminal => Self::is_terminal_scoped_message(msg),
+        };
+        (!allowed).then(|| Self::message_family(msg))
+    }
+
+    fn is_render_broadcast_noop_compat_message(msg: &Message) -> bool {
+        let Some(message::Union::Misc(misc)) = msg.union.as_ref() else {
+            return false;
+        };
+        match misc.union.as_ref() {
+            Some(misc::Union::RefreshVideo(_)) | Some(misc::Union::RefreshVideoDisplay(_)) => true,
+            Some(misc::Union::Option(option)) => Self::is_supported_decoding_only_option(option),
+            _ => false,
+        }
+    }
+
+    fn is_text_clipboard_noop_compat_message(msg: &Message) -> bool {
+        matches!(
+            msg.union.as_ref(),
+            Some(message::Union::Clipboard(_)) | Some(message::Union::MultiClipboards(_))
+        )
+    }
+
+    fn is_supported_decoding_only_option(option: &OptionMessage) -> bool {
+        option.supported_decoding.is_some()
+            && option.image_quality.enum_value() == Ok(ImageQuality::NotSet)
+            && option.custom_image_quality == 0
+            && option.custom_fps == 0
+            && Self::is_bool_option_not_set(option.lock_after_session_end)
+            && Self::is_bool_option_not_set(option.show_remote_cursor)
+            && Self::is_bool_option_not_set(option.privacy_mode)
+            && Self::is_bool_option_not_set(option.block_input)
+            && Self::is_bool_option_not_set(option.disable_audio)
+            && Self::is_bool_option_not_set(option.disable_clipboard)
+            && Self::is_bool_option_not_set(option.enable_file_transfer)
+            && Self::is_bool_option_not_set(option.disable_keyboard)
+            && Self::is_bool_option_not_set(option.follow_remote_cursor)
+            && Self::is_bool_option_not_set(option.follow_remote_window)
+            && Self::is_bool_option_not_set(option.disable_camera)
+            && Self::is_bool_option_not_set(option.terminal_persistent)
+            && Self::is_bool_option_not_set(option.show_my_cursor)
+    }
+
+    fn is_connection_housekeeping_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::LoginRequest(_)) => true,
+            Some(message::Union::TestDelay(_)) => true,
+            Some(message::Union::Misc(misc)) => {
+                matches!(misc.union.as_ref(), Some(misc::Union::CloseReason(_)))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_file_transfer_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) => true,
+            Some(message::Union::Misc(misc)) => Self::is_file_transfer_scoped_misc(misc),
+            _ => false,
+        }
+    }
+
+    fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {
+        #[cfg(windows)]
+        if matches!(misc.union.as_ref(), Some(misc::Union::SelectedSid(_))) {
+            return true;
+        }
+        #[cfg(not(windows))]
+        let _ = misc;
+        false
+    }
+
+    fn is_terminal_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::TerminalAction(_)) => true,
+            Some(message::Union::Misc(misc)) => Self::is_terminal_scoped_misc(misc),
+            _ => false,
+        }
+    }
+
+    fn is_terminal_scoped_misc(misc: &Misc) -> bool {
+        match misc.union.as_ref() {
+            Some(misc::Union::ChatMessage(_)) => true,
+            Some(misc::Union::Option(option)) => Self::is_terminal_scoped_option(option),
+            _ => false,
+        }
+    }
+
+    fn is_terminal_scoped_option(option: &OptionMessage) -> bool {
+        Self::scoped_terminal_login_option(option).1.is_none()
+    }
+
+    fn is_view_camera_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::ScreenshotRequest(_)) => true,
+            Some(message::Union::Misc(misc)) => Self::is_view_camera_scoped_misc(misc),
+            // Legacy clients may send auto-login input during view-camera connect.
+            // The handlers intentionally ignore these messages for view-camera sessions.
+            Some(message::Union::MouseEvent(_))
+            | Some(message::Union::PointerDeviceEvent(_))
+            | Some(message::Union::KeyEvent(_)) => true,
+            Some(message::Union::AudioFrame(_))
+            | Some(message::Union::VoiceCallRequest(_))
+            | Some(message::Union::VoiceCallResponse(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn is_view_camera_scoped_misc(misc: &Misc) -> bool {
+        match misc.union.as_ref() {
+            Some(misc::Union::SwitchDisplay(_))
+            | Some(misc::Union::CaptureDisplays(_))
+            | Some(misc::Union::RefreshVideo(_))
+            | Some(misc::Union::RefreshVideoDisplay(_))
+            | Some(misc::Union::VideoReceived(_))
+            | Some(misc::Union::ChatMessage(_))
+            | Some(misc::Union::AudioFormat(_))
+            | Some(misc::Union::ClientRecordStatus(_))
+            // Though these messages are not expected in normal view-camera sessions,
+            // keep them allowed to avoid breaking existing clients that may send them.
+            | Some(misc::Union::MessageQuery(_))
+            | Some(misc::Union::TogglePrivacyMode(_))
+            | Some(misc::Union::ToggleVirtualDisplay(_))
+            | Some(misc::Union::ChangeResolution(_))
+            | Some(misc::Union::ChangeDisplayResolution(_)) => true,
+            Some(misc::Union::Option(option)) => Self::is_view_camera_scoped_option(option),
+            #[cfg(windows)]
+            Some(misc::Union::SelectedSid(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn is_view_camera_scoped_option(option: &OptionMessage) -> bool {
+        Self::scoped_view_camera_option(option).1.is_none()
+    }
+
+    // Keep these OptionMessage field lists in sync with message.proto and update_options().
+    // New fields must be classified here before limited session types can receive them.
+    fn scoped_view_camera_option(
+        option: &OptionMessage,
+    ) -> (Option<OptionMessage>, Option<&'static str>) {
+        let mut scoped = OptionMessage::new();
+        let mut violation = false;
+        if option.image_quality.enum_value().is_ok() {
+            scoped.image_quality = option.image_quality;
+        }
+        if option.custom_image_quality >= 0 {
+            scoped.custom_image_quality = option.custom_image_quality;
+        }
+        if option.custom_fps >= 0 {
+            scoped.custom_fps = option.custom_fps;
+        }
+        scoped.supported_decoding = option.supported_decoding.clone();
+        if let Ok(value) = option.disable_audio.enum_value() {
+            scoped.disable_audio = value.into();
+        }
+        if Self::option_has_non_view_camera_login_field(option) {
+            violation = true;
+        }
+        let scoped = Self::option_has_any_field(&scoped).then_some(scoped);
+        (scoped, violation.then_some("login.option"))
+    }
+
+    fn option_has_non_view_camera_login_field(option: &OptionMessage) -> bool {
+        !(Self::is_bool_option_not_set(option.lock_after_session_end)
+            && Self::is_bool_option_not_set(option.show_remote_cursor)
+            && Self::is_bool_option_not_set(option.privacy_mode)
+            && Self::is_bool_option_not_set(option.block_input)
+            && Self::is_bool_option_not_set(option.disable_clipboard)
+            && Self::is_bool_option_not_set(option.enable_file_transfer)
+            && Self::is_bool_option_not_set(option.disable_keyboard)
+            && Self::is_bool_option_not_set(option.follow_remote_cursor)
+            && Self::is_bool_option_not_set(option.follow_remote_window)
+            && Self::is_bool_option_not_set(option.disable_camera)
+            && Self::is_bool_option_not_set(option.terminal_persistent)
+            && Self::is_bool_option_not_set(option.show_my_cursor))
+    }
+
+    fn option_has_non_terminal_login_field(option: &OptionMessage) -> bool {
+        option.image_quality.enum_value() != Ok(ImageQuality::NotSet)
+            || option.custom_image_quality != 0
+            || option.custom_fps != 0
+            || option.supported_decoding.is_some()
+            || !Self::is_bool_option_not_set(option.lock_after_session_end)
+            || !Self::is_bool_option_not_set(option.show_remote_cursor)
+            || !Self::is_bool_option_not_set(option.privacy_mode)
+            || !Self::is_bool_option_not_set(option.block_input)
+            || !Self::is_bool_option_not_set(option.disable_audio)
+            || !Self::is_bool_option_not_set(option.disable_clipboard)
+            || !Self::is_bool_option_not_set(option.enable_file_transfer)
+            || !Self::is_bool_option_not_set(option.disable_keyboard)
+            || !Self::is_bool_option_not_set(option.follow_remote_cursor)
+            || !Self::is_bool_option_not_set(option.follow_remote_window)
+            || !Self::is_bool_option_not_set(option.disable_camera)
+            || !Self::is_bool_option_not_set(option.show_my_cursor)
+    }
+
+    fn option_has_any_field(option: &OptionMessage) -> bool {
+        Self::option_has_non_terminal_login_field(option)
+            || !Self::is_bool_option_not_set(option.terminal_persistent)
+    }
+
+    fn is_bool_option_not_set(option: hbb_common::protobuf::EnumOrUnknown<BoolOption>) -> bool {
+        option.enum_value() == Ok(BoolOption::NotSet)
+    }
+
+    fn message_family(msg: &Message) -> &'static str {
+        match msg.union.as_ref() {
+            Some(message::Union::MouseEvent(_)) => "mouse_event",
+            Some(message::Union::AudioFrame(_)) => "audio_frame",
+            Some(message::Union::PointerDeviceEvent(_)) => "pointer_device_event",
+            Some(message::Union::KeyEvent(_)) => "key_event",
+            Some(message::Union::Clipboard(_)) => "clipboard",
+            Some(message::Union::FileAction(_)) => "file_action",
+            Some(message::Union::FileResponse(_)) => "file_response",
+            Some(message::Union::VoiceCallRequest(_)) => "voice_call_request",
+            Some(message::Union::VoiceCallResponse(_)) => "voice_call_response",
+            Some(message::Union::MultiClipboards(_)) => "multi_clipboards",
+            Some(message::Union::ScreenshotRequest(_)) => "screenshot_request",
+            Some(message::Union::ScreenshotResponse(_)) => "screenshot_response",
+            Some(message::Union::TerminalAction(_)) => "terminal_action",
+            Some(message::Union::TerminalResponse(_)) => "terminal_response",
+            Some(message::Union::Misc(misc)) => Self::misc_message_family(misc),
+            Some(_) => "message.other",
+            None => "empty",
+        }
+    }
+
+    fn misc_message_family(misc: &Misc) -> &'static str {
+        match misc.union.as_ref() {
+            Some(misc::Union::ChatMessage(_)) => "misc.chat_message",
+            Some(misc::Union::SwitchDisplay(_)) => "misc.switch_display",
+            Some(misc::Union::Option(_)) => "misc.option",
+            Some(misc::Union::AudioFormat(_)) => "misc.audio_format",
+            Some(misc::Union::CaptureDisplays(_)) => "misc.capture_displays",
+            Some(misc::Union::ClientRecordStatus(_)) => "misc.client_record_status",
+            Some(misc::Union::TogglePrivacyMode(_)) => "misc.toggle_privacy_mode",
+            Some(misc::Union::ToggleVirtualDisplay(_)) => "misc.toggle_virtual_display",
+            Some(misc::Union::SelectedSid(_)) => "misc.selected_sid",
+            Some(misc::Union::ChangeResolution(_)) => "misc.change_resolution",
+            Some(misc::Union::ChangeDisplayResolution(_)) => "misc.change_display_resolution",
+            Some(misc::Union::MessageQuery(_)) => "misc.message_query",
+            Some(misc::Union::FollowCurrentDisplay(_)) => "misc.follow_current_display",
+            Some(_) => "misc.other",
+            None => "misc.empty",
+        }
+    }
+
     #[cfg(feature = "unix-file-copy-paste")]
     async fn handle_file_clip(&mut self, clip: clipboard::ClipboardFile) {
         let is_stopping_allowed = clip.is_stopping_allowed();
@@ -6533,6 +6968,9 @@ pub fn insert_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+// IPC bootstrap summary:
+// - Resolve target CM socket (headless/non-headless, optional UID-scoped path on Linux).
+// - Start CM when missing, then bridge bidirectional messages between this task and CM IPC.
 async fn start_ipc(
     mut rx_to_cm: mpsc::UnboundedReceiver<ipc::Data>,
     tx_from_cm: mpsc::UnboundedSender<ipc::Data>,
@@ -6547,10 +6985,19 @@ async fn start_ipc(
         }
         sleep(1.).await;
     }
+    #[cfg(target_os = "linux")]
+    let headless_cm = crate::is_server()
+        && crate::platform::is_headless_allowed()
+        && linux_desktop_manager::is_headless();
+    #[cfg(not(target_os = "linux"))]
+    let headless_cm = false;
     let mut stream = None;
-    if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
-        stream = Some(s);
-    } else {
+    if !headless_cm {
+        if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
+            stream = Some(s);
+        }
+    }
+    if stream.is_none() {
         #[allow(unused_mut)]
         #[allow(unused_assignments)]
         let mut args = vec!["--cm"];
@@ -6560,74 +7007,122 @@ async fn start_ipc(
 
         // Cm run as user, wait until desktop session is ready.
         #[cfg(target_os = "linux")]
-        if crate::platform::is_headless_allowed() && linux_desktop_manager::is_headless() {
+        if headless_cm {
             let mut username = linux_desktop_manager::get_username();
             loop {
                 if !username.is_empty() {
                     break;
                 }
+                // `_rx_desktop_ready` is used as a wake-up signal from desktop/session state changes
+                // (for example wait_desktop_cm_ready paths). It is not itself a proof of CM readiness.
+                // TODO:
+                // When `_rx_desktop_ready` is closed, `recv()` returns
+                // `None` immediately and this loop may spin if `username` remains empty.
+                // Keep behavior unchanged for now; if field reports appear, handle `Ok(None)` by
+                // breaking/returning to avoid hot-looping.
                 let _res = timeout(1_000, _rx_desktop_ready.recv()).await;
                 username = linux_desktop_manager::get_username();
             }
             let uid = {
-                let output = run_cmds(&format!("id -u {}", &username))?;
+                let username_for_cmd = username.clone();
+                let mut uid_cmd = hbb_common::tokio::process::Command::new("id");
+                // TODO:
+                // Keep current behavior for now to minimize change risk.
+                // If usernames starting with '-' are observed in the field, prefer:
+                // `id -u -- <username>` to avoid option-parsing ambiguity.
+                // Already verified that `id -u -- <username>` works as expected on macOS and Ubuntu 24.04.
+                uid_cmd.arg("-u").arg(&username_for_cmd).kill_on_drop(true);
+                let output = timeout(10_000, uid_cmd.output())
+                    .await
+                    .map_err(|_| anyhow!("Timed out querying uid for {}", username))?
+                    .map_err(|e| anyhow!("Failed to run `id -u {}`: {}", username, e))?;
+                if !output.status.success() {
+                    bail!("Failed to query uid for {}", username);
+                }
+                let output = String::from_utf8_lossy(&output.stdout);
                 let output = output.trim();
-                if output.is_empty() || !output.parse::<i32>().is_ok() {
-                    bail!("Invalid username {}", &username);
+                if output.parse::<u32>().is_err() {
+                    bail!("Invalid uid {}", output);
                 }
                 output.to_string()
             };
             user = Some((uid, username));
             args = vec!["--cm-no-ui"];
         }
-        let run_done;
-        if crate::platform::is_root() {
-            let mut res = Ok(None);
-            for _ in 0..10 {
-                #[cfg(not(any(target_os = "linux")))]
-                {
-                    log::debug!("Start cm");
-                    res = crate::platform::run_as_user(args.clone());
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    log::debug!("Start cm");
-                    res = crate::platform::run_as_user(
-                        args.clone(),
-                        user.clone(),
-                        None::<(&str, &str)>,
-                    );
-                }
-                if res.is_ok() {
-                    break;
-                }
-                log::error!("Failed to run cm: {res:?}");
-                sleep(1.).await;
-            }
-            if let Some(task) = res? {
-                super::CHILD_PROCESS.lock().unwrap().push(task);
-            }
-            run_done = true;
-        } else {
-            run_done = false;
-        }
-        if !run_done {
-            log::debug!("Start cm");
-            super::CHILD_PROCESS
-                .lock()
-                .unwrap()
-                .push(crate::run_me(args)?);
-        }
-        for _ in 0..20 {
-            sleep(0.3).await;
-            if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
+        #[cfg(target_os = "linux")]
+        let cm_uid: Option<u32> = match &user {
+            Some((uid, _)) => Some(
+                uid.parse::<u32>()
+                    .map_err(|_| anyhow!("Invalid uid {}", uid))?,
+            ),
+            None => None,
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(uid) = cm_uid {
+            if let Ok(s) = crate::ipc::connect_for_uid(1000, uid, "_cm").await {
                 stream = Some(s);
-                break;
             }
         }
         if stream.is_none() {
-            bail!("Failed to connect to connection manager");
+            let run_done;
+            if crate::platform::is_root() {
+                let mut res = Ok(None);
+                for _ in 0..10 {
+                    #[cfg(not(any(target_os = "linux")))]
+                    {
+                        log::debug!("Start cm");
+                        res = crate::platform::run_as_user(args.clone());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        log::debug!("Start cm");
+                        res = crate::platform::run_as_user(
+                            args.clone(),
+                            user.clone(),
+                            None::<(&str, &str)>,
+                        );
+                    }
+                    if res.is_ok() {
+                        break;
+                    }
+                    log::error!("Failed to run cm: {res:?}");
+                    sleep(1.).await;
+                }
+                if let Some(task) = res? {
+                    super::CHILD_PROCESS.lock().unwrap().push(task);
+                }
+                run_done = true;
+            } else {
+                run_done = false;
+            }
+            if !run_done {
+                log::debug!("Start cm");
+                super::CHILD_PROCESS
+                    .lock()
+                    .unwrap()
+                    .push(crate::run_me(args)?);
+            }
+            for _ in 0..20 {
+                sleep(0.3).await;
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(uid) = cm_uid {
+                        if let Ok(s) = crate::ipc::connect_for_uid(1000, uid, "_cm").await {
+                            stream = Some(s);
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
+                    stream = Some(s);
+                    break;
+                }
+            }
         }
+    }
+    if stream.is_none() {
+        bail!("Failed to connect to connection manager");
     }
 
     let _res = tx_stream_ready.send(()).await;
@@ -7658,6 +8153,7 @@ mod raii {
     }
 }
 
+#[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
@@ -7699,5 +8195,326 @@ mod test {
         assert!(Ipv6Addr::from_str("::1").is_ok());
         assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
         assert!(Ipv6Addr::from_str("0").is_err());
+    }
+
+    fn msg(set: impl FnOnce(&mut Message)) -> Message {
+        let mut msg = Message::new();
+        set(&mut msg);
+        msg
+    }
+
+    fn misc_msg(set: impl FnOnce(&mut Misc)) -> Message {
+        msg(|msg| {
+            let mut misc = Misc::new();
+            set(&mut misc);
+            msg.set_misc(misc);
+        })
+    }
+
+    fn option_msg(set: impl FnOnce(&mut OptionMessage)) -> Message {
+        misc_msg(|misc| {
+            let mut option = OptionMessage::new();
+            set(&mut option);
+            misc.set_option(option);
+        })
+    }
+
+    fn set_supported_decoding(option: &mut OptionMessage) {
+        option.supported_decoding = hbb_common::protobuf::MessageField::some(Default::default());
+    }
+
+    fn assert_scopes(
+        conn_type: AuthConnType,
+        cases: impl IntoIterator<Item = (Message, Option<&'static str>)>,
+    ) {
+        for (msg, expected) in cases {
+            assert_eq!(
+                Connection::authorized_message_scope_violation(conn_type, &msg),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_scope_allows_only_messages_for_authenticated_session_type() {
+        let cases = [
+            (
+                AuthConnType::FileTransfer,
+                vec![
+                    (msg(|m| m.set_file_action(FileAction::new())), None),
+                    (msg(|m| m.set_file_response(FileResponse::new())), None),
+                    (msg(|m| m.set_login_request(LoginRequest::new())), None),
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        Some("screenshot_request"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_capture_displays(CaptureDisplays::new())),
+                        Some("misc.capture_displays"),
+                    ),
+                    (msg(|m| m.set_clipboard(Clipboard::new())), None),
+                    (
+                        msg(|m| m.set_multi_clipboards(MultiClipboards::new())),
+                        None,
+                    ),
+                    (misc_msg(|m| m.set_refresh_video(true)), None),
+                    (misc_msg(|m| m.set_refresh_video_display(0)), None),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default())
+                        }),
+                        None,
+                    ),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default());
+                            o.disable_audio = BoolOption::Yes.into();
+                        }),
+                        Some("misc.option"),
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::Terminal,
+                vec![
+                    (msg(|m| m.set_terminal_action(TerminalAction::new())), None),
+                    (
+                        option_msg(|o| o.terminal_persistent = BoolOption::Yes.into()),
+                        None,
+                    ),
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        Some("screenshot_request"),
+                    ),
+                    (
+                        msg(|m| m.set_file_action(FileAction::new())),
+                        Some("file_action"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_privacy_mode(TogglePrivacyMode::new())),
+                        Some("misc.toggle_privacy_mode"),
+                    ),
+                    (misc_msg(|m| m.set_chat_message(ChatMessage::new())), None),
+                    (msg(|m| m.set_clipboard(Clipboard::new())), None),
+                    (
+                        msg(|m| m.set_multi_clipboards(MultiClipboards::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_virtual_display(ToggleVirtualDisplay::new())),
+                        Some("misc.toggle_virtual_display"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_resolution(Resolution::new())),
+                        Some("misc.change_resolution"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_display_resolution(DisplayResolution::new())),
+                        Some("misc.change_display_resolution"),
+                    ),
+                    (misc_msg(|m| m.set_refresh_video(true)), None),
+                    (misc_msg(|m| m.set_refresh_video_display(0)), None),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default())
+                        }),
+                        None,
+                    ),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default());
+                            o.disable_audio = BoolOption::Yes.into();
+                        }),
+                        Some("misc.option"),
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::ViewCamera,
+                vec![
+                    (
+                        misc_msg(|m| m.set_switch_display(SwitchDisplay::new())),
+                        None,
+                    ),
+                    (misc_msg(|m| m.set_chat_message(ChatMessage::new())), None),
+                    (
+                        msg(|m| m.set_voice_call_request(VoiceCallRequest::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_audio_frame(AudioFrame::new())), None),
+                    (
+                        option_msg(|o| o.image_quality = ImageQuality::Balanced.into()),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_privacy_mode(TogglePrivacyMode::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_virtual_display(ToggleVirtualDisplay::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_resolution(Resolution::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_display_resolution(DisplayResolution::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_mouse_event(MouseEvent::new())), None),
+                    (
+                        msg(|m| m.set_pointer_device_event(PointerDeviceEvent::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_key_event(KeyEvent::new())), None),
+                    (misc_msg(|m| m.set_client_record_status(true)), None),
+                    (
+                        msg(|m| m.set_file_response(FileResponse::new())),
+                        Some("file_response"),
+                    ),
+                    (
+                        msg(|m| m.set_terminal_action(TerminalAction::new())),
+                        Some("terminal_action"),
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::Remote,
+                vec![
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_terminal_action(TerminalAction::new())), None),
+                ],
+            ),
+            (
+                AuthConnType::PortForward,
+                vec![
+                    (msg(|m| m.set_test_delay(TestDelay::new())), None),
+                    (misc_msg(|m| m.set_close_reason("closed".to_owned())), None),
+                    (
+                        msg(|m| m.set_file_action(FileAction::new())),
+                        Some("file_action"),
+                    ),
+                    (
+                        msg(|m| m.set_terminal_action(TerminalAction::new())),
+                        Some("terminal_action"),
+                    ),
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        Some("screenshot_request"),
+                    ),
+                    (misc_msg(|m| m.set_refresh_video(true)), None),
+                    (misc_msg(|m| m.set_refresh_video_display(0)), None),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default())
+                        }),
+                        None,
+                    ),
+                ],
+            ),
+        ];
+
+        for (conn_type, messages) in cases {
+            assert_scopes(conn_type, messages);
+        }
+    }
+
+    #[test]
+    fn session_scope_login_options_are_limited_to_authenticated_session_type() {
+        let mut option = OptionMessage::new();
+        option.image_quality = ImageQuality::Balanced.into();
+        option.disable_audio = BoolOption::Yes.into();
+        option.block_input = BoolOption::Yes.into();
+        option.privacy_mode = BoolOption::Yes.into();
+
+        let (scoped, violation) =
+            Connection::scoped_login_option(AuthConnType::ViewCamera, &option);
+        let scoped = scoped.unwrap();
+        assert_eq!(violation, Some("login.option"));
+        assert_eq!(
+            scoped.image_quality.enum_value(),
+            Ok(ImageQuality::Balanced)
+        );
+        assert_eq!(scoped.disable_audio.enum_value(), Ok(BoolOption::Yes));
+        assert_eq!(scoped.block_input.enum_value(), Ok(BoolOption::NotSet));
+        assert_eq!(scoped.privacy_mode.enum_value(), Ok(BoolOption::NotSet));
+
+        let (scoped, violation) =
+            Connection::scoped_login_option(AuthConnType::FileTransfer, &option);
+        assert!(scoped.is_none());
+        assert_eq!(violation, Some("login.option"));
+    }
+
+    #[test]
+    fn session_scope_limited_render_noop_options_reject_mixed_fields() {
+        for conn_type in [
+            AuthConnType::FileTransfer,
+            AuthConnType::Terminal,
+            AuthConnType::PortForward,
+        ] {
+            let supported_decoding_only = option_msg(set_supported_decoding);
+            assert_eq!(
+                Connection::authorized_message_scope_violation(conn_type, &supported_decoding_only),
+                None
+            );
+
+            let mixed_option = option_msg(|o| {
+                set_supported_decoding(o);
+                o.disable_audio = BoolOption::Yes.into();
+            });
+            assert_eq!(
+                Connection::authorized_message_scope_violation(conn_type, &mixed_option),
+                Some("misc.option")
+            );
+        }
+    }
+
+    #[test]
+    fn session_scope_view_camera_options_keep_only_camera_fields() {
+        let mut option = OptionMessage::new();
+        option.image_quality = ImageQuality::Balanced.into();
+        option.custom_image_quality = 80;
+        option.custom_fps = 24;
+        set_supported_decoding(&mut option);
+        option.disable_audio = BoolOption::Yes.into();
+        option.block_input = BoolOption::Yes.into();
+        option.disable_clipboard = BoolOption::Yes.into();
+        option.enable_file_transfer = BoolOption::Yes.into();
+        option.terminal_persistent = BoolOption::Yes.into();
+
+        let (scoped, violation) =
+            Connection::scoped_login_option(AuthConnType::ViewCamera, &option);
+        let scoped = scoped.unwrap();
+        assert_eq!(violation, Some("login.option"));
+        assert_eq!(
+            scoped.image_quality.enum_value(),
+            Ok(ImageQuality::Balanced)
+        );
+        assert_eq!(scoped.custom_image_quality, 80);
+        assert_eq!(scoped.custom_fps, 24);
+        assert!(scoped.supported_decoding.is_some());
+        assert_eq!(scoped.disable_audio.enum_value(), Ok(BoolOption::Yes));
+        assert_eq!(scoped.block_input.enum_value(), Ok(BoolOption::NotSet));
+        assert_eq!(
+            scoped.disable_clipboard.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
+        assert_eq!(
+            scoped.enable_file_transfer.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
+        assert_eq!(
+            scoped.terminal_persistent.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
     }
 }

@@ -680,7 +680,7 @@ async fn sync_and_watch_config_dir() {
     use hbb_common::sleep;
     for i in 1..=tries {
         sleep(i as f32 * CONFIG_SYNC_INTERVAL_SECS).await;
-        match crate::ipc::connect(1000, "_service").await {
+        match crate::ipc::connect_service(1000).await {
             Ok(mut conn) => {
                 if !synced {
                     if conn.send(&Data::SyncConfig(None)).await.is_ok() {
@@ -707,6 +707,12 @@ async fn sync_and_watch_config_dir() {
                             };
                         };
                     }
+                    if !synced {
+                        log::warn!(
+                            "initial config sync from root failed, reconnecting to ipc_service"
+                        );
+                        continue;
+                    }
                 }
 
                 loop {
@@ -717,7 +723,7 @@ async fn sync_and_watch_config_dir() {
                         match conn.send(&Data::SyncConfig(Some(cfg.clone().into()))).await {
                             Err(e) => {
                                 log::error!("sync config to root failed: {}", e);
-                                match crate::ipc::connect(1000, "_service").await {
+                                match crate::ipc::connect_service(1000).await {
                                     Ok(mut _conn) => {
                                         conn = _conn;
                                         log::info!("reconnected to ipc_service");

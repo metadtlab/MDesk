@@ -24,6 +24,27 @@ use crate::{
     config::Config,
 };
 
+#[cfg(windows)]
+#[path = "fs/windows_file_access.rs"]
+mod windows_file_access;
+
+/// Run eager, synchronous file operations under the non-elevated session user.
+pub fn with_user_file_access<T>(operation: impl FnOnce() -> ResultType<T>) -> ResultType<T> {
+    #[cfg(windows)]
+    let _access = windows_file_access::FileAccessGuard::enter()?;
+    operation()
+}
+
+pub fn open_file_for_read(path: &Path) -> ResultType<std::fs::File> {
+    with_user_file_access(|| Ok(std::fs::File::open(path)?))
+}
+
+async fn open_transfer_file(path: &Path) -> ResultType<File> {
+    let path = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || open_file_for_read(&path)).await??;
+    Ok(File::from_std(file))
+}
+
 static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
 // Negative IDs are reserved for controlled-host initiated direct pushes. This
 // avoids colliding with the controller's ordinary positive file-manager jobs
@@ -103,6 +124,10 @@ pub fn update_next_job_id(id: i32) {
 }
 
 pub fn read_dir(path: &Path, include_hidden: bool) -> ResultType<FileDirectory> {
+    with_user_file_access(|| read_dir_inner(path, include_hidden))
+}
+
+fn read_dir_inner(path: &Path, include_hidden: bool) -> ResultType<FileDirectory> {
     let mut dir = FileDirectory {
         path: get_string(path),
         ..Default::default()
@@ -474,7 +499,7 @@ fn snapshot_direct_source_identity(
     path: &Path,
     metadata: &std::fs::Metadata,
 ) -> ResultType<DirectSourceIdentity> {
-    let file = std::fs::File::open(path)?;
+    let file = open_file_for_read(path)?;
     let identity = direct_source_identity(&file)?;
     let current = std::fs::symlink_metadata(path)?;
     if current.file_type().is_symlink()
@@ -644,6 +669,10 @@ fn collect_direct_transfer_directory(
 /// refusing symlinks/reparse points. This prevents a partially enumerated
 /// folder from later being reported as a completed direct transfer.
 pub fn get_direct_transfer_manifest(source: &Path) -> ResultType<DirectTransferManifest> {
+    with_user_file_access(|| get_direct_transfer_manifest_inner(source))
+}
+
+fn get_direct_transfer_manifest_inner(source: &Path) -> ResultType<DirectTransferManifest> {
     let metadata = std::fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() || is_direct_transfer_reparse_point(&metadata) {
         bail!("symbolic links and reparse points are not allowed in direct transfer");
@@ -935,7 +964,7 @@ fn read_dir_recursive(
 }
 
 pub fn get_recursive_files(path: &str, include_hidden: bool) -> ResultType<Vec<FileEntry>> {
-    read_dir_recursive(&get_path(path), &get_path(""), include_hidden)
+    with_user_file_access(|| read_dir_recursive(&get_path(path), &get_path(""), include_hidden))
 }
 
 fn read_empty_dirs_recursive(
@@ -980,7 +1009,7 @@ pub fn get_empty_dirs_recursive(
     path: &str,
     include_hidden: bool,
 ) -> ResultType<Vec<FileDirectory>> {
-    read_empty_dirs_recursive(&get_path(path), &get_path(""), include_hidden)
+    with_user_file_access(|| read_empty_dirs_recursive(&get_path(path), &get_path(""), include_hidden))
 }
 
 #[inline]
@@ -1872,7 +1901,7 @@ impl TransferJob {
                     } else {
                         Self::join(p, &self.files[file_num].name)
                     };
-                    match File::open(&source_path).await {
+                    match open_transfer_file(&source_path).await {
                         Ok(file) => {
                             if self.strict_direct_transfer {
                                 let validation: ResultType<()> = async {
@@ -2201,7 +2230,7 @@ impl TransferJob {
                 }
             } else if Path::new(&file_path).exists() {
                 // If `file_path` exists, seek (reader) to the offset
-                match File::open(&file_path).await {
+                match open_transfer_file(Path::new(&file_path)).await {
                     Ok(f) => f,
                     Err(e) => {
                         log::warn!("Failed to open file {}: {}", file_path, e);

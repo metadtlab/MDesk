@@ -15,6 +15,13 @@ static void *test_realloc(void *ptr, size_t size)
 
 static unsigned reads, releases;
 UINT64 mdesk_clipboard_remote_generation(UINT32 conn) { return 77; }
+HANDLE mdesk_clipboard_find_first_file(const WCHAR *path, WIN32_FIND_DATAW *data)
+{ return FindFirstFileW(path, data); }
+HANDLE mdesk_clipboard_open_file_for_read(const WCHAR *path)
+{
+    return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, NULL);
+}
 void mdesk_clipboard_source_snapshot(UINT32 sequence, UINT32 count, WCHAR **paths) {}
 HANDLE mdesk_clipboard_descriptors(UINT32 conn, UINT64 gen, UINT32 format, SIZE_T *size)
 {

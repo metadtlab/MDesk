@@ -53,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, LoadIconW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, IDC_ARROW, IDI_APPLICATION, IDYES,
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    MB_YESNO, MB_DEFBUTTON2, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_CLOSE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD,
     WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
@@ -129,7 +129,7 @@ unsafe extern "system" {
 }
 
 #[derive(Parser)]
-#[command(name = "mdeskmini", about = "Minimal host runtime with accept popup")]
+#[command(name = "mdeskmini", about = "Minimal certificate-based host runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -142,8 +142,8 @@ enum Commands {
         /// Disable popup approval UI loop
         #[arg(long, default_value_t = false)]
         headless: bool,
-        /// Host approve mode
-        #[arg(long, value_enum, default_value_t = ApproveModeArg::Click)]
+        /// Host approval policy; auto accepts after certificate bootstrap
+        #[arg(long, value_enum, default_value_t = ApproveModeArg::Auto)]
         approve_mode: ApproveModeArg,
         /// Permanent password to preset on host
         #[arg(long)]
@@ -175,15 +175,16 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             headless: false,
-            approve_mode: ApproveModeArg::Click,
+            approve_mode: ApproveModeArg::Auto,
             password: None,
             api: Some(DEFAULT_API_HINT.to_owned()),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ApproveModeArg {
+    Auto,
     Password,
     Click,
     Both,
@@ -192,6 +193,8 @@ enum ApproveModeArg {
 impl ApproveModeArg {
     fn as_config_value(self) -> &'static str {
         match self {
+            // Automatic acceptance is handled only by Mini, never by the core server.
+            ApproveModeArg::Auto => "click",
             ApproveModeArg::Password => "password",
             ApproveModeArg::Click => "click",
             ApproveModeArg::Both => "both",
@@ -707,9 +710,9 @@ fn run_serve(options: ServeOptions) {
     diagnostic_event(
         "serve.begin",
         &format!(
-            "headless={} approve_mode={} api_configured={} password_configured={}",
+            "headless={} approve_mode={:?} api_configured={} password_configured={}",
             options.headless,
-            options.approve_mode.as_config_value(),
+            options.approve_mode,
             options
                 .api
                 .as_deref()
@@ -803,8 +806,6 @@ fn run_serve(options: ServeOptions) {
         "MDesk 준비중",
         "원격 접속 정책을 적용하고 있습니다.",
     );
-    apply_host_policy(&options);
-    diagnostic_event("policy.applied", "host acceptance policy applied");
 
     #[cfg(target_os = "windows")]
     update_startup_progress(
@@ -813,22 +814,19 @@ fn run_serve(options: ServeOptions) {
         "MDesk 준비중",
         "인증번호를 확인하고 있습니다.",
     );
-    let cert_verification = match apply_clipboard_cert_bootstrap(&options) {
-        Ok(verification) => verification,
+    let cert_verification = match require_certificate(apply_clipboard_cert_bootstrap(&options)) {
+        Ok(verification) => Some(verification),
         Err(err) => {
-            // 인증 실패 메시지박스는 사용자에게 노출하지 않고 로그만 남긴다.
-            // verify 자체는 Flutter UI / 후속 인스턴스에서 다시 시도되므로 그대로 진행한다.
-            eprintln!("cert bootstrap failed (ignored): {err}");
             diagnostic_event("cert.bootstrap_failed", &err);
-            None
+            #[cfg(target_os = "windows")]
+            show_error_popup("MDeskMini", "Certificate verification failed. Remote access was not started.");
+            common::global_clean();
+            secure_process_exit(1);
         }
     };
-    if cert_verification.is_none() {
-        diagnostic_event(
-            "cert.not_available",
-            "no verified clipboard certificate session",
-        );
-    }
+    let certificate_verified = cert_verification.is_some();
+    apply_host_policy(&options);
+    diagnostic_event("policy.applied", "host acceptance policy applied");
     if let Some(verification) = cert_verification.clone() {
         report_readiness_stage_async(
             verification,
@@ -933,7 +931,12 @@ fn run_serve(options: ServeOptions) {
     );
 
     if !options.headless {
-        monitor_pending_connections(&server_thread, waiting_window.as_ref());
+        monitor_pending_connections(
+            &server_thread,
+            waiting_window.as_ref(),
+            options.approve_mode,
+            certificate_verified,
+        );
     }
 
     let _ = server_thread.join();
@@ -1064,6 +1067,7 @@ fn run_installed_mdesk_handoff(
         "설치된 MDesk 확인",
         "설치된 MDesk를 사용하여 원격 연결을 준비합니다.",
     );
+    let verification = require_certificate(apply_clipboard_cert_bootstrap(options))?;
     show_information_popup(
         "MDeskMini",
         "MDesk가 이미 설치되어 있습니다.\n설치된 MDesk를 실행하여 원격 연결을 준비합니다.",
@@ -1083,8 +1087,6 @@ fn run_installed_mdesk_handoff(
         "인증번호와 원격 연결 정책을 확인하고 있습니다.",
     );
     apply_host_policy(options);
-    let verification = apply_clipboard_cert_bootstrap(options)?
-        .ok_or_else(|| "클립보드에서 유효한 인증번호를 찾지 못했습니다.".to_owned())?;
     report_readiness_stage(
         &verification,
         options.api.as_deref().unwrap_or_default(),
@@ -1557,6 +1559,33 @@ fn extract_certnum_from_clipboard_text(raw: &str) -> Option<String> {
     None
 }
 
+fn require_certificate<T>(result: Result<Option<T>, String>) -> Result<T, String> {
+    result?.ok_or_else(|| "A verified certificate session is required".to_owned())
+}
+
+fn validate_api_url(url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid API URL".to_owned())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("API URL must use HTTPS without credentials or fragments".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn secure_api_client(url: &str, timeout: Duration) -> Result<Client, String> {
+    validate_api_url(url)?;
+    Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|err| format!("http client build failed: {err}"))
+}
+
 fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerification, String> {
     if cert_code.trim().is_empty() {
         return Err("certno is empty".to_owned());
@@ -1578,11 +1607,7 @@ fn verify_cert_number(cert_code: &str, api_hint: &str) -> Result<CertVerificatio
         "peer_id": peer_id,
     });
 
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|err| format!("http client build failed: {err}"))?;
+    let client = secure_api_client(&verify_url, Duration::from_secs(10))?;
 
     let response = client
         .post(&verify_url)
@@ -1801,11 +1826,7 @@ fn post_cert_readiness(
     attempts: usize,
 ) -> Result<ReadinessPostResult, String> {
     let url = build_cert_readiness_url(api_hint, endpoint);
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(READINESS_HTTP_TIMEOUT)
-        .build()
-        .map_err(|err| format!("http client build failed: {err}"))?;
+    let client = secure_api_client(&url, READINESS_HTTP_TIMEOUT)?;
     let body = if let Some(stage) = stage {
         json!({
             "session_id": verification.session_id,
@@ -1899,11 +1920,7 @@ fn call_agentnumupdate(verification: &CertVerification, api_hint: &str) -> Resul
         &verification.verified_peer_id,
     );
 
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|err| format!("http client build failed: {err}"))?;
+    let client = secure_api_client(&agent_url, Duration::from_secs(10))?;
 
     let mut last_error = String::new();
     let body = json!({
@@ -2498,17 +2515,19 @@ extern "system" fn waiting_window_proc(
 fn monitor_pending_connections(
     server_thread: &thread::JoinHandle<()>,
     waiting_window: Option<&WaitingWindow>,
+    approve_mode: ApproveModeArg,
+    certificate_verified: bool,
 ) {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (server_thread, waiting_window);
-        println!("popup approval loop is windows-only; running without popup UI");
+        let _ = (server_thread, waiting_window, approve_mode, certificate_verified);
+        println!("connection monitor is windows-only; running without popup UI");
         return;
     }
 
     #[cfg(target_os = "windows")]
     {
-        println!("mini approval popup loop active");
+        println!("mini connection monitor active: {approve_mode:?}");
         diagnostic_event("connection.monitor.begin", "connection monitor loop active");
         let mut prompted: HashSet<i32> = HashSet::new();
         let mut had_remote_session = false;
@@ -2715,7 +2734,13 @@ fn monitor_pending_connections(
             prompted.retain(|id| active_ids.contains(id));
 
             for client in clients {
-                if client.authorized || client.disconnected {
+                let action = approval_action(
+                    approve_mode,
+                    certificate_verified,
+                    client.authorized,
+                    client.disconnected,
+                );
+                if action == ApprovalAction::None {
                     continue;
                 }
 
@@ -2726,14 +2751,23 @@ fn monitor_pending_connections(
                 had_remote_session = true;
 
                 diagnostic_event(
-                    "connection.auto_approve",
+                    if action == ApprovalAction::AutoAccept {
+                        "connection.auto_approve"
+                    } else {
+                        "connection.manual_approval"
+                    },
                     &format!(
                         "client_id={} peer_id={} name={} ip={}",
                         client.id, client.peer_id, client.name, client.ip
                     ),
                 );
 
-                flutter_ffi::cm_login_res(client.id, true);
+                let accepted = match action {
+                    ApprovalAction::AutoAccept => true,
+                    ApprovalAction::Prompt => prompt_approval(&client),
+                    ApprovalAction::None => continue,
+                };
+                flutter_ffi::cm_login_res(client.id, accepted);
             }
 
             thread::sleep(Duration::from_millis(300));
@@ -2747,8 +2781,30 @@ fn monitor_pending_connections(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalAction {
+    None,
+    AutoAccept,
+    Prompt,
+}
+
+fn approval_action(
+    mode: ApproveModeArg,
+    certificate_verified: bool,
+    authorized: bool,
+    disconnected: bool,
+) -> ApprovalAction {
+    if !certificate_verified || authorized || disconnected {
+        return ApprovalAction::None;
+    }
+    match mode {
+        ApproveModeArg::Auto => ApprovalAction::AutoAccept,
+        ApproveModeArg::Click | ApproveModeArg::Both => ApprovalAction::Prompt,
+        ApproveModeArg::Password => ApprovalAction::None,
+    }
+}
+
 #[cfg(target_os = "windows")]
-#[allow(dead_code)]
 fn prompt_approval(client: &CmClient) -> bool {
     let title = "MDeskMini";
     let body = format!(
@@ -2772,7 +2828,7 @@ fn prompt_approval(client: &CmClient) -> bool {
             None,
             PCWSTR(body_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+            MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
         )
     };
 
@@ -2818,6 +2874,114 @@ fn to_wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn certificate_bootstrap_fails_closed() {
+        assert!(super::require_certificate::<()>(Ok(None)).is_err());
+        assert!(super::require_certificate::<()>(Err("offline".into())).is_err());
+        assert_eq!(super::require_certificate(Ok(Some(42))).unwrap(), 42);
+    }
+
+    #[test]
+    fn default_cli_and_serve_policy_use_auto_approval() {
+        assert_eq!(ServeOptions::default().approve_mode, ApproveModeArg::Auto);
+        assert!(Cli::try_parse_from(["mdeskmini"]).unwrap().command.is_none());
+        match Cli::try_parse_from(["mdeskmini", "serve"]).unwrap().command {
+            Some(Commands::Serve { approve_mode, .. }) => {
+                assert_eq!(approve_mode, ApproveModeArg::Auto);
+                assert_eq!(approve_mode.as_config_value(), "click");
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn explicit_approval_modes_are_preserved() {
+        for (value, expected) in [
+            ("auto", ApproveModeArg::Auto),
+            ("password", ApproveModeArg::Password),
+            ("click", ApproveModeArg::Click),
+            ("both", ApproveModeArg::Both),
+        ] {
+            match Cli::try_parse_from(["mdeskmini", "serve", "--approve-mode", value])
+                .unwrap().command
+            {
+                Some(Commands::Serve { approve_mode, .. }) => assert_eq!(approve_mode, expected),
+                _ => panic!("expected serve command"),
+            }
+        }
+    }
+
+    #[test]
+    fn approval_policy_requires_bootstrap_and_preserves_password_validation() {
+        for mode in [
+            ApproveModeArg::Auto,
+            ApproveModeArg::Password,
+            ApproveModeArg::Click,
+            ApproveModeArg::Both,
+        ] {
+            for verified in [false, true] {
+                for authorized in [false, true] {
+                    for disconnected in [false, true] {
+                        let expected = if !verified || authorized || disconnected {
+                            ApprovalAction::None
+                        } else {
+                            match mode {
+                                ApproveModeArg::Auto => ApprovalAction::AutoAccept,
+                                ApproveModeArg::Password => ApprovalAction::None,
+                                ApproveModeArg::Click | ApproveModeArg::Both => {
+                                    ApprovalAction::Prompt
+                                }
+                            }
+                        };
+                        assert_eq!(
+                            approval_action(mode, verified, authorized, disconnected),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn authentication_api_requires_https() {
+        for url in ["http://admin.787.kr/api", "file:///config", "https://user:pass@admin.787.kr", "https://admin.787.kr/#fragment", "not a url"] {
+            assert!(super::validate_api_url(url).is_err(), "{url}");
+        }
+        assert!(super::validate_api_url(super::DEFAULT_CERT_VERIFY_URL).is_ok());
+        assert!(super::validate_api_url("https://support.example:8443/api").is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires PowerShell 7 and MDESK_TLS_FIXTURE pointing to the local TLS test script"]
+    fn authentication_client_rejects_untrusted_loopback_certificate() {
+        use std::{io::{BufRead, BufReader}, os::windows::process::CommandExt, process::Stdio};
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let fixture = std::env::var("MDESK_TLS_FIXTURE").expect("local TLS fixture path");
+        let mut child = ChildGuard(std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-File", &fixture])
+            .stdout(Stdio::piped()).stderr(Stdio::inherit()).creation_flags(0x08000000)
+            .spawn().expect("PowerShell 7 fixture"));
+        let mut line = String::new();
+        BufReader::new(child.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().parse().expect("loopback port");
+        let url = format!("https://127.0.0.1:{port}/");
+        let error = super::secure_api_client(&url, Duration::from_secs(10)).unwrap()
+            .get(&url).send().expect_err("untrusted certificate must not be accepted");
+        assert!(!error.is_timeout(), "a timeout is not certificate verification");
+        let detail = format!("{error:?}").to_ascii_lowercase();
+        // native-tls skips the OS error in source(), but Debug retains its
+        // locale-independent CERT_E_UNTRUSTEDROOT / SEC_E_UNTRUSTED_ROOT code.
+        let untrusted_root = [0x800b0109_u32, 0x80090325].iter()
+            .any(|code| detail.contains(&format!("code: {}", *code as i32)));
+        assert!(untrusted_root || detail.contains("certificate") || detail.contains("unknownissuer")
+            || detail.contains("80090325"), "not a certificate rejection: {detail}");
+    }
+
     use super::*;
 
     #[test]

@@ -24,6 +24,9 @@ if not exist "%MANIFEST%" (
   exit /b 1
 )
 
+call "%REPO_DIR%\setup_windows_env.bat" x64
+if errorlevel 1 exit /b 1
+
 where cargo >nul 2>nul
 if errorlevel 1 (
   echo ERROR: cargo was not found in PATH.

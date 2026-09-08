@@ -66,6 +66,8 @@ static BOOL wf_cliprdr_bounded_strlen(const char *value, size_t max_len, size_t 
 
 /* Rust adapter keeps file contents in a bounded, connection-scoped stream. */
 extern UINT64 mdesk_clipboard_remote_generation(UINT32 connID);
+extern HANDLE mdesk_clipboard_open_file_for_read(const WCHAR *path);
+extern HANDLE mdesk_clipboard_find_first_file(const WCHAR *path, WIN32_FIND_DATAW *data);
 extern int mdesk_clipboard_stream_read(UINT32 connID, UINT64 generation, UINT32 index,
     UINT64 size, UINT64 offset, void *output, UINT32 requested, UINT32 *read, UINT64 *token);
 extern void mdesk_clipboard_stream_release(UINT32 connID, UINT64 token);
@@ -2431,8 +2433,7 @@ static BOOL wf_cliprdr_get_file_contents(WCHAR *file_name, BYTE *buffer, LONG po
 		return FALSE;
 	}
 
-	hFile = CreateFileW(file_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-						FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	hFile = mdesk_clipboard_open_file_for_read(file_name);
 
 	if (hFile == INVALID_HANDLE_VALUE)
 		return FALSE;
@@ -2472,8 +2473,7 @@ static FILEDESCRIPTORW *wf_cliprdr_get_file_descriptor(WCHAR *file_name, size_t 
 	if (!fd)
 		return NULL;
 
-	hFile = CreateFileW(file_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-						FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	hFile = mdesk_clipboard_open_file_for_read(file_name);
 
 	if (hFile == INVALID_HANDLE_VALUE)
 	{
@@ -2584,7 +2584,7 @@ static BOOL wf_cliprdr_traverse_directory(wfClipboard *clipboard, WCHAR *Dir, si
 {
 	HANDLE hFind;
 	WCHAR DirSpec[MAX_PATH];
-	WIN32_FIND_DATA FindFileData;
+	WIN32_FIND_DATAW FindFileData;
 
 	if (!clipboard || !Dir)
 		return FALSE;
@@ -2595,7 +2595,7 @@ static BOOL wf_cliprdr_traverse_directory(wfClipboard *clipboard, WCHAR *Dir, si
 	StringCchCatW(DirSpec, MAX_PATH, L"\\*");
 
 	// hFind = FindFirstFile(DirSpec, &FindFileData);
-	hFind = FindFirstFileW(DirSpec, &FindFileData);
+	hFind = mdesk_clipboard_find_first_file(DirSpec, &FindFileData);
 
 	if (hFind == INVALID_HANDLE_VALUE)
 	{

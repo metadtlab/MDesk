@@ -1,6 +1,6 @@
 [package]
 name = "MDesk"
-version = "1.5.8"
+version = "1.5.9"
 authors = ["MDesk <metadtlab@Gmail.com>"]
 edition = "2021"
 build= "build.rs"
@@ -57,7 +57,7 @@ cfg-if = "1.0"
 lazy_static = "1.4"
 sha2 = "0.10"
 repng = "0.2"
-parity-tokio-ipc = { git = "https://github.com/rustdesk-org/parity-tokio-ipc" }
+parity-tokio-ipc = { git = "https://github.com/rustdesk-org/parity-tokio-ipc", rev = "d0ae39bffe5d5a3e8d82a1b6bcb1ca5a9b2f1c01" }
 magnum-opus = { git = "https://github.com/rustdesk-org/magnum-opus" }
 dasp = { version = "0.11", features = ["signal", "interpolate-linear", "interpolate"], optional = true }
 rubato = { version = "0.12", optional = true }
@@ -124,10 +124,23 @@ winapi = { version = "0.3", features = [
 ] }
 windows = { version = "0.61", features = [
     "Win32",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System",
+    "Win32_System_Com",
     "Win32_System_Diagnostics",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 winreg = "0.11"
 windows-service = "0.6"
@@ -136,7 +149,6 @@ remote_printer = { path = "libs/remote_printer" }
 impersonate_system = { git = "https://github.com/rustdesk-org/impersonate-system" }
 shared_memory = "0.12"
 tauri-winrt-notification = "0.1"
-runas = "1.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
