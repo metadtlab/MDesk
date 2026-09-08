@@ -9,7 +9,9 @@ extractor
 __pycache__
 src/version.rs
 *dmg
-*.md
+*.[mM][dD]
+*.mdx
+!/README.md
 *exe
 *tgz
 cert.pfx
@@ -90,14 +92,7 @@ push_to_github_force.bat
 push_to_github.bat
 setup_github_ssh.bat
 
-# Multi-agent task data: keep folder placeholders, ignore private task contents.
-!AGENTS.md
-!CLAUDE.md
-!SECURITY_HIGH_RISKS.md
-!_shared/
-!_shared/**
-!_templates/
-!_templates/**
+# Local task data: keep folder placeholders, ignore private task contents.
 !tasks/
 tasks/*
 !tasks/.gitkeep
@@ -106,4 +101,3 @@ tasks/*
 !_local/
 _local/*
 !_local/.gitkeep
-!docs/connection-diagnostics.md
