@@ -2369,6 +2369,14 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
     id = uri.path.substring("/new/".length);
   } else if (uri.authority == "config") {
     if (isAndroid || isIOS) {
+      if (bind.mainGetBuildinOption(key: kOptionAllowDeepLinkServerSettings) !=
+          'Y') {
+        debugPrint('Ignore config deep link: server settings import is disabled.');
+        // Cold-start links can arrive before the toast overlay is available.
+        Timer(Duration(seconds: 1), () => showToast(translate('Failed')));
+        return null;
+      }
+      if (uri.path.length <= 1) return null;
       final config = uri.path.substring("/".length);
       // add a timer to make showToast work
       Timer(Duration(seconds: 1), () {
@@ -2378,6 +2386,12 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
     return null;
   } else if (uri.authority == "password") {
     if (isAndroid || isIOS) {
+      if (bind.mainGetBuildinOption(key: kOptionAllowDeepLinkPassword) != 'Y') {
+        debugPrint('Ignore password deep link: password changes are disabled.');
+        Timer(Duration(seconds: 1), () => showToast(translate('Failed')));
+        return null;
+      }
+      if (uri.path.length <= 1) return null;
       final password = uri.path.substring("/".length);
       if (password.isNotEmpty) {
         Timer(Duration(seconds: 1), () async {

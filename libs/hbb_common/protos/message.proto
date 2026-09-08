@@ -328,6 +328,10 @@ message KeyEvent {
   }
   repeated ControlKey modifiers = 8;
   KeyboardMode mode = 9;
+  // Host-derived Android compatibility marker, also preserved over local
+  // portable-service IPC. The host overwrites this from LoginRequest.my_platform.
+  // Legacy/desktop peers default to false; clients must not set this themselves.
+  bool android_legacy_hangul = 10;
 }
 
 message CursorData {

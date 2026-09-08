@@ -1,8 +1,17 @@
 /* Runs the actual native IStream facade without touching the OS clipboard.
  * Rust transport hooks are replaced by a deterministic byte source. */
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
+static int fail_next_realloc;
+static void *test_realloc(void *ptr, size_t size)
+{
+    if (fail_next_realloc) { fail_next_realloc = 0; return NULL; }
+    return realloc(ptr, size);
+}
+#define realloc test_realloc
 #include "../libs/clipboard/src/windows/wf_cliprdr.c"
+#undef realloc
 
 static unsigned reads, releases;
 UINT64 mdesk_clipboard_remote_generation(UINT32 conn) { return 77; }
@@ -103,11 +112,66 @@ static void native_descriptor_ownership_survives_new_copy(void)
     assert(GlobalSize(first.hGlobal) >= sizeof(FILEGROUPDESCRIPTORW));
     ReleaseStgMedium(&first); ReleaseStgMedium(&second); GlobalFree(unrelated);
 }
+static void format_map_growth_and_rejection(void)
+{
+    wfClipboard cb = {0}; CliprdrClientContext context = {0};
+    context.Custom = &cb; cb.context = &context;
+    cb.map_capacity = 32;
+    cb.format_mappings = calloc(cb.map_capacity, sizeof(formatMapping));
+    assert(cb.format_mappings);
+
+    assert(map_ensure_capacity(&cb, 33));
+    for (size_t i = 0; i < cb.map_capacity; i++)
+        assert(!cb.format_mappings[i].name && cb.format_mappings[i].local_format_id == 0);
+    assert(!map_ensure_capacity(&cb, WF_CLIPRDR_MAX_FORMATS + 1));
+
+    CLIPRDR_FORMAT formats[34] = {0};
+    CLIPRDR_FORMAT_LIST list = {0};
+    list.formats = formats; list.numFormats = 34;
+    fail_next_realloc = 1;
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+    assert(!fail_next_realloc && cb.map_size == 0 && cb.map_capacity == 33 && !cb.copied);
+
+    list.numFormats = WF_CLIPRDR_MAX_FORMATS + 1;
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+    list.numFormats = 1; list.formats = NULL;
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+
+    list.formats = formats;
+    formats[0].formatName = "";
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+    char long_name[WF_CLIPRDR_MAX_FORMAT_NAME_UTF8_BYTES + 2];
+    memset(long_name, 'a', sizeof(long_name));
+    long_name[sizeof(long_name) - 1] = 0;
+    formats[0].formatName = long_name;
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+    long_name[256] = 0;
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+    assert(cb.map_size == 0 && !cb.copied);
+
+    list.numFormats = 2;
+    formats[0].formatName = "MDeskSecurityTestFormat";
+    formats[1].formatName = "";
+    assert(wf_cliprdr_server_format_list(&context, &list) != CHANNEL_RC_OK);
+    assert(cb.map_size == 0 && !cb.copied);
+    for (size_t i = 0; i < cb.map_capacity; i++)
+        assert(!cb.format_mappings[i].name);
+
+    size_t length = 0;
+    long_name[255] = 0;
+    assert(wf_cliprdr_bounded_strlen(long_name, 255, &length) && length == 255);
+    assert(!wf_cliprdr_bounded_strlen(long_name, 254, &length));
+    assert(!wf_cliprdr_bounded_strlen(NULL, 255, &length));
+    assert(clear_format_map(&cb));
+    free(cb.format_mappings);
+}
+
 int main(void)
 {
     native_read_seek_eof_and_release();
     legacy_response_correlation();
     native_descriptor_ownership_survives_new_copy();
-    puts("native clipboard tests passed: IStream read/seek/EOF/release, descriptor ownership, legacy response isolation");
+    format_map_growth_and_rejection();
+    puts("native clipboard tests passed: streams, descriptor ownership, response isolation, format limits and allocation failure");
     return 0;
 }

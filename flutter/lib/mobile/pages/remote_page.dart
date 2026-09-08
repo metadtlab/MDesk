@@ -24,6 +24,8 @@ import '../../models/input_model.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../utils/image.dart';
+import '../../utils/soft_keyboard_input.dart';
+import '../../utils/ime_diagnostic_trace.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
 
@@ -64,7 +66,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Timer? _timer;
   bool _showBar = !isWebDesktop;
   bool _showGestureHelp = false;
-  String _value = '';
+  late final SoftKeyboardInput _softKeyboardInput;
+  final ImeDiagnosticTrace? _imeTrace =
+      const bool.fromEnvironment('MDESK_IME_DIAGNOSTICS')
+          ? ImeDiagnosticTrace((line) => debugPrint(line))
+          : null;
   Orientation? _currentOrientation;
   double _viewInsetsBottom = 0;
 
@@ -93,6 +99,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _softKeyboardInput = SoftKeyboardInput(
+      sendBackspace: () => _sendSoftKeyboardKey('VK_BACK'),
+      sendText: _sendInputText,
+      trace: _imeTrace == null ? null : (stage, edit, deletes, text) {
+        _imeTrace!.emit(stage, text, {'edit': edit, 'deletes': deletes});
+      },
+      onError: (error, stack) {
+        debugPrint('Soft keyboard input stopped after bridge failure: $error');
+      },
+    );
+    _textController.addListener(_handleSoftKeyboardEditingValue);
     gFFI.ffiModel.updateEventListener(sessionId, widget.id);
     gFFI.start(
       widget.id,
@@ -130,6 +147,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Future<void> dispose() async {
+    _textController.removeListener(_handleSoftKeyboardEditingValue);
+    _softKeyboardInput.dispose();
+    _textController.dispose();
     WidgetsBinding.instance.removeObserver(this);
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
@@ -235,19 +255,34 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     return c >= 0x20 && c < 0x7F;
   }
 
-  void _sendInputText(String newStr) {
+  Future<void> _sendInputText(String newStr) async {
     if (newStr.isEmpty) return;
+    if (!inputModel.keyboardPerm || inputModel.isViewCamera) return;
     if (newStr.length > 1 || !_isAsciiPrintable(newStr)) {
-      bind.sessionInputString(sessionId: sessionId, value: newStr);
+      await bind.sessionInputString(sessionId: sessionId, value: newStr);
     } else {
-      inputChar(newStr);
+      await _sendSoftKeyboardKey(newStr == ' ' ? 'VK_SPACE' : newStr);
     }
+  }
+
+  Future<void> _sendSoftKeyboardKey(String name) async {
+    if (!inputModel.keyboardPerm || inputModel.isViewCamera) return;
+    await bind.sessionInputKey(
+      sessionId: sessionId,
+      name: name,
+      down: false,
+      press: true,
+      alt: inputModel.alt,
+      ctrl: inputModel.ctrl,
+      shift: inputModel.shift,
+      command: inputModel.command,
+    );
   }
 
   // Soft keyboard input diff used for both Android and iOS.
   //
   // The hidden TextFormField is pre-filled with `initText` ('1' * 1024).
-  // We compare the previous text (`_value`) and the new text from `onChanged`
+  // We compare the previous text and the new text from `onChanged`
   // and emit the minimal sequence of VK_BACK presses + text input that
   // transforms one into the other.
   //
@@ -262,50 +297,27 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   //     first to be silently dropped on Android. Diffing on text content alone
   //     handles all of these uniformly.
   void handleSoftKeyboardInput(String newValue) {
-    var oldValue = _value;
-    _value = newValue;
-
-    // Clipboard paste or other external replacement wiped the leading padding.
-    // Treat the previous state as empty so we don't issue stray backspaces.
-    if (oldValue.isNotEmpty &&
-        newValue.isNotEmpty &&
-        oldValue[0] == '1' &&
-        newValue[0] != '1') {
-      oldValue = '';
-    }
-
-    if (newValue == oldValue) return;
-
-    final maxLen = newValue.length < oldValue.length
-        ? newValue.length
-        : oldValue.length;
-    var common = 0;
-    while (common < maxLen && newValue[common] == oldValue[common]) {
-      common++;
-    }
-
-    final deleteCount = oldValue.length - common;
-    for (var k = 0; k < deleteCount; k++) {
-      inputModel.inputKey('VK_BACK');
-    }
-
-    _sendInputText(newValue.substring(common));
+    final composing = _textController.value.composing;
+    _imeTrace?.emit('ime', newValue, {
+      'composingStart': composing.start,
+      'composingEnd': composing.end,
+      'selection': _textController.selection.baseOffset,
+    });
+    _softKeyboardInput.update(newValue,
+        composingStart: isAndroid ? composing.start : -1,
+        composingEnd: isAndroid ? composing.end : -1);
   }
 
-  void inputChar(String char) {
-    if (char == '\n') {
-      char = 'VK_RETURN';
-    } else if (char == ' ') {
-      char = 'VK_SPACE';
-    }
-    inputModel.inputKey(char);
-  }
+  // A composition can commit without changing the text. onChanged misses
+  // that notification; the controller listener also handles range-only edits.
+  void _handleSoftKeyboardEditingValue() =>
+      handleSoftKeyboardInput(_textController.text);
 
   void openKeyboard() {
     gFFI.invokeMethod("enable_soft_keyboard", true);
-    // destroy first, so that our _value trick can work
-    _value = initText;
-    _textController.text = _value;
+    // Reset only the local padding; queued remote edits retain their order.
+    _softKeyboardInput.reset(initText);
+    _textController.text = initText;
     setState(() => _showEdit = false);
     _timer?.cancel();
     _timer = Timer(kMobileDelaySoftKeyboard, () {
@@ -582,7 +594,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       //      2. The button will trigger `onKeyEvent` if the text field is empty.
                       // ko/zh/ja input method: the button will trigger `onKeyEvent`
                       //                     and the event will not popup if `KeyEventResult.handled` is returned.
-                      onChanged: handleSoftKeyboardInput,
+                      // Text and composition changes are handled by the controller listener.
                     ).workaroundFreezeLinuxMint(),
             ),
           ];

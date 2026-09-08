@@ -1515,6 +1515,141 @@ fn process_seq(en: &mut Enigo, sequence: &str) {
     en.key_sequence(&sequence);
 }
 
+#[cfg(target_os = "windows")]
+pub(super) fn mark_android_hangul_input(mut evt: KeyEvent, peer_platform: &str) -> KeyEvent {
+    // Never trust a flag sent by a peer. Keep desktop sessions on their
+    // existing input path, including old clients and shared portable services.
+    evt.android_legacy_hangul = peer_platform == "Android";
+    evt
+}
+
+#[cfg(target_os = "windows")]
+fn is_android_legacy_unmodified(evt: &KeyEvent) -> bool {
+    evt.android_legacy_hangul && evt.mode.enum_value().ok() == Some(KeyboardMode::Legacy)
+        && evt.modifiers.iter().all(|key| matches!(key.enum_value().ok(),
+            Some(ControlKey::CapsLock | ControlKey::NumLock)))
+}
+
+#[cfg(target_os = "windows")]
+fn android_legacy_ascii(evt: &KeyEvent) -> Option<u32> {
+    if !is_android_legacy_unmodified(evt) { return None; }
+    match evt.union {
+        Some(key_event::Union::Chr(chr)) if (0x21..=0x7e).contains(&chr) => Some(chr),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn android_legacy_text(evt: &KeyEvent) -> Option<std::borrow::Cow<'_, str>> {
+    if !is_android_legacy_unmodified(evt) {
+        return None;
+    }
+    match &evt.union {
+        Some(key_event::Union::Seq(text)) => Some(std::borrow::Cow::Borrowed(text)),
+        Some(key_event::Union::Unicode(chr)) => char::from_u32(*chr)
+            .map(|c| std::borrow::Cow::Owned(c.to_string())),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod android_hangul_tests {
+    use super::*;
+    use hbb_common::protobuf::Message;
+
+    #[test]
+    fn desktop_keyboard_events_keep_their_original_input_path() {
+        let mut text = KeyEvent::new();
+        text.set_seq("한글 abc".into());
+        let mut shortcut = KeyEvent::new();
+        shortcut.set_chr(0x1e);
+        shortcut.mode = KeyboardMode::Map.into();
+        shortcut.down = true;
+        shortcut.modifiers.push(ControlKey::Control.into());
+        let mut translated = text.clone();
+        translated.mode = KeyboardMode::Translate.into();
+        let mut ime_toggle = KeyEvent::new();
+        ime_toggle.set_control_key(ControlKey::RAlt);
+        for platform in ["Windows", "Mac OS", "Linux", "iOS", ""] {
+            for original in [&text, &shortcut, &translated, &ime_toggle] {
+                assert_eq!(mark_android_hangul_input(original.clone(), platform), *original);
+                assert!(android_legacy_text(&mark_android_hangul_input(original.clone(), platform)).is_none());
+                assert!(android_legacy_ascii(&mark_android_hangul_input(original.clone(), platform)).is_none());
+                let mut supplied_flag = original.clone();
+                supplied_flag.android_legacy_hangul = true;
+                assert_eq!(mark_android_hangul_input(supplied_flag, platform), *original);
+            }
+        }
+    }
+
+    #[test]
+    fn android_compatibility_survives_portable_service_serialization() {
+        let mut original = KeyEvent::new();
+        original.set_seq("한글".into());
+        let marked = mark_android_hangul_input(original.clone(), "Android");
+        let decoded = KeyEvent::parse_from_bytes(&marked.write_to_bytes().unwrap()).unwrap();
+        assert!(decoded.android_legacy_hangul);
+        assert_eq!(decoded.seq(), original.seq());
+        assert_eq!(android_legacy_text(&decoded).as_deref(), Some("한글"));
+        assert!(!KeyEvent::parse_from_bytes(&original.write_to_bytes().unwrap())
+            .unwrap().android_legacy_hangul);
+    }
+
+    #[test]
+    fn android_native_hangul_excludes_shortcuts_and_nonlegacy_modes() {
+        let mut text = KeyEvent::new();
+        text.set_seq("한글".into());
+        let text = mark_android_hangul_input(text, "Android");
+        for key in [ControlKey::Control, ControlKey::Alt, ControlKey::Meta,
+            ControlKey::Shift, ControlKey::RShift, ControlKey::RControl,
+            ControlKey::RAlt, ControlKey::RWin] {
+            let mut shortcut = text.clone();
+            shortcut.modifiers.push(key.into());
+            assert!(android_legacy_text(&shortcut).is_none());
+        }
+        for mode in [KeyboardMode::Map, KeyboardMode::Translate] {
+            let mut other = text.clone();
+            other.mode = mode.into();
+            assert!(android_legacy_text(&other).is_none());
+        }
+        let mut control = text.clone();
+        control.set_control_key(ControlKey::Backspace);
+        assert!(android_legacy_text(&control).is_none()); // Keep queued native Backspace.
+        let mut scalar = text.clone();
+        scalar.set_unicode('한' as u32);
+        assert_eq!(android_legacy_text(&scalar).as_deref(), Some("한"));
+        scalar.set_unicode(0xd800);
+        assert!(android_legacy_text(&scalar).is_none());
+    }
+
+    #[test]
+    fn android_toad_ascii_preserves_case_and_leaves_control_keys_alone() {
+        let mut ascii = KeyEvent::new();
+        ascii.set_chr('A' as u32);
+        let mut ascii = mark_android_hangul_input(ascii, "Android");
+        for down in [true, false] {
+            ascii.down = down;
+            assert_eq!(android_legacy_ascii(&ascii), Some('A' as u32));
+            assert!(android_legacy_text(&ascii).is_none());
+        }
+        for platform in ["Windows", "Mac OS", "Linux", "iOS", ""] {
+            assert!(android_legacy_ascii(&mark_android_hangul_input(ascii.clone(), platform)).is_none());
+        }
+        let mut shortcut = ascii.clone();
+        shortcut.modifiers.push(ControlKey::Control.into());
+        assert!(android_legacy_ascii(&shortcut).is_none());
+        let mut mapped = ascii.clone();
+        mapped.mode = KeyboardMode::Map.into();
+        assert!(android_legacy_ascii(&mapped).is_none());
+        for chr in [0, 8, 13, 32, '한' as u32] {
+            ascii.set_chr(chr);
+            assert!(android_legacy_ascii(&ascii).is_none());
+        }
+        ascii.set_control_key(ControlKey::Space);
+        assert!(android_legacy_ascii(&ascii).is_none());
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn release_keys(en: &mut Enigo, to_release: &Vec<Key>) {
     for key in to_release {
@@ -1552,10 +1687,33 @@ fn is_function_key(ck: &EnumOrUnknown<ControlKey>) -> bool {
 fn legacy_keyboard_mode(evt: &KeyEvent) {
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
+    #[cfg(windows)]
+    if evt.android_legacy_hangul {
+        match &evt.union {
+            Some(key_event::Union::Seq(text)) => enigo::prepare_hangul_input(text),
+            Some(key_event::Union::Unicode(chr)) => {
+                if let Some(chr) = char::from_u32(*chr) {
+                    enigo::prepare_hangul_input(&chr.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
     let mut to_release: Vec<Key> = Vec::new();
 
     let mut en = ENIGO.lock().unwrap();
     sync_modifiers(&mut en, &evt, &mut to_release);
+
+    #[cfg(windows)]
+    if android_legacy_text(evt).is_some_and(|text| enigo::try_native_hangul_input(&text)) {
+        release_keys(&mut en, &to_release);
+        return;
+    }
+    #[cfg(windows)]
+    if android_legacy_ascii(evt).is_some_and(|chr| enigo::try_toad_ascii_input(chr, evt.down)) {
+        release_keys(&mut en, &to_release);
+        return;
+    }
 
     let down = evt.down;
     match evt.union {

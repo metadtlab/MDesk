@@ -2,6 +2,10 @@
 chcp 65001 >nul 2>&1
 setlocal
 
+cd /d "%~dp0"
+call "%~dp0setup_windows_x64_env.bat"
+if errorlevel 1 exit /b 1
+
 :: VCPKG 경로 설정
 if "%VCPKG_ROOT%"=="" set VCPKG_ROOT=D:\IMedix\Rust\vcpkg
 

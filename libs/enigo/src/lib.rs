@@ -65,6 +65,12 @@ mod win;
 pub use win::Enigo;
 #[cfg(target_os = "windows")]
 pub use win::ENIGO_INPUT_EXTRA_VALUE;
+#[cfg(target_os = "windows")]
+pub use win::prepare_hangul_input;
+#[cfg(target_os = "windows")]
+pub use win::try_native_hangul_input;
+#[cfg(target_os = "windows")]
+pub use win::try_toad_ascii_input;
 
 #[cfg(target_os = "macos")]
 mod macos;

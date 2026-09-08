@@ -1,6 +1,11 @@
 @echo off
 setlocal enabledelayedexpansion
 REM MDesk Windows Build Script
+REM --rust-only builds the DLL without cleaning caches, Flutter, or packaging.
+
+cd /d "%~dp0"
+call "%~dp0setup_windows_x64_env.bat"
+if errorlevel 1 exit /b 1
 
 echo ========================================
 echo MDesk Windows Build Script
@@ -44,6 +49,7 @@ echo [OK] Version: %VERSION%
 echo.
 
 REM Check clean build option
+if /i "%~1"=="--rust-only" goto BUILD_RUST
 set CLEAN_BUILD=0
 if "%1"=="--clean" set CLEAN_BUILD=1
 if "%1"=="-c" set CLEAN_BUILD=1
@@ -75,6 +81,7 @@ if %CLEAN_BUILD%==1 (
 )
 
 echo.
+:BUILD_RUST
 echo [3/5] Building Rust DLL...
 cargo build --features flutter --lib --release
 if errorlevel 1 (
@@ -88,6 +95,7 @@ if not exist "target\release\librustdesk.dll" (
     exit /b 1
 )
 echo [OK] Rust DLL built successfully
+if /i "%~1"=="--rust-only" exit /b 0
 
 echo.
 echo [4/5] Building Flutter...

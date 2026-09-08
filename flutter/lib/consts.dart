@@ -173,6 +173,8 @@ const String kOptionDisableUdp = "disable-udp";
 const String kOptionEnableFlutterHttpOnRust = "enable-flutter-http-on-rust";
 
 // builtin options
+const String kOptionAllowDeepLinkPassword = "allow-deep-link-password";
+const String kOptionAllowDeepLinkServerSettings = "allow-deep-link-server-settings";
 const String kOptionHideServerSetting = "hide-server-settings";
 const String kOptionHideProxySetting = "hide-proxy-settings";
 const String kOptionHideWebSocketSetting = "hide-websocket-settings";

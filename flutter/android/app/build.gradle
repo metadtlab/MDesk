@@ -145,6 +145,26 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules'
         }
     }
+
+    // Flutter's default ABI filters also include x86_64. Match the requested
+    // platforms so old JNI libraries cannot leak into an ARM-only bundle.
+    if (project.hasProperty('target-platform') &&
+            project.findProperty('split-per-abi')?.toString() != 'true') {
+        def platformAbis = [
+            'android-arm': 'armeabi-v7a',
+            'android-arm64': 'arm64-v8a',
+            'android-x64': 'x86_64',
+        ]
+        def requestedAbis = project.property('target-platform').split(',').collect {
+            def abi = platformAbis[it]
+            if (abi == null) throw new GradleException("Unsupported Android target platform: $it")
+            abi
+        }
+        buildTypes.configureEach {
+            ndk.abiFilters.clear()
+            ndk.abiFilters.addAll(requestedAbis)
+        }
+    }
 }
 
 flutter {

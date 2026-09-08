@@ -3209,6 +3209,8 @@ impl Connection {
     fn input_key(&self, msg: KeyEvent, press: bool) {
         // to-do: if is the legacy mode, and the key is function key "LockScreen".
         // Switch to the primary display.
+        #[cfg(target_os = "windows")]
+        let msg = super::input_service::mark_android_hangul_input(msg, &self.lr.my_platform);
         self.tx_input.send(MessageInput::Key((msg, press))).ok();
     }
 

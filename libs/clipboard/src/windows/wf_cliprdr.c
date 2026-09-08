@@ -43,6 +43,26 @@
 
 /* Maximum number of clipboard streams accepted from a remote peer. */
 #define WF_CLIPRDR_MAX_STREAMS 16384
+/* Windows registered formats use 0xC000..0xFFFF and 255-character atom names. */
+#define WF_CLIPRDR_MAX_FORMATS 0x4000u
+#define WF_CLIPRDR_MAX_FORMAT_NAME_WCHARS 255u
+#define WF_CLIPRDR_MAX_FORMAT_NAME_UTF8_BYTES (WF_CLIPRDR_MAX_FORMAT_NAME_WCHARS * 4u)
+
+static BOOL wf_cliprdr_bounded_strlen(const char *value, size_t max_len, size_t *len)
+{
+	size_t i;
+	if (!value || !len)
+		return FALSE;
+	for (i = 0; i <= max_len; i++)
+	{
+		if (value[i] == '\0')
+		{
+			*len = i;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
 
 /* Rust adapter keeps file contents in a bounded, connection-scoped stream. */
 extern UINT64 mdesk_clipboard_remote_generation(UINT32 connID);
@@ -1652,25 +1672,25 @@ static UINT32 get_remote_format_id(wfClipboard *clipboard, UINT32 local_format)
 	return local_format;
 }
 
-static void map_ensure_capacity(wfClipboard *clipboard)
+static BOOL map_ensure_capacity(wfClipboard *clipboard, size_t capacity)
 {
-	if (!clipboard)
-		return;
+	size_t old_size;
+	formatMapping *new_map;
+	if (!clipboard || !clipboard->format_mappings)
+		return FALSE;
+	if (capacity > WF_CLIPRDR_MAX_FORMATS || capacity > ((size_t)-1) / sizeof(formatMapping))
+		return FALSE;
+	if (capacity <= clipboard->map_capacity)
+		return TRUE;
 
-	if (clipboard->map_size >= clipboard->map_capacity)
-	{
-		size_t new_size;
-		formatMapping *new_map;
-		new_size = clipboard->map_capacity * 2;
-		new_map =
-			(formatMapping *)realloc(clipboard->format_mappings, sizeof(formatMapping) * new_size);
-
-		if (!new_map)
-			return;
-
-		clipboard->format_mappings = new_map;
-		clipboard->map_capacity = new_size;
-	}
+	old_size = clipboard->map_capacity;
+	new_map = (formatMapping *)realloc(clipboard->format_mappings, sizeof(formatMapping) * capacity);
+	if (!new_map)
+		return FALSE;
+	memset(new_map + old_size, 0, sizeof(formatMapping) * (capacity - old_size));
+	clipboard->format_mappings = new_map;
+	clipboard->map_capacity = capacity;
+	return TRUE;
 }
 
 static BOOL clear_format_map(wfClipboard *clipboard)
@@ -1695,6 +1715,13 @@ static BOOL clear_format_map(wfClipboard *clipboard)
 
 	clipboard->map_size = 0;
 	return TRUE;
+}
+
+static UINT wf_cliprdr_server_format_list_fail(wfClipboard *clipboard)
+{
+	clear_format_map(clipboard);
+	clipboard->copied = FALSE;
+	return ERROR_INTERNAL_ERROR;
 }
 
 static UINT cliprdr_send_tempdir(wfClipboard *clipboard)
@@ -2727,6 +2754,12 @@ static UINT wf_cliprdr_server_format_list(CliprdrClientContext *context,
 
 	if (!clear_format_map(clipboard))
 		return ERROR_INTERNAL_ERROR;
+	clipboard->copied = FALSE;
+	if (formatList->numFormats > WF_CLIPRDR_MAX_FORMATS ||
+		(formatList->numFormats > 0 && !formatList->formats))
+		return ERROR_INTERNAL_ERROR;
+	if (!map_ensure_capacity(clipboard, formatList->numFormats))
+		return ERROR_INTERNAL_ERROR;
 
 	clipboard->copied = TRUE;
 
@@ -2738,16 +2771,24 @@ static UINT wf_cliprdr_server_format_list(CliprdrClientContext *context,
 
 		if (format->formatName)
 		{
-			int size = MultiByteToWideChar(CP_UTF8, 0, format->formatName,
-										   strlen(format->formatName), NULL, 0);
-			mapping->name = calloc(size + 1, sizeof(WCHAR));
-
-			if (mapping->name)
-			{
-				MultiByteToWideChar(CP_UTF8, 0, format->formatName, strlen(format->formatName),
-									mapping->name, size);
-				mapping->local_format_id = RegisterClipboardFormatW((LPWSTR)mapping->name);
-			}
+			size_t name_len;
+			int size;
+			if (!wf_cliprdr_bounded_strlen(format->formatName,
+				WF_CLIPRDR_MAX_FORMAT_NAME_UTF8_BYTES, &name_len) || name_len == 0)
+				return wf_cliprdr_server_format_list_fail(clipboard);
+			size = MultiByteToWideChar(CP_UTF8, 0, format->formatName, (int)name_len, NULL, 0);
+			if (size <= 0 || (UINT)size > WF_CLIPRDR_MAX_FORMAT_NAME_WCHARS)
+				return wf_cliprdr_server_format_list_fail(clipboard);
+			mapping->name = calloc((size_t)size + 1, sizeof(WCHAR));
+			if (!mapping->name)
+				return wf_cliprdr_server_format_list_fail(clipboard);
+			if (MultiByteToWideChar(CP_UTF8, 0, format->formatName, (int)name_len,
+				mapping->name, size) != size)
+				return wf_cliprdr_server_format_list_fail(clipboard);
+			/* The remote ID is opaque; only the locally registered format must be valid. */
+			mapping->local_format_id = RegisterClipboardFormatW((LPWSTR)mapping->name);
+			if (mapping->local_format_id == 0)
+				return wf_cliprdr_server_format_list_fail(clipboard);
 		}
 		else
 		{
@@ -2756,7 +2797,6 @@ static UINT wf_cliprdr_server_format_list(CliprdrClientContext *context,
 		}
 
 		clipboard->map_size++;
-		map_ensure_capacity(clipboard);
 	}
 
 	if (file_transferring(clipboard))

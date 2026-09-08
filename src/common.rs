@@ -2537,6 +2537,17 @@ pub fn str2color(s: &str, alpha: u8) -> u32 {
     (alpha as u32) << 24 | rgb
 }
 
+// Peer IDs also reach the Windows shortcut script, so reject script delimiters.
+pub fn is_valid_untrusted_peer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 253
+        && !id.chars().any(|ch| {
+            ch.is_control()
+                || ch.is_whitespace()
+                || ['"', '<', '>', '/', '\\', '|', '?', '*'].contains(&ch)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2545,6 +2556,33 @@ mod tests {
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn untrusted_peer_id_validation() {
+        for id in [
+            "123456789",
+            "m\u{00fc}nchen-pc",
+            "192.168.1.10:21118",
+            "9123456234@public",
+        ] {
+            assert!(is_valid_untrusted_peer_id(id), "{id:?}");
+        }
+        for id in [
+            "",
+            "peer id",
+            "peer\nid",
+            "peer\r\nid",
+            "peer\0id",
+            "peer/id",
+            "peer\\id",
+            "peer?id",
+            "peer\"id",
+        ] {
+            assert!(!is_valid_untrusted_peer_id(id), "{id:?}");
+        }
+        assert!(is_valid_untrusted_peer_id(&"a".repeat(253)));
+        assert!(!is_valid_untrusted_peer_id(&"a".repeat(254)));
+    }
 
     #[inline]
     fn get_timestamp_secs() -> u128 {
