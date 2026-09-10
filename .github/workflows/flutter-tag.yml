@@ -89,6 +89,13 @@ jobs:
             Copy-Item 'target\release\deps\dylib_virtual_display.dll' $buildDir -Force
           }
 
+          $labelPath = 'libs\portable\src\res\label.png'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/rustdesk/rustdesk/12d3c59172846cc2890a714bc1d0ed9dd118b9e2/libs/portable/src/res/label.png' -OutFile $labelPath
+          $labelHash = (Get-FileHash $labelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($labelHash -ne 'fd359b0f3af18dc810d81aae036358c9b6c80b9d7a74612524c89c27ed5ce9b5') {
+            throw 'Portable loading label checksum mismatch'
+          }
+
           Push-Location libs\portable
           python .\generate.py -f "..\..\$buildDir" -o . -e "..\..\$buildDir\MDesk.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
