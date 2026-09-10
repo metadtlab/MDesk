@@ -1,5 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(target_os = "windows")]
+mod about;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use hbb_common::config::{self, Config};
 #[cfg(target_os = "windows")]
@@ -29,7 +32,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{COLORREF, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, GetStockObject, GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor,
@@ -45,16 +48,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::{
-    IsUserAnAdmin, Shell_NotifyIconW, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    IsUserAnAdmin, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, IsWindow,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IsWindow,
     LoadCursorW, LoadIconW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, IDC_ARROW, IDI_APPLICATION, IDYES,
+    RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow,
+    TrackPopupMenu, TranslateMessage, IDC_ARROW, IDI_APPLICATION, IDYES, MF_STRING, MSGFLT_ALLOW,
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
     MB_YESNO, MB_DEFBUTTON2, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD,
     WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 const DEFAULT_CERT_VERIFY_URL: &str = "https://admin.787.kr/api/certno/verify";
@@ -90,6 +97,14 @@ const INSTALLED_MDESK_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const INSTALLED_MDESK_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "windows")]
 const TRAY_ICON_ID: u32 = 1;
+#[cfg(target_os = "windows")]
+const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
+#[cfg(target_os = "windows")]
+const TRAY_INFORMATION_ID: usize = 100;
+#[cfg(target_os = "windows")]
+static TASKBAR_CREATED_MESSAGE: OnceLock<u32> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static TRAY_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 #[cfg(target_os = "windows")]
 const APP_ICON_RESOURCE_ID: usize = 1;
 #[cfg(target_os = "windows")]
@@ -412,6 +427,14 @@ impl Drop for SecureLogCleanup {
 }
 
 fn secure_process_exit(code: i32) -> ! {
+    #[cfg(target_os = "windows")]
+    {
+        // Remote-session completion exits directly instead of unwinding TrayIcon.
+        let hwnd = TRAY_WINDOW_HWND.swap(0, Ordering::AcqRel);
+        if hwnd != 0 {
+            remove_tray_icon(HWND(hwnd as *mut c_void));
+        }
+    }
     cleanup_mdeskmini_logs();
     std::process::exit(code)
 }
@@ -2063,6 +2086,9 @@ impl TrayIcon {
     fn spawn() -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<Option<usize>>();
         let ui_thread = thread::spawn(move || {
+            TASKBAR_CREATED_MESSAGE.get_or_init(|| unsafe {
+                RegisterWindowMessageW(PCWSTR(to_wide("TaskbarCreated").as_ptr()))
+            });
             let class_name = to_wide("MDeskMiniTrayClass");
             let title = to_wide("MDeskMini Tray");
             let wnd_class = WNDCLASSW {
@@ -2098,18 +2124,31 @@ impl TrayIcon {
                 }
             };
 
+            if let Some(&message) = TASKBAR_CREATED_MESSAGE.get().filter(|&&message| message != 0) {
+                // Mini is elevated; allow only Explorer's icon-recreation broadcast.
+                unsafe {
+                    let _ = ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, None);
+                }
+            }
             if !add_tray_icon(hwnd) {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
                 let _ = tx.send(None);
                 return;
             }
+            TRAY_WINDOW_HWND.store(hwnd.0 as isize, Ordering::Release);
 
             let _ = tx.send(Some(hwnd.0 as usize));
 
             let mut msg = MSG::default();
             loop {
                 let has_message = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-                if has_message.0 == 0 {
+                if has_message.0 <= 0 {
                     break;
+                }
+                if about::handle_dialog_message(hwnd, &msg) {
+                    continue;
                 }
                 unsafe {
                     let _ = TranslateMessage(&msg);
@@ -2151,11 +2190,12 @@ fn add_tray_icon(hwnd: HWND) -> bool {
     data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
     data.uID = TRAY_ICON_ID;
-    data.uFlags = NIF_ICON | NIF_TIP;
+    data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
     data.hIcon = icon;
     // NOTIFYICONDATAW is packed on 32-bit Windows, so do not borrow szTip in place.
     let mut tip = data.szTip;
-    copy_wide_truncated(&mut tip, "MDeskMini");
+    copy_wide_truncated(&mut tip, "MDeskMini - 정보 / 오픈소스 라이선스");
     data.szTip = tip;
 
     unsafe { Shell_NotifyIconW(NIM_ADD, &data).as_bool() }
@@ -2202,8 +2242,23 @@ extern "system" fn tray_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Explorer recreates its notification area after a restart.
+    if msg != 0 && TASKBAR_CREATED_MESSAGE.get() == Some(&msg) {
+        let _ = add_tray_icon(hwnd);
+        return LRESULT(0);
+    }
     match msg {
+        TRAY_CALLBACK_MESSAGE if wparam.0 == TRAY_ICON_ID as usize => {
+            match lparam.0 as u32 {
+                WM_RBUTTONUP | WM_CONTEXTMENU => show_tray_menu(hwnd),
+                WM_LBUTTONDBLCLK => show_tray_information(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            about::close(hwnd);
+            TRAY_WINDOW_HWND.store(0, Ordering::Release);
             remove_tray_icon(hwnd);
             unsafe {
                 PostQuitMessage(0);
@@ -2211,6 +2266,45 @@ extern "system" fn tray_window_proc(
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_tray_menu(hwnd: HWND) {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let label = to_wide("정보(&I)");
+        let mut point = POINT::default();
+        if AppendMenuW(menu, MF_STRING, TRAY_INFORMATION_ID, PCWSTR(label.as_ptr())).is_ok()
+            && GetCursorPos(&mut point).is_ok()
+        {
+            let _ = SetForegroundWindow(hwnd);
+            let command = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                None,
+                hwnd,
+                None,
+            );
+            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = DestroyMenu(menu);
+            if command.0 == TRAY_INFORMATION_ID as i32 {
+                show_tray_information(hwnd);
+            }
+        } else {
+            let _ = DestroyMenu(menu);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_tray_information(hwnd: HWND) {
+    if let Err(err) = about::show(hwnd) {
+        diagnostic_event("tray.about.error", &err.to_string());
     }
 }
 
@@ -2874,6 +2968,37 @@ fn to_wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tray_information_lifecycle() {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_USERDATA};
+
+        let tray = TrayIcon::spawn().expect("interactive Windows notification area required");
+        let owner = tray.hwnd;
+        let open = || unsafe {
+            SendMessageW(
+                owner,
+                TRAY_CALLBACK_MESSAGE,
+                Some(WPARAM(TRAY_ICON_ID as usize)),
+                Some(LPARAM(WM_LBUTTONDBLCLK as isize)),
+            );
+            HWND(GetWindowLongPtrW(owner, GWLP_USERDATA) as *mut c_void)
+        };
+        let first = open();
+        assert!(unsafe { IsWindow(Some(first)).as_bool() });
+        assert_eq!(open(), first);
+        unsafe {
+            SendMessageW(first, WM_CLOSE, None, None);
+        }
+        assert!(unsafe { IsWindow(Some(owner)).as_bool() });
+        let reopened = open();
+        assert!(unsafe { IsWindow(Some(reopened)).as_bool() });
+        tray.close();
+        assert!(!unsafe { IsWindow(Some(owner)).as_bool() });
+        assert!(!unsafe { IsWindow(Some(reopened)).as_bool() });
+        assert_eq!(TRAY_WINDOW_HWND.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn certificate_bootstrap_fails_closed() {
         assert!(super::require_certificate::<()>(Ok(None)).is_err());

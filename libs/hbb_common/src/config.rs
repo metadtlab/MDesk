@@ -3114,7 +3114,7 @@ pub fn apply_product_default_settings() {
         .write()
         .unwrap()
         .entry(keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING.to_string())
-        .or_insert_with(|| "Y".to_string());
+        .or_insert_with(|| "N".to_string());
     DEFAULT_LOCAL_SETTINGS
         .write()
         .unwrap()

@@ -1,0 +1,59 @@
+MDesk / MDeskMini - Source and License Release Checklist
+Prepared: 2026-09-08
+
+Status: NOT a completed release certification.
+Complete this checklist separately for each distributed build.
+
+[ ] Record product, version/build number, architecture, build date and source
+    commit, plus all source changes not contained in that commit.
+[ ] Identify all required source, interface definitions, build/install scripts,
+    custom resources and dependency modifications used by the build.
+[ ] Export changes used only in Cargo/vcpkg/other local caches. Confirm whether
+    Git submodule contents must be included; git archive alone omits them.
+[ ] Review whether any missing materials are genuinely System Libraries or
+    unmodified general-purpose tools exempt from Corresponding Source.
+[ ] Build from the documented source in a clean environment, then record the
+    final executable SHA-256 and corresponding source archive SHA-256.
+    Byte-for-byte reproducibility is useful but not claimed as a blanket
+    requirement of AGPLv3.
+[ ] Keep LICENCE unchanged. Include NOTICE.txt, MODIFICATIONS.txt and an updated
+    SOURCE_CODE.txt with the actual release source link.
+[ ] Preserve applicable third-party license texts, notices and required source.
+[ ] Publish the version-specific source download beside the binary download.
+    Do not publish private keys, passwords, tokens or customer data.
+[ ] Make the legal notices and source offer accessible to the relevant users,
+    including remote users. Review Mini as well as the main desktop application.
+[ ] Check that commercial terms do not restrict the recipients' AGPL rights.
+[ ] Test the exact package that users receive, not just the developer folder.
+    A sidecar placed beside an EXE is not inserted into that EXE or installer.
+[ ] Recheck downloads and recorded hashes after code signing or repackaging.
+
+Release record to complete:
+  Product / architecture:
+  Version / build number:
+  Source commit and additional source changes:
+  Build environment and commands:
+  Final executable name / SHA-256:
+  Corresponding Source archive URL / SHA-256:
+  Required dependency-source locations and local patches:
+  Public license/source notice location:
+  Reviewer / date:
+
+CURRENT RELEASE LIMITATIONS
+
+- New Mini builds have a tray Information window with embedded AGPL text and
+  repository links. Verify it in the shipped executable and review source-offer
+  accessibility for all relevant users, including remote users.
+- New desktop builds display native version/build metadata and open the bundled
+  AGPL text offline. Static toolchain versions and unverified source-completeness
+  claims were removed. The Flutter component-license view is not a full native
+  dependency inventory.
+- Flutter bundles the AGPL text as an asset; scripts do not automatically copy
+  all standalone notice files. Manual sidecars can be removed by the next clean
+  or replaced build directory.
+- Existing EXEs have not been certified against the reference snapshot.
+  Existing installers have not been repacked to include these files.
+- A reference source ZIP and a notice ZIP do not by themselves establish full
+  AGPL compliance or finish a third-party license review.
+
+Reference: https://github.com/rustdesk/rustdesk/blob/master/LICENCE

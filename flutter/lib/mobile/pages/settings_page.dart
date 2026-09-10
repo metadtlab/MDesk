@@ -81,7 +81,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _enableHardwareCodec = false;
   var _allowWebSocket = false;
   var _autoRecordIncomingSession = false;
-  var _autoRecordOutgoingSession = false;
   var _allowAutoDisconnect = false;
   var _localIP = "";
   var _directAccessPort = "";
@@ -118,8 +117,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     _disableUdp = bind.mainGetOptionSync(key: kOptionDisableUdp) == 'Y';
     _autoRecordIncomingSession = option2bool(kOptionAllowAutoRecordIncoming,
         bind.mainGetOptionSync(key: kOptionAllowAutoRecordIncoming));
-    _autoRecordOutgoingSession = option2bool(kOptionAllowAutoRecordOutgoing,
-        bind.mainGetLocalOption(key: kOptionAllowAutoRecordOutgoing));
     _localIP = bind.mainGetOptionSync(key: 'local-ip-addr');
     _directAccessPort = bind.mainGetOptionSync(key: kOptionDirectAccessPort);
     _allowAutoDisconnect = option2bool(kOptionAllowAutoDisconnect,
@@ -829,27 +826,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                                   key: kOptionAllowAutoRecordIncoming));
                           setState(() {
                             _autoRecordIncomingSession = newValue;
-                          });
-                        },
-                ),
-              if (!incomingOnly)
-                SettingsTile.switchTile(
-                  title:
-                      Text(translate('Automatically record outgoing sessions')),
-                  initialValue: _autoRecordOutgoingSession,
-                  onToggle: isOptionFixed(kOptionAllowAutoRecordOutgoing)
-                      ? null
-                      : (v) async {
-                          await bind.mainSetLocalOption(
-                              key: kOptionAllowAutoRecordOutgoing,
-                              value: bool2option(
-                                  kOptionAllowAutoRecordOutgoing, v));
-                          final newValue = option2bool(
-                              kOptionAllowAutoRecordOutgoing,
-                              bind.mainGetLocalOption(
-                                  key: kOptionAllowAutoRecordOutgoing));
-                          setState(() {
-                            _autoRecordOutgoingSession = newValue;
                           });
                         },
                 ),

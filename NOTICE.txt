@@ -1,0 +1,36 @@
+MDesk / MDeskMini - Open Source Notice
+Notice prepared: 2026-09-08
+
+MDesk and MDeskMini are modified versions of, or incorporate code from,
+RustDesk. They are not unmodified upstream RustDesk releases.
+
+Copyright (c) 2025 MetaDataLab.
+Portions Copyright (c) Purslane Ltd.
+Other contributors retain their respective copyrights and notices.
+
+Upstream project: https://github.com/rustdesk/rustdesk
+MDesk project: https://github.com/metadtlab/MDesk
+Modification information: MODIFICATIONS.txt
+
+The RustDesk-derived work is distributed under the GNU Affero General
+Public License, version 3 (AGPLv3). You may use, copy, modify and redistribute
+the covered work in accordance with that license. This notice does not
+remove existing permissions, notices or applicable additional terms.
+
+The program is provided WITHOUT ANY WARRANTY, including the implied
+warranties of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE,
+except to the extent a warranty is separately provided or required by law.
+See the accompanying LICENCE file for the complete license and its terms.
+
+Source information and its current verification status: SOURCE_CODE.txt
+The source is available without an additional source-access charge.
+Availability of a repository alone does not establish that every distributed
+binary has complete, matching Corresponding Source.
+
+Third-party components retain their own license terms. Keep their notices
+and any required source materials with distributions. Flutter dependency
+NOTICES are not a substitute for this program's AGPL text. This notice is
+not a complete third-party license inventory.
+
+Do not apply additional blanket prohibitions on modification or redistribution
+that would conflict with the rights granted for the AGPL-covered work.

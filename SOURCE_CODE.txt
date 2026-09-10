@@ -1,0 +1,46 @@
+MDesk / MDeskMini - Source Code Information
+Prepared: 2026-09-08
+
+Public source repository (no repository login is required):
+https://github.com/metadtlab/MDesk
+
+Reference source snapshot reviewed on 2026-09-08:
+2b8b3d689d9aad2c87d5112ae5ba6c79fd834674
+
+Browse that snapshot:
+https://github.com/metadtlab/MDesk/tree/2b8b3d689d9aad2c87d5112ae5ba6c79fd834674
+
+Download that snapshot:
+https://github.com/metadtlab/MDesk/archive/2b8b3d689d9aad2c87d5112ae5ba6c79fd834674.zip
+
+Build and run instructions are in README.md. License terms are in LICENCE.
+Project issue contact: https://github.com/metadtlab/MDesk/issues
+Use the issue tracker for source availability problems, not credentials,
+customer information or private support data.
+
+IMPORTANT: This is a reference source snapshot, not a certification that
+it is the complete Corresponding Source of an existing executable.
+The current local EXEs have not been rebuilt from this exact snapshot in
+a clean environment or matched to a verified release source manifest.
+The snapshot does not automatically include Git submodule contents, private
+build inputs or modifications made only in local dependency caches.
+
+BEFORE DISTRIBUTING A BINARY
+
+The distributor must identify its actual source revision and any additional
+source changes, include the required build/install scripts and dependency
+modifications, and replace or supplement the reference above with the exact
+release source download. Keep that source available as required by the license.
+Record the binary and source archive hashes using RELEASE_CHECKLIST.txt.
+Do not present an incomplete snapshot as complete Corresponding Source.
+
+For network downloads, place a clear, version-specific source download link
+next to the binary download, without an additional source-access charge.
+Modified network-interactive versions must prominently offer the relevant
+source to their remote users as required by AGPLv3 section 13. A file in the
+download directory alone does not establish that the program satisfies
+its interactive notice and source-offer requirements.
+
+This file is a source-location notice, not the three-year physical-product
+written offer described in AGPLv3 section 6(b). Do not use it as a substitute
+for that offer if that particular distribution method is being relied upon.

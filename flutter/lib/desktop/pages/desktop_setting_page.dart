@@ -5,7 +5,6 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/hbbs/hbbs.dart';
@@ -15,6 +14,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
+import 'package:flutter_hbb/desktop/widgets/mdesk_about.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
@@ -727,7 +727,7 @@ class _GeneralState extends State<_General> {
         if (!bind.isOutgoingOnly())
           _OptionCheckBox(context, 'Automatically record incoming sessions',
               kOptionAllowAutoRecordIncoming),
-        if (!bind.isIncomingOnly())
+        if ((isWindows || isMacOS) && !bind.isIncomingOnly())
           _OptionCheckBox(context, 'Automatically record outgoing sessions',
               kOptionAllowAutoRecordOutgoing,
               isServer: false),
@@ -3191,160 +3191,67 @@ class _About extends StatefulWidget {
 }
 
 class _AboutState extends State<_About> {
+  final _scrollController = ScrollController();
+  late Future<Map<String, String>> _metadata = _loadMetadata();
+
+  Future<Map<String, String>> _loadMetadata() async {
+    return {
+      'version': await bind.mainGetVersion(),
+      'buildDate': await bind.mainGetBuildDate(),
+      'fingerprint': isWeb ? '' : await bind.mainGetFingerprint(),
+    };
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return futureBuilder(future: () async {
-      final license = await bind.mainGetLicense();
-      final version = await bind.mainGetVersion();
-      final buildDate = await bind.mainGetBuildDate();
-      final fingerprint = await bind.mainGetFingerprint();
-      return {
-        'license': license,
-        'version': version,
-        'buildDate': buildDate,
-        'fingerprint': fingerprint
-      };
-    }(), hasData: (data) {
-      final license = data['license'].toString();
-      final version = data['version'].toString();
-      final buildDate = data['buildDate'].toString();
-      final fingerprint = data['fingerprint'].toString();
-      const linkStyle = TextStyle(decoration: TextDecoration.underline);
-      final scrollController = ScrollController();
-      return SingleChildScrollView(
-        controller: scrollController,
-        child: _Card(title: 'MDesk 정보', children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(
-                height: 8.0,
-              ),
-              SelectionArea(
-                  child: const Text('MDesk Version 1.4.0')
-                      .marginSymmetric(vertical: 4.0)),
-              SelectionArea(
-                  child: Text('${translate('Build Date')}: $buildDate')
-                      .marginSymmetric(vertical: 4.0)),
-              if (!isWeb)
-                SelectionArea(
-                    child: Text('${translate('Fingerprint')}: $fingerprint')
-                        .marginSymmetric(vertical: 4.0)),
-              InkWell(
-                  onTap: () {
-                    launchUrlString('https://www.mdesk.co.kr/#privacy-policy');
-                  },
-                  child: Text(
-                    translate('Privacy Statement'),
-                    style: linkStyle,
-                  ).marginSymmetric(vertical: 4.0)),
-              InkWell(
-                  onTap: () {
-                    launchUrlString(
-                        'https://www.mdesk.co.kr/#open-source-license');
-                  },
-                  child: Text(
-                    '오픈소스 라이센스 약관',
-                    style: linkStyle,
-                  ).marginSymmetric(vertical: 4.0)),
-              Container(
-                decoration: const BoxDecoration(color: Color(0xFF2c8cff)),
-                padding:
-                    const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
-                child: SelectionArea(
-                    child: Row(
+    return FutureBuilder<Map<String, String>>(
+      future: _metadata,
+      builder: (context, snapshot) {
+        final data = snapshot.data ?? const <String, String>{};
+        return Scrollbar(
+          controller: _scrollController,
+          child: SingleChildScrollView(
+            controller: _scrollController,
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+            child: Align(
+              alignment: Alignment.topLeft,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 640),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Copyright © 2025 MetaDataLab.\nPortions Copyright © Purslane Ltd.',
-                            style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 16),
-                          const Text(
-                            'Open Source Notice',
-                            style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 14),
-                          ),
-                          const SizedBox(height: 8),
-                          Builder(
-                            builder: (context) {
-                              final mdeskRecognizer = TapGestureRecognizer()
-                                ..onTap = () {
-                                  launchUrlString(
-                                    'https://github.com/metadtlab/MDesk',
-                                    mode: LaunchMode.externalApplication,
-                                  );
-                                };
-                              final apiServerRecognizer = TapGestureRecognizer()
-                                ..onTap = () {
-                                  launchUrlString(
-                                    'https://github.com/metadtlab/MDeskAPIServer',
-                                    mode: LaunchMode.externalApplication,
-                                  );
-                                };
-                              final textSpans = <TextSpan>[
-                                const TextSpan(
-                                  text:
-                                      'This software is based on RustDesk and is licensed under\nthe GNU Affero General Public License v3.0 (AGPL-3.0).\n\nIn accordance with AGPL-3.0, the complete corresponding\nsource code for this version is available at:\n',
-                                ),
-                                TextSpan(
-                                  text: 'https://github.com/metadtlab/MDesk',
-                                  style: const TextStyle(
-                                    color: Color(0xFF4A9EFF),
-                                    decoration: TextDecoration.underline,
-                                  ),
-                                  recognizer: mdeskRecognizer,
-                                ),
-                                const TextSpan(
-                                    text: '\n\nAPI Server source code:\n'),
-                                TextSpan(
-                                  text:
-                                      'https://github.com/metadtlab/MDeskAPIServer',
-                                  style: const TextStyle(
-                                    color: Color(0xFF4A9EFF),
-                                    decoration: TextDecoration.underline,
-                                  ),
-                                  recognizer: apiServerRecognizer,
-                                ),
-                                const TextSpan(
-                                  text:
-                                      '\n\nBuild Environment:\nCore: Rust 1.75.0\nUI: Flutter 3.16.0 / Dart 3.2.0',
-                                ),
-                              ];
-                              return RichText(
-                                text: TextSpan(
-                                  style: const TextStyle(
-                                      color: Colors.white, fontSize: 13),
-                                  children: textSpans,
-                                ),
-                              );
-                            },
-                          ),
-                          const SizedBox(height: 16),
-                          const Text(
-                            'Powered by RustDesk',
-                            style: TextStyle(
-                                fontWeight: FontWeight.w800,
-                                color: Colors.white),
-                          )
-                        ],
-                      ),
+                    if (snapshot.connectionState != ConnectionState.done)
+                      const LinearProgressIndicator(),
+                    if (snapshot.hasError)
+                      Row(children: [
+                        const Expanded(child: Text('버전 정보를 불러오지 못했습니다.')),
+                        IconButton(
+                          tooltip: '다시 시도',
+                          onPressed: () => setState(() {
+                            _metadata = _loadMetadata();
+                          }),
+                          icon: const Icon(Icons.refresh),
+                        ),
+                      ]),
+                    MDeskAbout(
+                      version: data['version'] ?? '',
+                      buildDate: data['buildDate'] ?? '',
+                      fingerprint: isWeb ? null : data['fingerprint'] ?? '',
                     ),
                   ],
-                )),
-              ).marginSymmetric(vertical: 4.0)
-            ],
-          ).marginOnly(left: _kContentHMargin)
-        ]),
-      );
-    });
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
   }
 }
 

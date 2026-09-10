@@ -1,0 +1,36 @@
+MDesk / MDeskMini - Modification Notice
+Record date: 2026-09-08
+Modification project: MetaDataLab / MDesk
+Upstream: https://github.com/rustdesk/rustdesk
+Reference revision: 2b8b3d689d9aad2c87d5112ae5ba6c79fd834674
+
+This is a modified RustDesk-based project, not an upstream RustDesk release.
+The following is a summary, not a complete per-file change history:
+
+- MDesk branding and a Flutter desktop remote-support workflow.
+- Custom remote support with certificate-number generation, readiness
+  reporting, device management and reconnection integration.
+- A separate MDeskMini Windows host application and x86/x64 build workflows.
+- Changes to session approval, certificate bootstrap and related security
+  checks, IPC authorization and file-transfer handling.
+- Windows native dependency initialization and portable packaging changes.
+
+Changes specifically reviewed on 2026-09-08 include Mini default automatic
+approval after certificate bootstrap, default password approval for unset
+MDesk host settings, and custom remote UI/layout adjustments.
+These descriptions do not constitute a security or compatibility guarantee.
+
+Original copyright and license notices continue to apply. New documentation
+and notices prepared on 2026-09-08 do not change the application source or
+relicense third-party components. The precise upstream base revision and
+complete third-party modification inventory still require release review.
+
+Follow-up on 2026-09-08: MDeskMini's existing runtime tray icon gains an
+Information menu and a modeless version/license/source window. The AGPL text
+is embedded for offline reading. Remote and authentication logic is unchanged.
+
+Follow-up on 2026-09-09: The main desktop About screen uses runtime version and
+build metadata instead of hard-coded values. Theme-aware notices replace the
+blue text panel. Offline AGPL text, registered Flutter component notices and
+explicit source links are available. The API repository is identified as a
+related project, not a replacement for the client's Corresponding Source.
