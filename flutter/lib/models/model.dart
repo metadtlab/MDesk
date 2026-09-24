@@ -1822,6 +1822,7 @@ class VirtualMouseMode with ChangeNotifier {
 
 class ImageModel with ChangeNotifier {
   ui.Image? _image;
+  int? displayIndex;
 
   ui.Image? get image => _image;
 
@@ -1887,6 +1888,7 @@ class ImageModel with ChangeNotifier {
           : ui.PixelFormat.bgra8888,
     );
     if (parent.target?.id != pid) return;
+    displayIndex = display;
     await update(image);
   }
 

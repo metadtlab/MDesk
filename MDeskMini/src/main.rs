@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "windows")]
 mod about;
+#[cfg(target_os = "windows")]
+mod self_cleanup;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use hbb_common::config::{self, Config};
@@ -2625,6 +2627,14 @@ fn monitor_pending_connections(
         diagnostic_event("connection.monitor.begin", "connection monitor loop active");
         let mut prompted: HashSet<i32> = HashSet::new();
         let mut had_remote_session = false;
+        let mut had_authorized_session = false;
+        let mut cleanup_ticket = match self_cleanup::CleanupTicket::capture() {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                diagnostic_event("cleanup.unavailable", &error.to_string());
+                None
+            }
+        };
         let mut idle_ticks_after_disconnect = 0u32;
         let mut last_status_title = String::new();
         let mut last_status_body = String::new();
@@ -2747,6 +2757,7 @@ fn monitor_pending_connections(
 
             if active_remote_sessions > 0 {
                 had_remote_session = true;
+                had_authorized_session = true;
                 idle_ticks_after_disconnect = 0;
             } else if has_pending_connection {
                 idle_ticks_after_disconnect = 0;
@@ -2760,6 +2771,17 @@ fn monitor_pending_connections(
                     );
                     platform::unregister_explorer_send_to_controller_menu();
                     common::global_clean();
+                    if had_authorized_session {
+                        if let Some(ticket) = cleanup_ticket.take() {
+                            match ticket.schedule() {
+                                Ok(()) => diagnostic_event(
+                                    "cleanup.scheduled",
+                                    "Downloads Mini cleanup after process exit",
+                                ),
+                                Err(error) => diagnostic_event("cleanup.failed", &error.to_string()),
+                            }
+                        }
+                    }
                     secure_process_exit(0);
                 }
             }

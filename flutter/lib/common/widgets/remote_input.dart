@@ -14,12 +14,16 @@ import 'package:flutter_hbb/models/input_model.dart';
 import './gestures.dart';
 
 class RawKeyFocusScope extends StatelessWidget {
+  final bool autofocus;
+  final bool canRequestFocus;
   final FocusNode? focusNode;
   final ValueChanged<bool>? onFocusChange;
   final InputModel inputModel;
   final Widget child;
 
   RawKeyFocusScope({
+    this.autofocus = true,
+    this.canRequestFocus = true,
     this.focusNode,
     this.onFocusChange,
     required this.inputModel,
@@ -33,10 +37,10 @@ class RawKeyFocusScope extends StatelessWidget {
     // FIXME: On Windows, `AltGr` will generate `Alt` and `Control` key events,
     // while `Alt` and `Control` are seperated key events for en-US input method.
     return FocusScope(
-        autofocus: true,
+        autofocus: autofocus,
         child: Focus(
-            autofocus: true,
-            canRequestFocus: true,
+            autofocus: autofocus,
+            canRequestFocus: canRequestFocus,
             focusNode: focusNode,
             onFocusChange: onFocusChange,
             onKey: useRawKeyEvents

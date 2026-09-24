@@ -1709,6 +1709,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     if !self.diagnostic_first_received {
                         self.diagnostic_first_received = true;
                         crate::connection_diagnostics::event("controller", &self.handler.lc.read().unwrap().session_id.to_string(), "video.first_received", &[]);
+                        if self.handler.is_view_camera() {
+                            crate::camera_diagnostics::checkpoint(self.handler.lc.read().unwrap().session_id, "video.first_received", format_args!(""));
+                        }
                     }
                     if !self.first_frame {
                         self.first_frame = true;
@@ -1758,6 +1761,9 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(login_response::Union::PeerInfo(pi)) => {
+                        if self.handler.is_view_camera() {
+                            crate::camera_diagnostics::checkpoint(self.handler.lc.read().unwrap().session_id, "login.accepted", format_args!("cameras={}", pi.displays.len()));
+                        }
                         crate::connection_diagnostics::event("controller", &self.handler.lc.read().unwrap().session_id.to_string(), "login.accepted", &[]);
                         if self.recording_source_connection_id.is_empty()
                             || self.recording_connection_ticket.is_empty()

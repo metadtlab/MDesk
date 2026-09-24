@@ -539,6 +539,22 @@ pub async fn start_server(_is_server: bool) {
     crate::RendezvousMediator::start_all().await;
 }
 
+#[cfg(windows)]
+fn should_start_embedded_server(
+    no_server: bool,
+    service_running: bool,
+    ipc_error: &hbb_common::anyhow::Error,
+) -> bool {
+    // An inaccessible or untrusted pipe is not a missing server. Starting an
+    // embedded server in that case collides with the service's listener and
+    // the IPC failure path terminates the entire GUI process.
+    !no_server
+        && !service_running
+        && ipc_error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Start the host server that allows the remote peer to control the current machine.
 ///
 /// # Arguments
@@ -613,16 +629,55 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                 crate::ipc::client_get_hwcodec_config_thread(0);
             }
             Err(err) => {
-                log::info!("server not started: {err:?}, no_server: {no_server}");
-                if no_server {
+                #[cfg(windows)]
+                let service_running = crate::platform::is_self_service_running();
+                #[cfg(windows)]
+                let start_embedded =
+                    should_start_embedded_server(no_server, service_running, &err);
+                #[cfg(not(windows))]
+                let start_embedded = !no_server;
+                log::warn!(
+                    "Server IPC connection failed: {err:#}; no_server={no_server}, start_embedded={start_embedded}"
+                );
+                if !start_embedded {
                     hbb_common::sleep(1.0).await;
-                    std::thread::spawn(|| start_server(false, true));
+                    std::thread::spawn(move || start_server(false, no_server));
                 } else {
                     log::info!("try start server");
                     std::thread::spawn(|| start_server(true, false));
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod startup_tests {
+    use super::should_start_embedded_server;
+    use hbb_common::anyhow::anyhow;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn ordinary_gui_does_not_take_over_an_inaccessible_service_pipe() {
+        // Access denied and identity-check failures must leave the GUI alive,
+        // including while the service manager is between state transitions.
+        let denied = anyhow!(Error::from_raw_os_error(5)).context("connect service pipe");
+        let untrusted = anyhow!("Untrusted IPC server on channel");
+        let busy = anyhow!(Error::from_raw_os_error(231));
+        for error in [denied, untrusted, busy] {
+            for service_running in [false, true] {
+                assert!(!should_start_embedded_server(false, service_running, &error));
+            }
+        }
+    }
+
+    #[test]
+    fn service_startup_gap_does_not_start_a_competing_server() {
+        let missing = anyhow!(Error::from(ErrorKind::NotFound));
+        assert!(!should_start_embedded_server(false, true, &missing));
+        assert!(!should_start_embedded_server(true, false, &missing));
+        // Portable operation still hosts locally when there is no service/pipe.
+        assert!(should_start_embedded_server(false, false, &missing));
     }
 }
 

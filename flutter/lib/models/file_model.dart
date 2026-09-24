@@ -48,6 +48,7 @@ typedef GetSessionID = SessionID Function();
 typedef GetDialogManager = OverlayDialogManager? Function();
 
 const String kRemoteDropDownloadsPrefix = 'mdesk-drop-downloads:';
+const String kDeviceRemoteTarget = 'mdesk-device-remote:DeviceRemote.exe';
 
 String remoteDropDownloadsPath(Iterable<String> components) {
   return kRemoteDropDownloadsPrefix +
@@ -108,6 +109,32 @@ class FileModel {
       items.add(entry);
     }
     await localController.sendFilesToRemoteDownloads(items);
+  }
+
+  Future<void> sendDeviceRemote(Entry entry) async {
+    if (!entry.isFile || entry.name != 'DeviceRemote.exe') {
+      throw StateError('DeviceRemote.exe 파일만 실행할 수 있습니다.');
+    }
+    await ensureTransferEventLoopReady();
+    if (jobController.jobTable
+        .any((job) => job.isDeviceRemote && job.state == JobState.inProgress)) {
+      throw StateError('디바이스 원격 실행을 준비 중입니다. 잠시 기다려주세요.');
+    }
+    final id = jobController.addTransferJob(entry, false, isDeviceRemote: true);
+    try {
+      await bind.sessionSendFiles(
+          sessionId: sessionId,
+          actId: id,
+          path: entry.path,
+          to: kDeviceRemoteTarget,
+          fileNum: 0,
+          includeHidden: false,
+          isRemote: false,
+          isDir: false);
+    } catch (_) {
+      jobController.jobTable.removeWhere((job) => job.id == id);
+      rethrow;
+    }
   }
 
   Future<void> onReady() async {
@@ -1053,7 +1080,7 @@ class JobController {
 
   // return jobID
   int addTransferJob(Entry from, bool isRemoteToLocal,
-      {bool isRemoteDropDownload = false}) {
+      {bool isRemoteDropDownload = false, bool isDeviceRemote = false}) {
     final jobID = JobController.jobID.next();
     jobTable.add(JobProgress()
       ..type = JobType.transfer
@@ -1063,6 +1090,7 @@ class JobController {
       ..state = JobState.inProgress
       ..id = jobID
       ..isRemoteToLocal = isRemoteToLocal
+      ..isDeviceRemote = isDeviceRemote
       ..isRemoteDropDownload = isRemoteDropDownload);
     return jobID;
   }
@@ -1189,6 +1217,9 @@ class JobController {
       job.state = JobState.error;
       job.err = err;
       job.recvJobRes = true;
+      if (job.isDeviceRemote) {
+        showToast('디바이스 원격 실행 실패: $err');
+      }
       if (job.type == JobType.transfer) {
         int? fileNum = int.tryParse(evt['file_num']);
         if (fileNum != null) job.fileNum = fileNum;
@@ -1651,6 +1682,7 @@ class JobProgress {
   var showHidden = false;
   var err = "";
   var isRemoteDropDownload = false;
+  var isDeviceRemote = false;
   var isDirectDownload = false;
   int lastTransferredSize = 0;
 
@@ -1669,6 +1701,7 @@ class JobProgress {
     to = "";
     err = "";
     isRemoteDropDownload = false;
+    isDeviceRemote = false;
     isDirectDownload = false;
   }
 

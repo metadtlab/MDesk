@@ -421,6 +421,7 @@ pub struct Connection {
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
     file_transferred: bool,
+    device_remote_jobs: HashSet<i32>,
     // 드래그앤드롭으로 받은(client→host) 파일 transfer가 발생한 마지막 시점.
     // 직후 일정 시간 동안 호스트→클라이언트 방향 cliprdr file 메시지 송신을 잠시 미뤄
     // connection drop을 방지한다.
@@ -610,6 +611,7 @@ impl Connection {
             session_last_recv_time: None,
             chat_unanswered: false,
             file_transferred: false,
+            device_remote_jobs: HashSet::new(),
             #[cfg(target_os = "windows")]
             last_remote_drop_recv_at: None,
             #[cfg(windows)]
@@ -1116,6 +1118,9 @@ impl Connection {
                     }
                     if diagnostic_sending_first {
                         crate::connection_diagnostics::event("host", &conn.lr.session_id.to_string(), "video.first_sent", &[]);
+                        if conn.view_camera {
+                            crate::camera_diagnostics::checkpoint(conn.lr.session_id, "video.first_sent", format_args!(""));
+                        }
                     }
                 },
                 Some((instant, value)) = rx.recv() => {
@@ -2052,6 +2057,7 @@ impl Connection {
         let Some((job_id, status)) = Self::enterprise_file_terminal_outcome(bytes) else {
             return;
         };
+        self.device_remote_jobs.remove(&job_id);
         if self
             .pending_file_audits
             .get(&job_id)
@@ -2507,6 +2513,9 @@ impl Connection {
             return;
         }
         self.authorized = true;
+        if self.view_camera {
+            crate::camera_diagnostics::checkpoint(self.lr.session_id, "login.authorized", format_args!("connection={}", self.inner.id()));
+        }
         crate::connection_diagnostics::event("host", &self.lr.session_id.to_string(), "login.authorized", &[("peer", &self.lr.my_id)]);
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
@@ -2613,6 +2622,9 @@ impl Connection {
         }
         #[cfg(target_os = "windows")]
         {
+            platform_additions.insert("log_analysis_v1".into(), json!(true));
+            platform_additions.insert("log_analysis_events_v1".into(), json!(true));
+            platform_additions.insert("device_remote_launch_v1".into(), json!(true));
             platform_additions.insert(
                 "is_installed".into(),
                 json!(crate::platform::is_installed()),
@@ -2732,6 +2744,7 @@ impl Connection {
         if self.file_transfer.is_some() || self.terminal {
             res.set_peer_info(pi);
         } else if self.view_camera {
+            crate::camera_diagnostics::checkpoint(self.lr.session_id, "peer_info.begin", format_args!(""));
             let supported_encoding = scrap::codec::Encoder::supported_encoding();
             self.last_supported_encoding = Some(supported_encoding.clone());
             log::info!("peer info supported_encoding: {:?}", supported_encoding);
@@ -2752,6 +2765,7 @@ impl Connection {
                 })
                 .into();
             }
+            crate::camera_diagnostics::checkpoint(self.lr.session_id, "peer_info.ready", format_args!("cameras={}", pi.displays.len()));
             res.set_peer_info(pi);
             self.update_codec_on_login();
         } else {
@@ -2808,6 +2822,9 @@ impl Connection {
         msg_out.set_login_response(res);
         self.send(msg_out).await;
         self.update_scoped_login_options().await;
+        if self.view_camera {
+            crate::camera_diagnostics::checkpoint(self.lr.session_id, "login.response.queued", format_args!(""));
+        }
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
             let dir = if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
@@ -3155,6 +3172,10 @@ impl Connection {
     }
 
     async fn send_login_error<T: std::string::ToString>(&mut self, err: T) {
+        if self.view_camera || matches!(self.lr.union, Some(login_request::Union::ViewCamera(_))) {
+            crate::camera_diagnostics::checkpoint(self.lr.session_id, "login.rejected", format_args!(
+                "reason={}", crate::camera_diagnostics::login_error_reason(&err.to_string())));
+        }
         crate::connection_diagnostics::event("host", &self.lr.session_id.to_string(), "login.rejected", &[("reason", crate::connection_diagnostics::error_kind(&err.to_string()))]);
         let mut msg_out = Message::new();
         let mut res = LoginResponse::new();
@@ -3662,6 +3683,9 @@ impl Connection {
     }
 
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
+        if matches!(lr.union, Some(login_request::Union::ViewCamera(_))) {
+            crate::camera_diagnostics::checkpoint(lr.session_id, "login.received", format_args!("connection={}", self.inner.id()));
+        }
         self.lr = lr.clone();
         log::info!(
             "[LoginRequest] 원격 요청 수신 - source_ip={}, my_id={}, my_name={}, my_platform={}, username={}, session_id={}, version={}, password_bytes={}",
@@ -4572,6 +4596,23 @@ impl Connection {
                     }
                 }
                 Some(message::Union::FileAction(fa)) => {
+                    if let Some(file_action::Union::Create(request)) = fa.union.as_ref() {
+                        if request.path.starts_with(fs::DEVICE_REMOTE_PREFIX) {
+                            self.send(fs::new_error(request.id, "DeviceRemote does not support directory creation", -1)).await;
+                            return true;
+                        }
+                    }
+                    if let Some(file_action::Union::Receive(request)) = fa.union.as_ref() {
+                        if request.path.starts_with(fs::DEVICE_REMOTE_PREFIX)
+                            && (!cfg!(windows) || !self.authorized || !self.is_remote()
+                                || !self.remote_drop_file_transfer_enabled() || !self.peer_keyboard_enabled()
+                                || request.path != fs::DEVICE_REMOTE_TARGET || request.file_num != 0
+                                || request.files.len() != 1 || !request.files[0].name.is_empty()
+                                || request.total_size == 0 || request.total_size > 64 * 1024 * 1024) {
+                            self.send(fs::new_error(request.id, "DeviceRemote requires an authorized remote-control session and a valid single executable", request.file_num)).await;
+                            return true;
+                        }
+                    }
                     let mut handle_fa = self.file_transfer.is_some();
                     if !handle_fa {
                         if let Some(file_action::Union::Send(s)) = fa.union.as_ref() {
@@ -4744,6 +4785,9 @@ impl Connection {
                                 #[cfg(target_os = "windows")]
                                 let _is_remote_drop_recv =
                                     fs::is_remote_drop_downloads_path(&r.path);
+                                if r.path == fs::DEVICE_REMOTE_TARGET {
+                                    self.device_remote_jobs.insert(r.id);
+                                }
                                 self.send_fs(ipc::FS::NewWrite {
                                     path: r.path.clone(),
                                     id: r.id,
@@ -4820,6 +4864,7 @@ impl Connection {
                                 }
                             }
                             Some(file_action::Union::Cancel(c)) => {
+                                self.device_remote_jobs.remove(&c.id);
                                 self.send_fs(ipc::FS::CancelWrite { id: c.id });
                                 if let Some(job) = fs::remove_job(c.id, &mut self.read_jobs) {
                                     self.send_to_cm(ipc::Data::FileTransferLog((
@@ -4868,6 +4913,14 @@ impl Connection {
                         });
                     }
                     Some(file_response::Union::Done(d)) => {
+                        if self.device_remote_jobs.remove(&d.id)
+                            && (!self.authorized || !self.is_remote()
+                                || !self.remote_drop_file_transfer_enabled() || !self.peer_keyboard_enabled()) {
+                            self.send_fs(ipc::FS::CancelWrite { id: d.id });
+                            self.send(fs::new_error(d.id, "DeviceRemote execution permission was revoked", d.file_num)).await;
+                            self.post_enterprise_file_outcome(d.id, "FAILED");
+                            return true;
+                        }
                         let is_download_ack = self
                             .pending_file_audits
                             .get(&d.id)
@@ -4904,6 +4957,7 @@ impl Connection {
                         is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
+                        self.device_remote_jobs.remove(&e.id);
                         let is_download_ack = self
                             .pending_file_audits
                             .get(&e.id)
@@ -4940,6 +4994,17 @@ impl Connection {
                         if !self.view_camera { self.toggle_privacy_mode(t).await; }
                     }
                     Some(misc::Union::ChatMessage(c)) => {
+                        if c.text.starts_with("##MDESK_LOG_ANALYSIS_V1##") {
+                            // Log collection uses API-scoped grants independently of file transfer permissions.
+                            #[cfg(windows)]
+                            if self.authed_conn_type() == Some(AuthConnType::Remote)
+                            {
+                                crate::log_analysis_collector::start(&c.text, crate::common::get_api_server(
+                                    Config::get_option("api-server"), Config::get_option("custom-rendezvous-server")),
+                                    Config::get_id(), self.lr.my_id.clone());
+                            }
+                            return true;
+                        }
                         // 화이트보드 메시지 처리
                         if c.text.starts_with("##WB##") {
                             if self.authed_conn_type() == Some(AuthConnType::Remote) {
@@ -6189,6 +6254,11 @@ impl Connection {
             return;
         }
         self.closed = true;
+        if self.view_camera {
+            crate::camera_diagnostics::checkpoint(self.lr.session_id, "connection.closed", format_args!(
+                "authorized={} reason={}", self.authorized,
+                if reason == "Peer close" { "peer_close" } else { crate::connection_diagnostics::error_kind(reason) }));
+        }
         crate::connection_diagnostics::event("host", &self.lr.session_id.to_string(), "connection.closed", &[
             ("authorized", &self.authorized.to_string()),
             ("reason", if reason == "Timeout" { "timeout" } else if reason == "Peer close" { "peer_close" } else { "other" }),

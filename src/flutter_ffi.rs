@@ -108,6 +108,7 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
         apply_android_app_role_config(conn_type, app_name);
     }
     config::apply_product_default_settings();
+    config::migrate_password_approval_for_rollout();
     config::persist_recording_options();
     #[cfg(target_os = "android")]
     {

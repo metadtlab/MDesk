@@ -3369,6 +3369,9 @@ pub fn start_video_thread<F, T>(
                                 Ok(true) => {
                                     if !diagnostic_decoded {
                                         diagnostic_decoded = true;
+                                        if is_view_camera {
+                                            crate::camera_diagnostics::checkpoint(session.lc.read().unwrap().session_id, "video.first_decoded", format_args!("display={} codec={:?}", display, format));
+                                        }
                                         crate::connection_diagnostics::event("controller", &session.lc.read().unwrap().session_id.to_string(), "video.first_decoded", &[
                                             ("display", &display.to_string()), ("duration_ms", &start.elapsed().as_millis().to_string()),
                                             ("codec", &format!("{:?}", format)),
@@ -3939,6 +3942,7 @@ pub fn handle_login_error(
     err: &str,
     interface: &impl Interface,
 ) -> bool {
+    camera_login_checkpoint(&lc, "login.rejected", format_args!("reason={}", crate::camera_diagnostics::login_error_reason(err)));
     if err == LOGIN_MSG_PASSWORD_EMPTY {
         lc.write().unwrap().password = Default::default();
         interface.msgbox("input-password", "Password Required", "", "");
@@ -3981,6 +3985,13 @@ pub fn handle_login_error(
 
 const MDESK_MINI_AUTO_CONNECT_PASSWORD_PRESET: &str = "__MDESKMINI_AUTO_CONNECT_V1__";
 
+fn camera_login_checkpoint(lc: &Arc<RwLock<LoginConfigHandler>>, stage: &str, detail: std::fmt::Arguments<'_>) {
+    let lc = lc.read().unwrap();
+    if lc.conn_type == ConnType::VIEW_CAMERA {
+        crate::camera_diagnostics::checkpoint(lc.session_id, stage, detail);
+    }
+}
+
 /// Handle hash message sent by peer.
 /// Hash will be used for login.
 ///
@@ -3998,6 +4009,7 @@ pub async fn handle_hash(
     peer: &mut Stream,
 ) {
     lc.write().unwrap().hash = hash.clone();
+    camera_login_checkpoint(&lc, "hash.received", format_args!(""));
     let is_mdesk_mini_auto_connect = password_preset == MDESK_MINI_AUTO_CONNECT_PASSWORD_PRESET;
     // Take care of password application order
 
@@ -4118,6 +4130,7 @@ pub async fn handle_hash(
     // Always require an explicit confirmation before submitting a credential.
     // If a credential is already available, the dialog can submit an empty
     // password and `handle_login_from_ui` will reuse the prepared hash.
+    camera_login_checkpoint(&lc, "password.prompt", format_args!("reason=explicit_confirmation"));
     interface.msgbox("input-password", "Password Required", "", "");
 }
 
@@ -4164,12 +4177,14 @@ async fn send_login(
 ) -> ResultType<()> {
     let session = lc.read().unwrap().session_id.to_string();
     let mut diagnostic = crate::connection_diagnostics::Span::new("controller", &session, "login.send");
+    camera_login_checkpoint(&lc, "login.send.begin", format_args!(""));
     prepare_connection_intent(lc.clone()).await?;
     let msg_out = lc
         .read()
         .unwrap()
         .create_login_msg(os_username, os_password, password);
     peer.send(&msg_out).await?;
+    camera_login_checkpoint(&lc, "login.send.end", format_args!("result=ok"));
     diagnostic.success();
     Ok(())
 }
@@ -4262,6 +4277,7 @@ pub async fn handle_login_from_ui(
     remember: bool,
     peer: &mut Stream,
 ) -> ResultType<()> {
+    camera_login_checkpoint(&lc, "password.confirmed", format_args!("input_present={} remember={}", !password.is_empty(), remember));
     lc.write().unwrap().remember = remember;
     let mut hash_password = if password.is_empty() {
         if remember {
@@ -4385,6 +4401,9 @@ pub trait Interface: Send + Clone + 'static + Sized {
         }
 
         // relay-hint
+        camera_login_checkpoint(&lc, "connection.error", format_args!(
+            "reason={} direct={:?} received={} relay_retry={}",
+            crate::connection_diagnostics::error_kind(&text), direct, received, relay_hint));
         if cfg!(feature = "flutter") && relay_hint {
             self.msgbox(relay_hint_type, title, &text, "");
         } else {

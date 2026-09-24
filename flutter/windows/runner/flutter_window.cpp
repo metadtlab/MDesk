@@ -20,6 +20,62 @@
 
 #include "win32_desktop.h"
 
+namespace {
+// Each Flutter engine owns a different client HWND. Convert desktop pixels at
+// that HWND instead of using window frames (borders/DPI differ between monitors).
+void RegisterPaneDragChannel(flutter::FlutterViewController* controller) {
+  const HWND view = controller->view()->GetNativeWindow();
+  flutter::MethodChannel<> channel(
+      controller->engine()->messenger(), "mdesk/pane_drag",
+      &flutter::StandardMethodCodec::GetInstance());
+  channel.SetMethodCallHandler(
+      [view](const flutter::MethodCall<>& call,
+             std::unique_ptr<flutter::MethodResult<>> result) {
+        POINT point{};
+        if (call.method_name() == "cursor") {
+          if (!GetCursorPos(&point)) {
+            result->Success();
+            return;
+          }
+        } else if (call.method_name() == "hitTest") {
+          const auto* args = call.arguments()
+              ? std::get_if<flutter::EncodableMap>(call.arguments()) : nullptr;
+          if (!args) {
+            result->Success();
+            return;
+          }
+          const auto x = args->find(flutter::EncodableValue("x"));
+          const auto y = args->find(flutter::EncodableValue("y"));
+          if (x == args->end() || y == args->end() ||
+              !std::holds_alternative<int32_t>(x->second) ||
+              !std::holds_alternative<int32_t>(y->second)) {
+            result->Success();
+            return;
+          }
+          point.x = std::get<int32_t>(x->second);
+          point.y = std::get<int32_t>(y->second);
+          const HWND root = GetAncestor(view, GA_ROOT);
+          RECT client{};
+          if (!IsWindow(view) || !IsWindowVisible(root) || IsIconic(root) ||
+              GetAncestor(WindowFromPoint(point), GA_ROOT) != root ||
+              !ScreenToClient(view, &point) || !GetClientRect(view, &client) ||
+              !PtInRect(&client, point)) {
+            result->Success();
+            return;
+          }
+        } else {
+          result->NotImplemented();
+          return;
+        }
+        result->Success(flutter::EncodableMap{
+            {flutter::EncodableValue("x"),
+             flutter::EncodableValue(static_cast<int32_t>(point.x))},
+            {flutter::EncodableValue("y"),
+             flutter::EncodableValue(static_cast<int32_t>(point.y))}});
+      });
+}
+}  // namespace
+
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -87,6 +143,34 @@ bool FlutterWindow::OnCreate() {
     auto *flutter_view_controller =
         reinterpret_cast<flutter::FlutterViewController *>(controller);
     auto *registry = flutter_view_controller->engine();
+    RegisterPaneDragChannel(flutter_view_controller);
+    // Per-view HWND: pin only the report window, without taking keyboard focus
+    // from the remote session. Do not use the main window_manager singleton.
+    const HWND report_window = GetAncestor(
+        flutter_view_controller->view()->GetNativeWindow(), GA_ROOT);
+    flutter::MethodChannel<> report_channel(
+        registry->messenger(), "mdesk/log_analysis_window",
+        &flutter::StandardMethodCodec::GetInstance());
+    report_channel.SetMethodCallHandler(
+        [report_window](const flutter::MethodCall<>& call,
+                        std::unique_ptr<flutter::MethodResult<>> result) {
+          if (call.method_name() != "setAlwaysOnTop") {
+            result->NotImplemented();
+            return;
+          }
+          const auto* pinned = call.arguments()
+              ? std::get_if<bool>(call.arguments()) : nullptr;
+          if (!pinned || !IsWindow(report_window)) {
+            result->Error("invalid_window", "Invalid report window or pin state");
+            return;
+          }
+          if (!SetWindowPos(report_window, *pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
+                            0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)) {
+            result->Error("pin_failed", "Could not update report window pin state");
+            return;
+          }
+          result->Success();
+        });
     DesktopDropPluginRegisterWithRegistrar(
         registry->GetRegistrarForPlugin("DesktopDropPlugin"));
     TextureRgbaRendererPluginCApiRegisterWithRegistrar(

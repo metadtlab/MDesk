@@ -2082,8 +2082,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable audio', kOptionEnableAudio,
                 enabled: enabled, fakeValue: fakeValue),
-            // 카메라: 설치 모드에서는 지원되지 않음 (Windows 서비스 제한)
-            _CameraOptionCheckBox(context,
+            _OptionCheckBox(context, 'Enable camera', kOptionEnableCamera,
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
                 enabled: enabled, fakeValue: fakeValue),
@@ -3365,68 +3364,6 @@ Widget _OptionCheckBox(
             onChanged(!ref.value);
           }
         : null,
-  );
-}
-
-// 카메라 옵션 체크박스: 설치 모드에서는 비활성화 및 취소선 표시
-// ignore: non_constant_identifier_names
-Widget _CameraOptionCheckBox(
-  BuildContext context, {
-  bool enabled = true,
-  bool? fakeValue,
-}) {
-  // Windows 설치 모드인지 확인
-  final bool isInstalled = isWindows && bind.mainIsInstalled();
-
-  // 설치 모드에서는 카메라 비활성화 (Windows 서비스 제한)
-  if (isInstalled) {
-    return Tooltip(
-      message: translate(
-          'Camera is not supported in installed mode (Windows service limitation)'),
-      child: Row(
-        children: [
-          Checkbox(
-            value: false,
-            onChanged: null, // 비활성화
-          ).marginOnly(right: 5),
-          Expanded(
-            child: Text(
-              translate('Enable camera'),
-              style: TextStyle(
-                color: Colors.grey,
-                decoration: TextDecoration.lineThrough,
-                decorationColor: Colors.red,
-                decorationThickness: 2,
-              ),
-            ),
-          ),
-          Container(
-            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(
-              color: Colors.orange.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: Colors.orange.withOpacity(0.5)),
-            ),
-            child: Text(
-              '설치모드 미지원',
-              style: TextStyle(
-                fontSize: 10,
-                color: Colors.orange[700],
-              ),
-            ),
-          ),
-        ],
-      ).marginOnly(left: _kCheckBoxLeftMargin),
-    );
-  }
-
-  // 포터블 모드에서는 기존 체크박스 사용
-  return _OptionCheckBox(
-    context,
-    'Enable camera',
-    kOptionEnableCamera,
-    enabled: enabled,
-    fakeValue: fakeValue,
   );
 }
 

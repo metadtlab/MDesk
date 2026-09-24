@@ -115,6 +115,7 @@ class _GpuTexture {
 
 class _Control {
   RxInt textureID = (-1).obs;
+  final hasFrame = false.obs;
 
   int _rgbaTextureId = -1;
   int get rgbaTextureId => _rgbaTextureId;
@@ -126,6 +127,7 @@ class _Control {
   setTextureType({bool gpuTexture = false}) {
     _isGpuTexture = gpuTexture;
     textureID.value = _isGpuTexture ? gpuTextureId : rgbaTextureId;
+    hasFrame.value = true;
   }
 
   setRgbaTextureId(int id) {
@@ -144,6 +146,10 @@ class TextureModel {
   final Map<int, _Control> _control = {};
   final Map<int, _PixelbufferTexture> _pixelbufferRenderTextures = {};
   final Map<int, _GpuTexture> _gpuRenderTextures = {};
+  Set<int>? workspaceDisplays;
+  // Reuse split textures until this connection closes. A quick split/single
+  // toggle must not race asynchronous native texture creation/destruction.
+  final Set<int> _retainedWorkspaceDisplays = {};
 
   TextureModel(this.parent);
 
@@ -180,6 +186,11 @@ class TextureModel {
     return _control[display]!.textureID;
   }
 
+  bool hasFrame(int display) {
+    ensureControl(display);
+    return _control[display]!.hasFrame.value;
+  }
+
   updateCurrentDisplay(int curDisplay) {
     if (isWeb) return;
     final ffi = parent.target;
@@ -198,6 +209,7 @@ class TextureModel {
     }
 
     tryRemoveTexture(int idx) {
+      if (_retainedWorkspaceDisplays.contains(idx)) return;
       _control.remove(idx);
       if (_pixelbufferRenderTextures.containsKey(idx)) {
         _pixelbufferRenderTextures[idx]!.destroy(true, ffi);
@@ -209,7 +221,14 @@ class TextureModel {
       }
     }
 
-    if (curDisplay == kAllDisplayValue) {
+    if (workspaceDisplays != null) {
+      // The hidden legacy page still builds. Its current-display callback must
+      // not destroy textures being shown by other panes of this connection.
+      _retainedWorkspaceDisplays.addAll(workspaceDisplays!);
+      for (final display in _retainedWorkspaceDisplays) {
+        tryCreateTexture(display);
+      }
+    } else if (curDisplay == kAllDisplayValue) {
       final displays = ffi.ffiModel.pi.getCurDisplays();
       for (var i = 0; i < displays.length; i++) {
         tryCreateTexture(i);

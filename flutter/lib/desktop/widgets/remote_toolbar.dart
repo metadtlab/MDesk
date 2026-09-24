@@ -29,6 +29,7 @@ import '../../common/shared_state.dart';
 import './popup_menu.dart';
 import './kb_layout_type_chooser.dart';
 import './whiteboard_overlay.dart';
+import './remote_log_analysis.dart';
 import 'package:flutter_hbb/utils/scale.dart';
 import 'package:flutter_hbb/common/widgets/custom_scale_base.dart';
 
@@ -414,6 +415,9 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     }
     if (!isWeb) toolbarItems.add(_RecordMenu());
     toolbarItems.add(_DeviceRemoteButton(ffi: widget.ffi));
+    if (!isWeb && widget.ffi.connType == ConnType.defaultConn) {
+      toolbarItems.add(_LogAnalysisButton(id: widget.id, ffi: widget.ffi));
+    }
     toolbarItems.add(_WhiteboardButton(id: widget.id));
     toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));
     final toolbarBorderRadius = BorderRadius.all(Radius.circular(4.0));
@@ -2405,6 +2409,14 @@ class _DeviceRemoteButton extends StatelessWidget {
     }
 
     final devicePath = _resolveLocalDeviceRemotePath();
+    if (ffi.ffiModel.pi.platformAdditions['device_remote_launch_v1'] != true) {
+      showToast('피원격 PC의 MDesk를 디바이스 원격 바로 실행 지원 버전으로 업데이트해주세요.');
+      return;
+    }
+    if (ffi.ffiModel.permissions['keyboard'] == false) {
+      showToast('디바이스 원격 실행에는 원격 제어 권한이 필요합니다.');
+      return;
+    }
     if (devicePath == null) {
       final exeDir = path_util.dirname(Platform.resolvedExecutable);
       showToast(
@@ -2430,12 +2442,11 @@ class _DeviceRemoteButton extends StatelessWidget {
       ..size = size;
 
     try {
-      await ffi.fileModel.sendLocalEntriesToRemoteDownloads([entry]);
+      await ffi.fileModel.sendDeviceRemote(entry);
       _refreshVideoAfterUpload();
-      showToast('DeviceRemote.exe 업로드를 시작했습니다.');
     } catch (e) {
       debugPrint('Failed to upload DeviceRemote.exe: $e');
-      showToast(translate('Error'));
+      showToast(e.toString().replaceFirst('Bad state: ', ''));
     }
   }
 
@@ -2452,6 +2463,41 @@ class _DeviceRemoteButton extends StatelessWidget {
     unawaited(Future.delayed(const Duration(milliseconds: 700), refresh));
     unawaited(Future.delayed(const Duration(milliseconds: 1800), refresh));
   }
+}
+
+class _LogAnalysisButton extends StatefulWidget {
+  final String id;
+  final FFI ffi;
+  const _LogAnalysisButton({required this.id, required this.ffi});
+  @override
+  State<_LogAnalysisButton> createState() => _LogAnalysisButtonState();
+}
+
+class _LogAnalysisButtonState extends State<_LogAnalysisButton> {
+  bool _open = false;
+  @override
+  Widget build(BuildContext context) => _IconMenuButton(
+        icon:
+            const Icon(Icons.analytics_outlined, size: 32, color: Colors.white),
+        tooltip: '로그 분석',
+        color: _ToolbarTheme.blueColor,
+        hoverColor: _ToolbarTheme.hoverBlueColor,
+        onPressed: _open
+            ? null
+            : () async {
+                setState(() {
+                  _open = true;
+                });
+                try {
+                  await showRemoteLogAnalysis(context, widget.ffi, widget.id);
+                } finally {
+                  if (mounted)
+                    setState(() {
+                      _open = false;
+                    });
+                }
+              },
+      );
 }
 
 class _WhiteboardButton extends StatelessWidget {

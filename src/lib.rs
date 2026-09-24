@@ -12,6 +12,11 @@ mod server;
 pub use self::server::*;
 mod client;
 pub mod connection_diagnostics;
+mod camera_diagnostics;
+#[cfg(not(target_os = "ios"))]
+mod device_remote;
+#[cfg(windows)]
+mod log_analysis_collector;
 mod lan;
 #[cfg(not(any(target_os = "ios")))]
 mod rendezvous_mediator;

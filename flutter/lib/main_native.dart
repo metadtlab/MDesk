@@ -27,6 +27,7 @@ import 'package:window_manager/window_manager.dart';
 import 'common.dart';
 import 'consts.dart';
 import 'desktop/widgets/whiteboard_overlay.dart';
+import 'desktop/widgets/log_analysis_result_window.dart';
 import 'mobile/pages/home_page.dart';
 import 'mobile/pages/server_page.dart';
 import 'models/platform_model.dart';
@@ -85,6 +86,15 @@ bool hasAgentIdInFilename() {
 Future<void> main(List<String> args) async {
   earlyAssert();
   WidgetsFlutterBinding.ensureInitialized();
+
+  // A report viewer has no remote session or Rust FFI state of its own.
+  if (args.length >= 3 && args.first == 'multi_window') {
+    final payload = args[2].isEmpty ? <String, dynamic>{} : jsonDecode(args[2]);
+    if (payload is Map && payload['type'] == logAnalysisResultWindowType) {
+      await runLogAnalysisResultWindow(int.parse(args[1]));
+      return;
+    }
+  }
 
   debugPrint("launch args: $args");
   kBootArgs = List.from(args);

@@ -1,6 +1,6 @@
 [package]
 name = "MDesk"
-version = "1.6.0"
+version = "1.6.3"
 authors = ["MDesk <metadtlab@Gmail.com>"]
 edition = "2021"
 build= "build.rs"
@@ -76,6 +76,7 @@ url = { version = "2.3", features = ["serde"] }
 crossbeam-queue = "0.3"
 hex = "0.4"
 chrono = "0.4"
+encoding_rs = "0.8"
 cidr-utils = "0.5"
 libloading = "0.8"
 fon = "0.6"

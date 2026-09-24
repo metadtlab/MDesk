@@ -46,7 +46,7 @@ use winapi::{
         },
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
-            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
+            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, OpenProcess,
             OpenProcessToken, ProcessIdToSessionId, PROCESS_INFORMATION, STARTUPINFOW,
         },
         securitybaseapi::{
@@ -100,6 +100,7 @@ use winreg::{enums::*, RegKey};
 mod acl;
 mod installer_handoff;
 mod installer_shell;
+mod server_query_access;
 pub(crate) use acl::current_process_user_sid_string;
 pub use acl::{
     set_path_permission, set_path_permission_for_portable_service_shmem_dir,
@@ -832,6 +833,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
     let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
+    let mut server_query_access = server_query_access::ServerQueryAccess::default();
     let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
     loop {
@@ -850,6 +852,9 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                 }
             }
         }
+        // Also retry after a pre-login launch: the session may acquire a user
+        // without changing its numeric ID. Only the server process is touched.
+        server_query_access.refresh(h_process.cast(), session_id);
         let res = timeout(super::SERVICE_INTERVAL, incoming.next()).await;
         match res {
             Ok(res) => match res {
@@ -912,11 +917,18 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                         }
                     }
                     let mut exit_code: DWORD = 0;
+                    let exited = !h_process.is_null()
+                        && GetExitCodeProcess(h_process, &mut exit_code) == TRUE
+                        && exit_code != STILL_ACTIVE;
+                    if exited {
+                        log::warn!("[ProcessDiag] event=server.exited supervisor_pid={} server_pid={} session={} exit_code=0x{:08X} close_sent={}",
+                            std::process::id(), GetProcessId(h_process), session_id, exit_code, close_sent);
+                        log::logger().flush();
+                    }
                     if h_process.is_null()
-                        || (GetExitCodeProcess(h_process, &mut exit_code) == TRUE
-                            && exit_code != STILL_ACTIVE
-                            && CloseHandle(h_process) == TRUE)
+                        || (exited && CloseHandle(h_process) == TRUE)
                     {
+                        h_process = NULL;
                         match launch_server(session_id, !close_sent).await {
                             Ok(ptr) => {
                                 h_process = ptr;
@@ -950,6 +962,9 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
 }
 
 async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDLE> {
+    log::info!("[ProcessDiag] event=server.launch.begin supervisor_pid={} session={} close_first={}",
+        std::process::id(), session_id, close_first);
+    log::logger().flush();
     if close_first {
         // in case started some elsewhere
         send_close_async("").await.ok();
@@ -958,7 +973,16 @@ async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDL
         "\"{}\" --server",
         std::env::current_exe()?.to_str().unwrap_or("")
     );
-    launch_privileged_process(session_id, &cmd)
+    let result = launch_privileged_process(session_id, &cmd);
+    match &result {
+        Ok(handle) if !handle.is_null() => log::info!(
+            "[ProcessDiag] event=server.launch.end supervisor_pid={} server_pid={} session={}",
+            std::process::id(), unsafe { GetProcessId(*handle) }, session_id),
+        _ => log::error!("[ProcessDiag] event=server.launch.failed supervisor_pid={} session={}",
+            std::process::id(), session_id),
+    }
+    log::logger().flush();
+    result
 }
 
 pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HANDLE> {
@@ -4301,10 +4325,11 @@ pub mod remote_overlay {
     use winapi::um::wingdi::{CreateFontW, CreateSolidBrush, SetBkMode, SetTextColor, TRANSPARENT};
     use winapi::um::winuser::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetSystemMetrics, PeekMessageW, PostMessageW, RegisterClassExW, SetLayeredWindowAttributes,
+        GetSystemMetrics, InvalidateRect, PostMessageW, RegisterClassExW, SetLayeredWindowAttributes,
         ShowWindow, TranslateMessage, UpdateWindow, CS_HREDRAW, CS_VREDRAW, LWA_ALPHA, MSG,
-        PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY,
-        WM_PAINT, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY,
+        WM_PAINT, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
     static OVERLAY_HWND: AtomicPtr<winapi::shared::windef::HWND__> =
@@ -4337,7 +4362,7 @@ pub mod remote_overlay {
     const OVERLAY_WIDTH: i32 = 300;
     const OVERLAY_HEIGHT: i32 = 76; // 제목 + 소형 IP 두 줄
     const WM_UPDATE_OVERLAY: u32 = WM_USER + 100;
-    const BLINK_INTERVAL_MS: u64 = 1500; // 1.5초 깜빡임 간격
+    const OVERLAY_ALPHA: u8 = 80; // About 31% opacity: a faint, steady guide.
 
     unsafe extern "system" fn overlay_wnd_proc(
         hwnd: HWND,
@@ -4470,7 +4495,11 @@ pub mod remote_overlay {
             let y = screen_height - OVERLAY_HEIGHT - 50; // 50px margin from bottom (작업표시줄 위)
 
             let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_NOACTIVATE,
                 class_name.as_ptr(),
                 std::ptr::null(),
                 WS_POPUP,
@@ -4485,8 +4514,9 @@ pub mod remote_overlay {
             );
 
             if !hwnd.is_null() {
-                // Set transparency (더 투명하게 - alpha 110)
-                SetLayeredWindowAttributes(hwnd, 0, 110, LWA_ALPHA);
+                // Layered + transparent passes mouse input to windows underneath,
+                // including windows owned by other applications/threads.
+                SetLayeredWindowAttributes(hwnd, 0, OVERLAY_ALPHA, LWA_ALPHA);
             }
 
             hwnd
@@ -4505,62 +4535,46 @@ pub mod remote_overlay {
             OVERLAY_HWND.store(hwnd, Ordering::SeqCst);
 
             // Show window if there are active connections
-            let mut is_visible = false;
             if ACTIVE_CONNECTIONS.load(Ordering::SeqCst) > 0 {
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 UpdateWindow(hwnd);
-                is_visible = true;
             }
 
-            // Blink timer
-            let mut last_blink = Instant::now();
-            let mut blink_state = true; // true = visible, false = hidden
-
-            // Message loop
+            // Repaint only for window messages and connection changes. No blink
+            // timer or periodic show/hide cycle, and no idle polling.
             let mut msg: MSG = std::mem::zeroed();
-            loop {
-                if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                    if msg.message == WM_QUIT {
-                        break;
+            while OVERLAY_THREAD_RUNNING.load(Ordering::SeqCst) {
+                let result = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                if result <= 0 {
+                    if result == -1 {
+                        log::error!(
+                            "Remote overlay message loop failed: {}",
+                            io::Error::last_os_error()
+                        );
                     }
-                    if msg.message == WM_UPDATE_OVERLAY {
-                        let count = ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
-                        if count > 0 {
-                            is_visible = true;
-                            blink_state = true;
-                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                            UpdateWindow(hwnd);
-                            last_blink = Instant::now();
-                        } else {
-                            is_visible = false;
-                            ShowWindow(hwnd, SW_HIDE);
-                        }
-                    }
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                } else {
-                    // Handle blinking
-                    if is_visible && ACTIVE_CONNECTIONS.load(Ordering::SeqCst) > 0 {
-                        if last_blink.elapsed().as_millis() >= BLINK_INTERVAL_MS as u128 {
-                            blink_state = !blink_state;
-                            if blink_state {
-                                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                            } else {
-                                ShowWindow(hwnd, SW_HIDE);
-                            }
-                            last_blink = Instant::now();
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
+                    break;
                 }
-
                 if !OVERLAY_THREAD_RUNNING.load(Ordering::SeqCst) {
                     break;
                 }
+                if msg.message == WM_UPDATE_OVERLAY {
+                    if ACTIVE_CONNECTIONS.load(Ordering::SeqCst) > 0 {
+                        // Refresh the IP line when peers change without erasing
+                        // the background between paints.
+                        InvalidateRect(hwnd, std::ptr::null(), FALSE);
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        UpdateWindow(hwnd);
+                    } else {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
 
             DestroyWindow(hwnd);
             OVERLAY_HWND.store(std::ptr::null_mut(), Ordering::SeqCst);
+            OVERLAY_THREAD_RUNNING.store(false, Ordering::SeqCst);
         }
     }
 

@@ -11,6 +11,12 @@ import 'package:flutter_hbb/models/input_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/desktop/pages/remote_page.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
+import 'package:flutter_hbb/desktop/models/remote_layout_model.dart';
+import 'package:flutter_hbb/desktop/models/remote_window_drag.dart';
+import 'package:flutter_hbb/desktop/widgets/remote_layout_button.dart';
+import 'package:flutter_hbb/desktop/widgets/remote_pane_drag.dart';
+import 'package:flutter_hbb/desktop/widgets/remote_workspace.dart';
+import 'package:flutter_hbb/desktop/widgets/remote_log_analysis.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
     as mod_menu;
@@ -41,6 +47,8 @@ class ConnectionTabPage extends StatefulWidget {
 }
 
 class _ConnectionTabPageState extends State<ConnectionTabPage> {
+  final _layout = RemoteLayoutModel();
+  final _workspaceKey = GlobalKey<RemoteWorkspaceState>();
   final tabController =
       Get.put(DesktopTabController(tabType: DesktopTabType.remoteScreen));
   final contentKey = UniqueKey();
@@ -53,6 +61,12 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   Timer? _connectionDurationTimer;
   final _connectionDurationTick = 0.obs;
   final Map<String, DateTime> _connectedAt = {};
+  RemoteWindowDragController? _windowDrag;
+  Timer? _windowDragHoverTimer;
+  String? _windowDragHoverToken;
+  int? _windowDragHoverSource;
+  Offset? _windowDragHoverPoint;
+  bool _receivingWindowPane = false;
 
   var connectionMap = RxList<Widget>.empty(growable: true);
 
@@ -70,8 +84,9 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     if (peerId != null) {
       ConnectionTypeState.init(peerId!);
       tabController.onSelected = (id) {
+        _workspaceKey.currentState?.onTabSelected(id);
         final remotePage = tabController.widget(id);
-        if (remotePage is RemotePage) {
+        if (remotePage is RemotePage && Get.isRegistered<FFI>(tag: id)) {
           final ffi = remotePage.ffi;
           bind.setCurSessionId(sessionId: ffi.sessionId);
         }
@@ -95,6 +110,8 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         },
         page: RemotePage(
           key: ValueKey(peerId),
+          onSessionReady: () => _workspaceKey.currentState?.sessionsChanged(),
+          isWorkspaceVisible: () => !_layout.isSplit,
           id: peerId!,
           sessionId: sessionId == null ? null : SessionID(sessionId),
           tabWindowId: tabWindowId,
@@ -118,6 +135,35 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   void initState() {
     super.initState();
 
+    if (isWindows) {
+      _windowDrag = RemoteWindowDragController(
+        windowId: windowId(),
+        createOffer: (peerId, display) {
+          final target = _workspaceKey.currentState?.windowDragTarget(
+            peerId,
+            display,
+          );
+          if (target == null) return null;
+          return RemoteWindowDragOffer(
+            token: '${windowId()}-${DateTime.now().microsecondsSinceEpoch}',
+            peerId: peerId,
+            display: target.display,
+            sessionId: Get.find<FFI>(tag: peerId).sessionId.toString(),
+            paneOnly: display != null,
+          );
+        },
+        isValid: _validWindowDrag,
+        onMoved: (offer) => _workspaceKey.currentState?.completeWindowTransfer(
+          RemotePaneTarget(offer.peerId, offer.display),
+        ),
+        onFailure: () {
+          if (mounted) {
+            BotToast.showText(text: '화면을 옮기지 못했습니다. 원래 창에서 다시 시도해 주세요.');
+          }
+        },
+      );
+    }
+
     _connectionDurationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _connectionDurationTick.value++;
       _syncRecordingStates();
@@ -140,6 +186,10 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   @override
   void dispose() {
     _connectionDurationTimer?.cancel();
+    _windowDragHoverTimer?.cancel();
+    _windowDrag?.dispose();
+    _layout.dispose();
+    disposeAllRemoteLogAnalyses();
     super.dispose();
   }
 
@@ -175,6 +225,18 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     );
   }
 
+  Widget _buildDraggableTab(String peerId, Widget tab) => ListenableBuilder(
+        listenable: _layout,
+        child: tab,
+        builder: (_, child) => RemotePaneDragSource(
+            peerId: peerId,
+            affinity: Axis.vertical,
+            enabled: _layout.isSplit,
+            onStart: () => _workspaceKey.currentState?.suspendInput(),
+            onEnd: () => _workspaceKey.currentState?.resumeInput(),
+            child: child!),
+      );
+
   @override
   Widget build(BuildContext context) {
     final child = Scaffold(
@@ -182,11 +244,30 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       body: DesktopTab(
         controller: tabController,
         onWindowCloseButton: handleWindowCloseButton,
-        tail: const AddButton(),
+        tail: Row(mainAxisSize: MainAxisSize.min, children: [
+          const AddButton(),
+          ListenableBuilder(
+              listenable: _layout,
+              builder: (_, __) => RemoteLayoutControls(
+                    mode: _layout.mode,
+                    onSelected: (mode) =>
+                        _workspaceKey.currentState?.changeMode(mode),
+                    onArrangePeers: () => _workspaceKey.currentState?.arrange(),
+                    onArrangeMonitors: () =>
+                        _workspaceKey.currentState?.arrange(monitors: true),
+                    onRestore: _layout.slots.any((target) => target != null)
+                        ? () => _workspaceKey.currentState?.restoreSplit()
+                        : null,
+                    onOpened: () => _workspaceKey.currentState?.suspendInput(),
+                    onClosed: () => _workspaceKey.currentState?.resumeInput(),
+                  )),
+        ]),
         selectedBorderColor: MyTheme.accent,
-        pageViewBuilder: (pageView) => pageView,
+        pageViewBuilder: (_) => RemoteWorkspace(key: _workspaceKey,
+            tabs: tabController, layout: _layout,
+            peerLabelGetter: (peerId) => DesktopTab.tablabelGetter(peerId).value),
         labelGetter: DesktopTab.tablabelGetter,
-        tabBuilder: (key, icon, label, themeConf) => Obx(() {
+        tabBuilder: (key, icon, label, themeConf) => _buildDraggableTab(key, Obx(() {
           final connectionType = ConnectionTypeState.find(key);
           if (!connectionType.isValid()) {
             _connectedAt.remove(key);
@@ -360,7 +441,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
               child: tab,
             );
           }
-        }),
+        })),
       ),
     );
     final tabWidget = isLinux
@@ -375,17 +456,222 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
                   ),
                   child: child,
                 )));
-    return isMacOS || kUseCompatibleUiMode
-        ? tabWidget
-        : Obx(() => SubWindowDragToResizeArea(
-              key: contentKey,
-              child: tabWidget,
-              // Specially configured for a better resize area and remote control.
-              childPadding: kDragToResizeAreaPadding,
-              resizeEdgeSize: stateGlobal.resizeEdgeSize.value,
-              enableResizeEdges: subWindowManagerEnableResizeEdges,
-              windowId: stateGlobal.windowId,
-            ));
+    return RemoteWindowDragScope(
+      controller: _windowDrag,
+      child: isMacOS || kUseCompatibleUiMode
+          ? tabWidget
+          : Obx(
+              () => SubWindowDragToResizeArea(
+                key: contentKey,
+                child: tabWidget,
+                // Specially configured for a better resize area and remote control.
+                childPadding: kDragToResizeAreaPadding,
+                resizeEdgeSize: stateGlobal.resizeEdgeSize.value,
+                enableResizeEdges: subWindowManagerEnableResizeEdges,
+                windowId: stateGlobal.windowId,
+              ),
+            ),
+    );
+  }
+
+  bool _validWindowDrag(RemoteWindowDragOffer offer) {
+    if (!mounted || !Get.isRegistered<FFI>(tag: offer.peerId)) return false;
+    final ffi = Get.find<FFI>(tag: offer.peerId);
+    if (ffi.sessionId.toString() != offer.sessionId) return false;
+    return _workspaceKey.currentState?.windowDragTarget(
+          offer.peerId,
+          offer.paneOnly ? offer.display : null,
+        ) ==
+        RemotePaneTarget(offer.peerId, offer.display);
+  }
+
+  void _clearWindowDragHover() {
+    _windowDragHoverTimer?.cancel();
+    _windowDragHoverToken = null;
+    _windowDragHoverSource = null;
+    _windowDragHoverPoint = null;
+    _workspaceKey.currentState?.showWindowDropSlot(null);
+  }
+
+  Future<int?> _probeWindowPane(dynamic args, int source) async {
+    if (_windowDrag == null || _receivingWindowPane || !mounted) return null;
+    final offer = RemoteWindowDragOffer.fromMap(args);
+    if (offer == null || args['x'] is! num || args['y'] is! num) return null;
+    final point = Offset(
+      (args['x'] as num).toDouble(),
+      (args['y'] as num).toDouble(),
+    );
+    final local = await _windowDrag!.platform.hitTest(
+      point,
+      View.of(context).devicePixelRatio,
+    );
+    if (!mounted || _receivingWindowPane) return null;
+    final workspace = _workspaceKey.currentState;
+    final slot = local == null ? null : workspace?.emptyPaneAt(local);
+    if (slot == null ||
+        workspace?.canReceiveWindowTarget(
+              slot,
+              RemotePaneTarget(offer.peerId, offer.display),
+            ) !=
+            true) {
+      _clearWindowDragHover();
+      return null;
+    }
+    _windowDragHoverToken = offer.token;
+    _windowDragHoverSource = source;
+    _windowDragHoverPoint = point;
+    workspace!.showWindowDropSlot(slot);
+    _windowDragHoverTimer?.cancel();
+    _windowDragHoverTimer = Timer(
+      const Duration(milliseconds: 800),
+      _clearWindowDragHover,
+    );
+    return slot;
+  }
+
+  Future<bool> _receiveWindowPane(dynamic args, int source) async {
+    final offer = RemoteWindowDragOffer.fromMap(args);
+    final point = _windowDragHoverPoint;
+    if (offer == null ||
+        _windowDrag == null ||
+        _receivingWindowPane ||
+        args['slot'] is! int ||
+        point == null ||
+        _windowDragHoverToken != offer.token ||
+        _windowDragHoverSource != source) {
+      return false;
+    }
+    final slot = args['slot'] as int;
+    final target = RemotePaneTarget(offer.peerId, offer.display);
+    _receivingWindowPane = true;
+    var added = false;
+    Widget? addedPage;
+    try {
+      final local = await _windowDrag!.platform.hitTest(
+        point,
+        View.of(context).devicePixelRatio,
+      );
+      if (!mounted ||
+          local == null ||
+          _workspaceKey.currentState?.emptyPaneAt(local) != slot) {
+        return false;
+      }
+      final accepted = await receiveRemoteWindowPane(
+        validateSource: () async {
+          if (!mounted) return false;
+          return await DesktopMultiWindow.invokeMethod(
+                source,
+                paneDragValidate,
+                offer.toMap(),
+              ).timeout(const Duration(seconds: 1)) ==
+              true;
+        },
+        reserve: () {
+          final workspace = _workspaceKey.currentState;
+          if (workspace?.receiveWindowTarget(slot, target) != true) {
+            return false;
+          }
+          if (!tabController.state.value.tabs.any(
+            (tab) => tab.key == offer.peerId,
+          )) {
+            added = true;
+            _addRemoteTab({
+              'id': offer.peerId,
+              'tab_window_id': source,
+              'display': offer.display,
+              'displays': [offer.display],
+            });
+            addedPage = tabController.widget(offer.peerId);
+          }
+          return true;
+        },
+        waitUntilReady: () async {
+          // Attaching another monitor UI reuses the authenticated native
+          // connection. Keep the source alive through cached data + first frame.
+          final deadline = DateTime.now().add(const Duration(seconds: 10));
+          do {
+            if (!mounted ||
+                !_layout.isSplit ||
+                !_layout.visibleTargets.contains(target)) {
+              return false;
+            }
+            if (Get.isRegistered<FFI>(tag: offer.peerId)) {
+              final ffi = Get.find<FFI>(tag: offer.peerId);
+              if (ffi.closed) return false;
+              if (ffi.ffiModel.pi.isSet.value &&
+                  !ffi.ffiModel.waitForFirstImage.value &&
+                  offer.display < ffi.ffiModel.pi.displays.length) {
+                return true;
+              }
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          } while (DateTime.now().isBefore(deadline));
+          return false;
+        },
+        rollback: () {
+          if (!mounted) return;
+          _layout.removeTarget(target);
+          if (added &&
+              identical(tabController.widget(offer.peerId), addedPage)) {
+            tabController.closeBy(offer.peerId);
+          }
+        },
+      );
+      if (accepted && mounted) {
+        // Focus only after the mouse has been released and the view is ready.
+        try {
+          await windowOnTop(windowId());
+          _workspaceKey.currentState?.resumeInput();
+        } catch (_) {
+          // Focus failure must not turn an already accepted move into a retry.
+        }
+      }
+      return accepted;
+    } finally {
+      _receivingWindowPane = false;
+      _clearWindowDragHover();
+    }
+  }
+
+  void _addRemoteTab(Map<String, dynamic> args) {
+    final String id = args['id'];
+    ConnectionTypeState.init(id);
+    tabController.add(
+      TabInfo(
+        key: id,
+        label: id,
+        selectedIcon: selectedIcon,
+        unselectedIcon: unselectedIcon,
+        onTabCloseButton: () async {
+          if (await desktopTryShowTabAuditDialogCloseCancelled(
+            id: id,
+            tabController: tabController,
+          )) {
+            return;
+          }
+          tabController.closeBy(id);
+        },
+        page: RemotePage(
+          key: ValueKey(id),
+          onSessionReady: () => _workspaceKey.currentState?.sessionsChanged(),
+          isWorkspaceVisible: () => !_layout.isSplit,
+          id: id,
+          sessionId: args['session_id'] == null
+              ? null
+              : SessionID(args['session_id']),
+          tabWindowId: args['tab_window_id'],
+          display: args['display'],
+          displays: (args['displays'] as List?)?.cast<int>(),
+          password: args['password'],
+          toolbarState: ToolbarState(),
+          tabController: tabController,
+          switchUuid: args['switch_uuid'],
+          forceRelay: args['forceRelay'],
+          isSharedPassword: args['isSharedPassword'],
+        ),
+      ),
+    );
+    _update_remote_count();
   }
 
   // Note: Some dup code to ../widgets/remote_toolbar
@@ -422,6 +708,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
           style: style,
         ),
         proc: () async {
+          _workspaceKey.currentState?.prepareForWindowTransfer(key);
           await DesktopMultiWindow.invokeMethod(
               kMainWindowId,
               kWindowEventMoveTabToNewWindow,
@@ -506,6 +793,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   }
 
   void onRemoveId(String id) async {
+    disposeRemoteLogAnalysis(id);
     _connectedAt.remove(id);
     if (tabController.state.value.tabs.isEmpty) {
       // Keep calling until the window status is hidden.
@@ -567,6 +855,24 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       RemoteCountState.find().value = tabController.length;
 
   Future<dynamic> _remoteMethodHandler(call, fromWindowId) async {
+    if (call.method == paneDragSupported) {
+      return _windowDrag != null;
+    } else if (call.method == paneDragValidate) {
+      return _windowDrag?.validates(call.arguments) ?? false;
+    } else if (call.method == paneDragProbe) {
+      return _probeWindowPane(call.arguments, fromWindowId);
+    } else if (call.method == paneDragDrop) {
+      return _receiveWindowPane(call.arguments, fromWindowId);
+    } else if (call.method == paneDragClear) {
+      if (_windowDragHoverSource == fromWindowId &&
+          _windowDragHoverToken == call.arguments) {
+        _clearWindowDragHover();
+      }
+      return null;
+    }
+    if (call.method == 'logAnalysis.command') {
+      return handleLogAnalysisCommand(call.arguments, fromWindowId);
+    }
     debugPrint(
         "[Remote Page] call ${call.method} with args ${call.arguments} from window $fromWindowId");
 
@@ -575,11 +881,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     if (call.method == kWindowEventNewRemoteDesktop) {
       final args = jsonDecode(call.arguments);
       final id = args['id'];
-      final switchUuid = args['switch_uuid'];
-      final sessionId = args['session_id'];
-      final tabWindowId = args['tab_window_id'];
       final display = args['display'];
-      final displays = args['displays'];
       final screenRect = parseParamScreenRect(args);
       final prePeerCount = tabController.length;
       Future.delayed(Duration.zero, () async {
@@ -593,36 +895,8 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
           await windowOnTop(windowId());
         });
       });
-      ConnectionTypeState.init(id);
-      tabController.add(TabInfo(
-        key: id,
-        label: id,
-        selectedIcon: selectedIcon,
-        unselectedIcon: unselectedIcon,
-        onTabCloseButton: () async {
-          if (await desktopTryShowTabAuditDialogCloseCancelled(
-            id: id,
-            tabController: tabController,
-          )) {
-            return;
-          }
-          tabController.closeBy(id);
-        },
-        page: RemotePage(
-          key: ValueKey(id),
-          id: id,
-          sessionId: sessionId == null ? null : SessionID(sessionId),
-          tabWindowId: tabWindowId,
-          display: display,
-          displays: displays?.cast<int>(),
-          password: args['password'],
-          toolbarState: ToolbarState(),
-          tabController: tabController,
-          switchUuid: switchUuid,
-          forceRelay: args['forceRelay'],
-          isSharedPassword: args['isSharedPassword'],
-        ),
-      ));
+      _workspaceKey.currentState?.prepareForNewConnection(id, display: display);
+      _addRemoteTab(Map<String, dynamic>.from(args));
     } else if (call.method == kWindowDisableGrabKeyboard) {
       // ???
     } else if (call.method == "onDestroy") {
@@ -672,6 +946,9 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
         tabController.closeBy(id);
       }
     } else if (call.method == kWindowEventRemoteWindowCoords) {
+      // A split window has several coordinate spaces; it must not advertise
+      // the hidden legacy canvas as one whole-window drag destination.
+      if (_layout.isSplit) return null;
       final remotePage =
           tabController.state.value.selectedTabInfo.page as RemotePage;
       final ffi = remotePage.ffi;

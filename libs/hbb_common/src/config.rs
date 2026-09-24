@@ -3097,6 +3097,38 @@ pub fn option2bool(option: &str, value: &str) -> bool {
     }
 }
 
+/// Temporary MDesk password-only rollout (2026-09-12).
+/// Remove this helper and its call sites once existing installations have migrated;
+/// keep the regular `password` product default. Until then, MDesk startup resets
+/// any subsequently selected click/both mode to password again. Passwords and the
+/// verification method are deliberately unchanged.
+fn migrate_password_approval_options(options: &mut HashMap<String, String>) -> bool {
+    let key = keys::OPTION_APPROVE_MODE;
+    if options.get(key).map(String::as_str) == Some("password") {
+        return false;
+    }
+    options.insert(key.to_owned(), "password".to_owned());
+    true
+}
+
+/// Apply the temporary migration after custom/product settings are initialized.
+/// Keep this out of Config2::load: Mini has a separate certificate approval policy.
+pub fn migrate_password_approval_for_rollout() {
+    migrate_password_approval_options(&mut DEFAULT_SETTINGS.write().unwrap());
+    {
+        let mut overwrite = OVERWRITE_SETTINGS.write().unwrap();
+        // Migrate an existing custom policy too, without making the setting fixed
+        // for clients that did not already have an enforced approval policy.
+        if overwrite.contains_key(keys::OPTION_APPROVE_MODE) {
+            migrate_password_approval_options(&mut overwrite);
+        }
+    }
+    let mut config = CONFIG2.write().unwrap();
+    if migrate_password_approval_options(&mut config.options) {
+        config.store();
+    }
+}
+
 /// Product defaults merged into [`DEFAULT_SETTINGS`] when a key is not already set
 /// (for example by custom client). Call after [`load_custom_client`] / `read_custom_client`.
 pub fn apply_product_default_settings() {
@@ -3567,6 +3599,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_password_approval_rollout_migration() {
+        for previous in [
+            None,
+            Some(""),
+            Some("click"),
+            Some("password-click"),
+            Some("both"),
+            Some("password"),
+            Some("unknown"),
+        ] {
+            let mut options = HashMap::from([
+                (
+                    "verification-method".to_owned(),
+                    "use-permanent-password".to_owned(),
+                ),
+                ("unrelated-option".to_owned(), "keep-me".to_owned()),
+            ]);
+            if let Some(value) = previous {
+                options.insert(keys::OPTION_APPROVE_MODE.to_owned(), value.to_owned());
+            }
+            assert_eq!(
+                migrate_password_approval_options(&mut options),
+                previous != Some("password"),
+            );
+            assert_eq!(options[keys::OPTION_APPROVE_MODE], "password");
+            assert_eq!(options["verification-method"], "use-permanent-password");
+            assert_eq!(options["unrelated-option"], "keep-me");
+            assert_eq!(options.len(), 3);
+            // Repeated UI/service initialization must not rewrite unchanged settings.
+            assert!(!migrate_password_approval_options(&mut options));
+            let serialized = toml::to_string(&options).unwrap();
+            let mut reloaded: HashMap<String, String> = toml::from_str(&serialized).unwrap();
+            assert!(!migrate_password_approval_options(&mut reloaded));
+        }
+    }
+
+    #[test]
     fn test_serialize() {
         let cfg: Config = Default::default();
         let res = toml::to_string_pretty(&cfg);
@@ -3606,6 +3675,30 @@ mod tests {
 
     #[test]
     fn test_overwrite_settings() {
+        // Exercise the actual startup migration/store path in an isolated profile;
+        // the migration must never touch the developer's installed MDesk config.
+        let original_app_name = APP_NAME.read().unwrap().clone();
+        *APP_NAME.write().unwrap() = format!("MDesk-approval-test-{}", uuid::Uuid::new_v4());
+        let mut legacy = Config2::default();
+        legacy
+            .options
+            .insert(keys::OPTION_APPROVE_MODE.to_owned(), "click".to_owned());
+        legacy.options.insert(
+            "verification-method".to_owned(),
+            "use-permanent-password".to_owned(),
+        );
+        legacy.store();
+        *CONFIG2.write().unwrap() = Config2::load();
+        apply_product_default_settings();
+        migrate_password_approval_for_rollout();
+        let loaded = Config2::get();
+        assert_eq!(loaded.options[keys::OPTION_APPROVE_MODE], "password");
+        assert_eq!(loaded.options["verification-method"], "use-permanent-password");
+        let persisted: Config2 = Config::load_("2");
+        assert_eq!(persisted, loaded);
+        DEFAULT_SETTINGS.write().unwrap().clear();
+        DEFAULT_LOCAL_SETTINGS.write().unwrap().clear();
+
         DEFAULT_SETTINGS
             .write()
             .unwrap()
@@ -3791,6 +3884,10 @@ mod tests {
             .unwrap()
             .insert(key.to_owned(), "click".to_owned());
         assert_eq!(Config::get_option(key), "click");
+        apply_product_default_settings();
+        migrate_password_approval_for_rollout();
+        assert_eq!(Config::get_option(key), "password");
+        assert_eq!(password_security::approve_mode(), ApproveMode::Password);
         OVERWRITE_SETTINGS.write().unwrap().clear();
         CONFIG2.write().unwrap().options.clear();
 
@@ -3799,9 +3896,12 @@ mod tests {
             .unwrap()
             .insert(key.to_owned(), "password-click".to_owned());
         apply_product_default_settings();
-        assert_eq!(Config::get_option(key), "password-click");
+        migrate_password_approval_for_rollout();
+        assert_eq!(Config::get_option(key), "password");
         DEFAULT_SETTINGS.write().unwrap().clear();
         DEFAULT_LOCAL_SETTINGS.write().unwrap().clear();
+        std::fs::remove_file(Config2::file()).unwrap();
+        *APP_NAME.write().unwrap() = original_app_name;
     }
 
     #[test]

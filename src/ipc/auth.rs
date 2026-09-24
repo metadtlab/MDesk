@@ -43,9 +43,10 @@ pub(super) fn validate_windows_ipc_server(
     if pid == 0 {
         bail!("IPC server identity is unavailable");
     }
-    if ensure_peer_executable_matches_current_by_pid(pid, postfix).is_ok() {
-        return Ok(());
-    }
+    let identity_error = match ensure_peer_executable_matches_current_by_pid(pid, postfix) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
     // Mini deliberately hands off to the installed product, not another Mini.
     if crate::common::is_mdeskmini_process()
         && (postfix.is_empty() || postfix == crate::POSTFIX_SERVICE)
@@ -56,7 +57,12 @@ pub(super) fn validate_windows_ipc_server(
             return Ok(());
         }
     }
-    bail!("Untrusted IPC server on channel {}", postfix)
+    bail!(
+        "Untrusted IPC server on channel '{}': server_pid={}, identity_error={:#}",
+        postfix,
+        pid,
+        identity_error
+    )
 }
 
 #[cfg(windows)]

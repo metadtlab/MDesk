@@ -829,6 +829,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                 }
             }
         }
+        for job in &write_jobs { crate::device_remote::cleanup(job); }
     }
 
     async fn ipc_task(stream: Connection, cm: ConnectionManager<T>) {
@@ -972,6 +973,7 @@ pub async fn start_listen<T: InvokeUiCM>(
             _ => {}
         }
     }
+    for job in &write_jobs { crate::device_remote::cleanup(job); }
     cm.remove_connection(current_id, true);
 }
 
@@ -1062,6 +1064,21 @@ async fn handle_fs(
             conn_id,
         } => {
             let is_remote_drop_downloads = fs::is_remote_drop_downloads_path(&path);
+            if path.starts_with(fs::DEVICE_REMOTE_PREFIX) {
+                if write_jobs.iter().any(|job| job.id() == id || job.device_remote_launch) {
+                    if let Some(job) = fs::remove_job(id, write_jobs) {
+                        crate::device_remote::cleanup(&job);
+                        job.remove_download_file();
+                    }
+                    send_raw(fs::new_error(id, "DeviceRemote upload is already in progress", file_num), tx);
+                    return;
+                }
+                match crate::device_remote::prepare(&path, id, file_num, &files, total_size, conn_id) {
+                    Ok(job) => write_jobs.push(job),
+                    Err(error) => send_raw(fs::new_error(id, error, file_num), tx),
+                }
+                return;
+            }
             let path = match fs::resolve_remote_drop_downloads_path(&path) {
                 Ok(Some(path)) => path,
                 Ok(None) => PathBuf::from(&path),
@@ -1109,6 +1126,7 @@ async fn handle_fs(
         }
         ipc::FS::CancelWrite { id } => {
             if let Some(job) = fs::remove_job(id, write_jobs) {
+                crate::device_remote::cleanup(&job);
                 job.remove_download_file();
                 tx_log.map(|tx: &UnboundedSender<String>| {
                     tx.send(serialize_transfer_job(&job, false, true, ""))
@@ -1117,7 +1135,13 @@ async fn handle_fs(
         }
         ipc::FS::WriteDone { id, file_num } => {
             if let Some(mut job) = fs::remove_job(id, write_jobs) {
-                match job.finalize_write().await {
+                let outcome = if job.device_remote_launch {
+                    crate::device_remote::finish(&mut job, crate::device_remote::launch).await
+                } else {
+                    job.finalize_write().await
+                };
+                crate::device_remote::cleanup(&job);
+                match outcome {
                     Ok(()) => {
                         allow_err!(tx.send(ipc::Data::FileTransferAuditOutcome {
                             id,
@@ -1144,6 +1168,7 @@ async fn handle_fs(
         }
         ipc::FS::WriteError { id, file_num, err } => {
             if let Some(job) = fs::remove_job(id, write_jobs) {
+                crate::device_remote::cleanup(&job);
                 tx_log.map(|tx| tx.send(serialize_transfer_job(&job, false, false, &err)));
                 send_raw(fs::new_error(job.id(), err, file_num), tx);
             }
@@ -1166,6 +1191,11 @@ async fn handle_fs(
                     .await
                 {
                     send_raw(fs::new_error(id, err, file_num), &tx);
+                    if job.device_remote_launch {
+                        if let Some(job) = fs::remove_job(id, write_jobs) {
+                            crate::device_remote::cleanup(&job);
+                        }
+                    }
                 }
             }
         }
@@ -1184,6 +1214,18 @@ async fn handle_fs(
                     union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
                     ..Default::default()
                 };
+                if job.device_remote_launch {
+                    // Always restart at zero, even when an identical destination already exists.
+                    if file_num != 0 || file_size != job.total_size || is_resume {
+                        send_raw(fs::new_error(id, "Invalid DeviceRemote digest", file_num), tx);
+                        if let Some(job) = fs::remove_job(id, write_jobs) {
+                            crate::device_remote::cleanup(&job);
+                        }
+                    } else {
+                        send_raw(new_send_confirm(req), tx);
+                    }
+                    return;
+                }
                 let digest = FileTransferDigest {
                     id,
                     file_num,

@@ -49,6 +49,7 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     crate::load_custom_client();
     config::apply_product_default_settings();
+    config::migrate_password_approval_for_rollout();
     config::persist_recording_options();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
@@ -182,6 +183,7 @@ pub fn core_main() -> Option<Vec<String>> {
         }
     }
     hbb_common::init_log(false, &log_name);
+    crate::camera_diagnostics::initialize(if log_name.is_empty() { "ui" } else { &log_name });
 
     // linux uni (url) go here.
     #[cfg(all(target_os = "linux", feature = "flutter"))]

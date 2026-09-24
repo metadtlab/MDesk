@@ -51,6 +51,8 @@ static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
 // on the same bidirectional stream.
 static NEXT_DIRECT_JOB_ID: AtomicI32 = AtomicI32::new(-1);
 pub const REMOTE_DROP_DOWNLOADS_PREFIX: &str = "mdesk-drop-downloads:";
+pub const DEVICE_REMOTE_PREFIX: &str = "mdesk-device-remote:";
+pub const DEVICE_REMOTE_TARGET: &str = "mdesk-device-remote:DeviceRemote.exe";
 pub const DIRECT_TRANSFER_MAX_ENTRIES: usize = 100_000;
 pub const DIRECT_TRANSFER_MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const DIRECT_TRANSFER_MAX_PATH_BYTES: usize = 4 * 1024;
@@ -827,10 +829,17 @@ pub fn release_direct_download_reservation(destination: &PathBuf, is_directory: 
 }
 
 pub fn is_remote_drop_downloads_path(path: &str) -> bool {
-    path.starts_with(REMOTE_DROP_DOWNLOADS_PREFIX)
+    path.starts_with(REMOTE_DROP_DOWNLOADS_PREFIX) || path.starts_with(DEVICE_REMOTE_PREFIX)
 }
 
 pub fn resolve_remote_drop_downloads_path(path: &str) -> Result<Option<PathBuf>, String> {
+    if path.starts_with(DEVICE_REMOTE_PREFIX) {
+        if path != DEVICE_REMOTE_TARGET {
+            return Err("Invalid DeviceRemote target".to_string());
+        }
+        return get_download_dir_strict().map(|dir| Some(dir.join("DeviceRemote.exe")))
+            .map_err(|err| err.to_string());
+    }
     let Some(relative) = path.strip_prefix(REMOTE_DROP_DOWNLOADS_PREFIX) else {
         return Ok(None);
     };
@@ -1164,6 +1173,8 @@ pub struct TransferJob {
     #[serde(skip_serializing)]
     pub files: Vec<FileEntry>,
     pub conn_id: i32, // server only
+    #[serde(skip_serializing)]
+    pub device_remote_launch: bool,
 
     #[serde(skip_serializing)]
     data_stream: Option<DataStream>,

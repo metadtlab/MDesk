@@ -737,6 +737,7 @@ class OverlayKeyState {
 
 class OverlayDialogManager {
   final Map<String, Dialog> _dialogs = {};
+  final hasOpenDialogs = false.obs;
   var _overlayKeyState = OverlayKeyState();
   int _tagCount = 0;
 
@@ -767,11 +768,13 @@ class OverlayDialogManager {
       BackButtonInterceptor.removeByName(key);
     });
     _dialogs.clear();
+    hasOpenDialogs.value = false;
   }
 
   void dismissByTag(String tag) {
     _dialogs[tag]?.complete(null);
     _dialogs.remove(tag);
+    hasOpenDialogs.value = _dialogs.isNotEmpty;
     BackButtonInterceptor.removeByName(tag);
   }
 
@@ -799,9 +802,11 @@ class OverlayDialogManager {
 
     final dialog = Dialog<T>();
     _dialogs[dialogTag] = dialog;
+    hasOpenDialogs.value = true;
 
     close([res]) {
       _dialogs.remove(dialogTag);
+      hasOpenDialogs.value = _dialogs.isNotEmpty;
       try {
         dialog.complete(res);
       } catch (e) {

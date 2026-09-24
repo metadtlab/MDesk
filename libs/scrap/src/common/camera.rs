@@ -21,6 +21,14 @@ use crate::{Frame, TraitCapturer};
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::{PixelBuffer, Pixfmt};
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[path = "camera_decode.rs"]
+mod decode;
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[path = "camera_trace.rs"]
+mod trace;
+
 pub const PRIMARY_CAMERA_IDX: usize = 0;
 lazy_static::lazy_static! {
     static ref SYNC_CAMERA_DISPLAYS: Arc<Mutex<Vec<DisplayInfo>>> = Arc::new(Mutex::new(Vec::new()));
@@ -39,8 +47,10 @@ pub fn primary_camera_exists() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 impl Cameras {
     pub fn all_info() -> ResultType<Vec<DisplayInfo>> {
+        trace::checkpoint("enumerate.begin", format_args!("backend=auto"));
         match query(ApiBackend::Auto) {
             Ok(cameras) => {
+                trace::checkpoint("enumerate.end", format_args!("count={}", cameras.len()));
                 let mut camera_displays = SYNC_CAMERA_DISPLAYS.lock().unwrap();
                 camera_displays.clear();
                 // FIXME: nokhwa returns duplicate info for one physical camera on linux for now.
@@ -107,9 +117,11 @@ impl Cameras {
                         }
                     }
                 }
+                trace::checkpoint("enumerate.ready", format_args!("count={}", camera_displays.len()));
                 Ok(camera_displays.clone())
             }
             Err(e) => {
+                trace::checkpoint("enumerate.error", format_args!("backend=auto"));
                 bail!("Query cameras error: {}", e)
             }
         }
@@ -128,20 +140,33 @@ impl Cameras {
         } else {
             RequestedFormatType::AbsoluteHighestResolution
         };
+        // Do not persist string camera IDs: drivers may include identifying data.
+        let diagnostic_index = match index { CameraIndex::Index(value) => Some(*value), _ => None };
+        trace::checkpoint("device.create.begin", format_args!("camera={:?}", diagnostic_index));
         let result = Camera::new(
             index.clone(),
             RequestedFormat::new::<RgbAFormat>(format_type),
         );
         match result {
-            Ok(camera) => Ok(camera),
-            Err(e) => bail!("create camera{} error:  {}", index, e),
+            Ok(camera) => {
+                trace::checkpoint("device.create.end", format_args!(
+                    "camera={:?} width={} height={}", diagnostic_index,
+                    camera.resolution().width(), camera.resolution().height()));
+                Ok(camera)
+            }
+            Err(e) => {
+                trace::checkpoint("device.create.error", format_args!("camera={:?}", diagnostic_index));
+                bail!("create camera{} error:  {}", index, e)
+            }
         }
     }
 
     pub fn get_camera_resolution(index: usize) -> ResultType<Resolution> {
+        trace::checkpoint("resolution.begin", format_args!("camera={}", index));
         let index = CameraIndex::Index(index as u32);
         let camera = Self::create_camera(&index)?;
         let resolution = camera.resolution();
+        trace::checkpoint("resolution.end", format_args!("width={} height={}", resolution.width(), resolution.height()));
         Ok(Resolution {
             width: resolution.width() as i32,
             height: resolution.height() as i32,
@@ -183,9 +208,11 @@ impl Cameras {
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub struct CameraCapturer {
+    trace: trace::CaptureTrace,
     camera: Camera,
     data: Vec<u8>,
     last_data: Vec<u8>, // for faster compare and copy
+    decode_error_logged: bool,
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -197,9 +224,11 @@ impl CameraCapturer {
         let index = CameraIndex::Index(current as u32);
         let camera = Cameras::create_camera(&index)?;
         Ok(CameraCapturer {
+            trace: trace::CaptureTrace::new(current),
             camera,
             data: Vec::new(),
             last_data: Vec::new(),
+            decode_error_logged: false,
         })
     }
 
@@ -215,18 +244,25 @@ impl TraitCapturer for CameraCapturer {
     fn frame<'a>(&'a mut self, _timeout: std::time::Duration) -> std::io::Result<Frame<'a>> {
         // TODO: move this check outside `frame`.
         if !self.camera.is_stream_open() {
+            self.trace.stream("stream.open.begin");
             if let Err(e) = self.camera.open_stream() {
+                self.trace.stream("stream.open.error");
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Camera open stream error: {}", e),
                 ));
             }
+            self.trace.stream("stream.open.end");
         }
+        self.trace.before_read();
         match self.camera.frame() {
             Ok(buffer) => {
-                match buffer.decode_image::<RgbAFormat>() {
-                    Ok(decoded) => {
-                        self.data = decoded.as_raw().to_vec();
+                self.trace.received(&buffer);
+                match decode::decode_rgba(&buffer) {
+                    Ok((data, width, height)) => {
+                        self.trace.decoded(width, height);
+                        self.decode_error_logged = false;
+                        self.data = data;
                         crate::would_block_if_equal(&mut self.last_data, &self.data)?;
                         // FIXME: macos's PixelBuffer cannot be directly created from bytes slice.
                         cfg_if::cfg_if! {
@@ -234,8 +270,8 @@ impl TraitCapturer for CameraCapturer {
                                 Ok(Frame::PixelBuffer(PixelBuffer::new(
                                     &self.data,
                                     Pixfmt::RGBA,
-                                    decoded.width() as usize,
-                                    decoded.height() as usize,
+                                    width,
+                                    height,
                                 )))
                             } else {
                                 Err(io::Error::new(
@@ -245,16 +281,22 @@ impl TraitCapturer for CameraCapturer {
                             }
                         }
                     }
-                    Err(e) => Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Camera frame decode error: {}", e),
-                    )),
+                    Err(e) => {
+                        self.trace.invalid();
+                        if !self.decode_error_logged {
+                            hbb_common::log::warn!("Skipping invalid camera frame: {}", e);
+                            self.decode_error_logged = true;
+                        }
+                        // A partial startup frame must not restart the camera; the
+                        // next frame from the existing stream can be valid.
+                        Err(io::Error::new(io::ErrorKind::WouldBlock, e))
+                    }
                 }
             }
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Camera frame error: {}", e),
-            )),
+            Err(e) => {
+                self.trace.read_error();
+                Err(io::Error::new(io::ErrorKind::Other, format!("Camera frame error: {}", e)))
+            }
         }
     }
 

@@ -324,6 +324,10 @@ class ToReleaseKeys {
 }
 
 class InputModel {
+  /// Optional display-local view used by split panes. The legacy canvas and
+  /// cross-window drag path remain unchanged when this is null.
+  Offset? Function(Offset position, bool clamp)? pointerPositionMapper;
+  bool pointerInputEnabled = true;
   final WeakReference<FFI> parent;
   String keyboardMode = '';
 
@@ -867,8 +871,28 @@ class InputModel {
     }
   }
 
+  /// A pane can disappear while a button is held. Send releases before
+  /// changing the active session, including right/middle/back/forward buttons.
+  void releasePaneInputs({bool leave = true}) {
+    const buttons = {
+      kPrimaryMouseButton: 'left', kSecondaryMouseButton: 'right',
+      kMiddleMouseButton: 'wheel', kBackMouseButton: 'back',
+      kForwardMouseButton: 'forward',
+    };
+    for (final button in buttons.entries) {
+      if ((_lastButtons & button.key) != 0) {
+        bind.sessionSendMouse(sessionId: sessionId,
+            msg: json.encode(modify({'type': 'up', 'buttons': button.value})));
+      }
+    }
+    _lastButtons = 0;
+    _flingTimer?.cancel();
+    if (leave) enterOrLeave(false);
+  }
+
   /// Send mouse movement event with distance in [x] and [y].
   Future<void> moveMouse(double x, double y) async {
+    if (!pointerInputEnabled) return;
     if (!keyboardPerm) return;
     if (isViewCamera) return;
     var x2 = x.toInt();
@@ -1038,7 +1062,7 @@ class InputModel {
   void onPointDownImage(PointerDownEvent e) {
     debugPrint("onPointDownImage ${e.kind}");
     _stopFling = true;
-    if (isDesktop) _queryOtherWindowCoords = true;
+    if (isDesktop && pointerPositionMapper == null) _queryOtherWindowCoords = true;
     _remoteWindowCoords = [];
     _windowRect = null;
     if (isViewOnly && !showMyCursor) return;
@@ -1303,6 +1327,7 @@ class InputModel {
     bool moveCanvas = true,
     bool edgeScroll = false,
   }) {
+    if (!pointerInputEnabled) return null;
     final evtToPeer =
         processEventToPeer(evt, offset, onExit: onExit, moveCanvas: moveCanvas, edgeScroll: edgeScroll);
     if (evtToPeer != null) {
@@ -1323,6 +1348,13 @@ class InputModel {
     bool moveCanvas = true,
     bool edgeScroll = false,
   }) {
+    if (!pointerInputEnabled) return null;
+    final mapper = pointerPositionMapper;
+    if (mapper != null) {
+      final position = mapper(Offset(x, y),
+          evtType == kMouseEventTypeUp || (isMove && buttons != 0));
+      return position == null ? null : Point(position.dx, position.dy);
+    }
     final ffiModel = parent.target!.ffiModel;
     CanvasCoords canvas =
         CanvasCoords.fromCanvasModel(parent.target!.canvasModel);

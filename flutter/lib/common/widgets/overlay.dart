@@ -651,17 +651,21 @@ class BlockableOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final initialEntries = [
-      OverlayEntry(builder: (_) => underlying),
+      // Overlay keeps its initial entries when the key is reused. Read the
+      // current body from a scope instead of capturing an old login/empty body.
+      OverlayEntry(
+          builder: (context) => _BlockableOverlayScope.of(context).underlying),
 
       /// middle layer
-      OverlayEntry(
-          builder: (context) => Obx(() => Listener(
-              onPointerDown: (_) {
-                state.onMiddleBlockedClick?.call();
-              },
-              child: Container(
-                  color:
-                      state.middleBlocked.value ? Colors.transparent : null)))),
+      OverlayEntry(builder: (context) {
+        final state = _BlockableOverlayScope.of(context).state;
+        return Obx(() => Listener(
+            onPointerDown: (_) {
+              state.onMiddleBlockedClick?.call();
+            },
+            child: Container(
+                color: state.middleBlocked.value ? Colors.transparent : null)));
+      }),
     ];
 
     if (upperLayer != null) {
@@ -669,6 +673,25 @@ class BlockableOverlay extends StatelessWidget {
     }
 
     /// set key
-    return Overlay(key: state.key, initialEntries: initialEntries);
+    return _BlockableOverlayScope(
+        underlying: underlying,
+        state: state,
+        child: Overlay(key: state.key, initialEntries: initialEntries));
   }
+}
+
+/// Refresh the body without replacing the Overlay or its open dialog entries.
+class _BlockableOverlayScope extends InheritedWidget {
+  const _BlockableOverlayScope(
+      {required this.underlying, required this.state, required super.child});
+
+  final Widget underlying;
+  final BlockableOverlayState state;
+
+  static _BlockableOverlayScope of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_BlockableOverlayScope>()!;
+
+  @override
+  bool updateShouldNotify(_BlockableOverlayScope oldWidget) =>
+      underlying != oldWidget.underlying || state != oldWidget.state;
 }

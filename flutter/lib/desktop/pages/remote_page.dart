@@ -48,6 +48,8 @@ class RemotePage extends StatefulWidget {
     this.switchUuid,
     this.forceRelay,
     this.isSharedPassword,
+    this.onSessionReady,
+    this.isWorkspaceVisible,
   }) : super(key: key) {
     initSharedStates(id);
   }
@@ -62,10 +64,16 @@ class RemotePage extends StatefulWidget {
   final String? switchUuid;
   final bool? forceRelay;
   final bool? isSharedPassword;
+  final VoidCallback? onSessionReady;
+  final bool Function()? isWorkspaceVisible;
   final SimpleWrapper<State<RemotePage>?> _lastState = SimpleWrapper(null);
   final DesktopTabController? tabController;
 
   FFI get ffi => (_lastState.value! as _RemotePageState)._ffi;
+
+  Future<void> handleWorkspaceFileDrop(DropDoneDetails details) async {
+    await (_lastState.value as _RemotePageState?)?._handleRemoteFileDrop(details);
+  }
 
   @override
   State<RemotePage> createState() {
@@ -182,7 +190,14 @@ class _RemotePageState extends State<RemotePage>
     _blockableOverlayState.applyFfi(_ffi);
     // Call onSelected in post frame callback, since we cannot guarantee that the callback will not call setState.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      widget.tabController?.onSelected?.call(widget.id);
+      if (!mounted) return;
+      widget.onSessionReady?.call();
+      final state = widget.tabController?.state.value;
+      if ((state == null || (state.tabs.isNotEmpty &&
+          state.selectedTabInfo.key == widget.id)) &&
+          (widget.isWorkspaceVisible?.call() ?? true)) {
+        widget.tabController?.onSelected?.call(widget.id);
+      }
     });
   }
 
@@ -342,6 +357,7 @@ class _RemotePageState extends State<RemotePage>
               child: RawKeyFocusScope(
                   focusNode: _rawKeyFocusNode,
                   onFocusChange: (bool imageFocused) {
+                    if (!(widget.isWorkspaceVisible?.call() ?? true)) return;
                     debugPrint(
                         "onFocusChange(window active:${!_isWindowBlur}) $imageFocused");
                     // See [onWindowBlur].
@@ -404,7 +420,8 @@ class _RemotePageState extends State<RemotePage>
           // If the privacy mode(disable physical displays) is switched,
           // we should not dismiss the dialog immediately.
           if (DateTime.now().difference(togglePrivacyModeTime) >
-              const Duration(milliseconds: 3000)) {
+              const Duration(milliseconds: 3000) &&
+              (widget.isWorkspaceVisible?.call() ?? true)) {
             // `dismissAll()` is to ensure that the state is clean.
             // It's ok to call dismissAll() here.
             _ffi.dialogManager.dismissAll();
@@ -457,6 +474,7 @@ class _RemotePageState extends State<RemotePage>
   }
 
   bool _isActiveRemoteDropTarget() {
+    if (!(widget.isWorkspaceVisible?.call() ?? true)) return false;
     final controller = widget.tabController;
     if (controller == null) {
       return true;
