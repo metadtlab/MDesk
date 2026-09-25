@@ -1,3 +1,37 @@
+/// Sends IME control characters as keys so toolbar modifiers reach the peer.
+/// Text messages have no modifier fields; keep composed text on that path.
+Future<void> sendSoftKeyboardText(
+  String text, {
+  required Future<void> Function(String) sendText,
+  required Future<void> Function(String) sendKey,
+}) async {
+  Future<void> sendChunk(String chunk) async {
+    if (chunk.isEmpty) return;
+    if (chunk.length == 1 &&
+        chunk.codeUnitAt(0) >= 0x20 &&
+        chunk.codeUnitAt(0) < 0x7f) {
+      await sendKey(chunk == ' ' ? 'VK_SPACE' : chunk);
+    } else {
+      await sendText(chunk);
+    }
+  }
+
+  var start = 0;
+  for (var i = 0; i < text.length; i++) {
+    final code = text.codeUnitAt(i);
+    if (code != 0x0d && code != 0x0a && code != 0x09) continue;
+    await sendChunk(text.substring(start, i));
+    await sendKey(code == 0x09 ? 'VK_TAB' : 'VK_RETURN');
+    if (code == 0x0d &&
+        i + 1 < text.length &&
+        text.codeUnitAt(i + 1) == 0x0a) {
+      i++;
+    }
+    start = i + 1;
+  }
+  await sendChunk(text.substring(start));
+}
+
 /// Converts mobile IME text updates into ordered remote edits.
 /// Bridge calls run on native workers, so issuing calls in Dart order alone
 /// does not guarantee that Backspace reaches the session before replacement.

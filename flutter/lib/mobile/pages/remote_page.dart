@@ -249,20 +249,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   // Korean Hangul, Japanese kana/kanji, Chinese hanzi, accented latin or
   // emoji must go through `sessionInputString`, which sends a `KeyEvent::Seq`
   // message that the server inputs as text.
-  bool _isAsciiPrintable(String s) {
-    if (s.length != 1) return false;
-    final c = s.codeUnitAt(0);
-    return c >= 0x20 && c < 0x7F;
-  }
-
   Future<void> _sendInputText(String newStr) async {
     if (newStr.isEmpty) return;
     if (!inputModel.keyboardPerm || inputModel.isViewCamera) return;
-    if (newStr.length > 1 || !_isAsciiPrintable(newStr)) {
-      await bind.sessionInputString(sessionId: sessionId, value: newStr);
-    } else {
-      await _sendSoftKeyboardKey(newStr == ' ' ? 'VK_SPACE' : newStr);
-    }
+    await sendSoftKeyboardText(
+      newStr,
+      sendText: (value) =>
+          bind.sessionInputString(sessionId: sessionId, value: value),
+      sendKey: _sendSoftKeyboardKey,
+    );
   }
 
   Future<void> _sendSoftKeyboardKey(String name) async {

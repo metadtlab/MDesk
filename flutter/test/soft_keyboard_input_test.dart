@@ -4,6 +4,56 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/utils/soft_keyboard_input.dart';
 
 void main() {
+  test('IME Enter and Tab use the modifier-aware key callback in order',
+      () async {
+    final sent = <String>[];
+    final enterSent = Completer<void>();
+    final releaseEnter = Completer<void>();
+    final pending = sendSoftKeyboardText(
+      '한글\r\n다\t끝😀',
+      sendText: (value) async => sent.add('text:$value'),
+      sendKey: (name) async {
+        sent.add('ctrl+key:$name');
+        if (name == 'VK_RETURN') {
+          enterSent.complete();
+          await releaseEnter.future;
+        }
+      },
+    );
+    await enterSent.future;
+    expect(sent, ['text:한글', 'ctrl+key:VK_RETURN']);
+    releaseEnter.complete();
+    await pending;
+    expect(sent, [
+      'text:한글',
+      'ctrl+key:VK_RETURN',
+      'text:다',
+      'ctrl+key:VK_TAB',
+      'text:끝😀',
+    ]);
+  });
+
+  test('standalone controls and existing text routes stay distinct', () async {
+    final sent = <String>[];
+    for (final text in ['', '\n', '\r', '\t', ' ', 'a', 'abc', '한', '😀']) {
+      await sendSoftKeyboardText(
+        text,
+        sendText: (value) async => sent.add('text:$value'),
+        sendKey: (name) async => sent.add('key:$name'),
+      );
+    }
+    expect(sent, [
+      'key:VK_RETURN',
+      'key:VK_RETURN',
+      'key:VK_TAB',
+      'key:VK_SPACE',
+      'key:a',
+      'text:abc',
+      'text:한',
+      'text:😀',
+    ]);
+  });
+
   test('vowel-only replacement of hidden padding never deletes remote content',
       () async {
     final sent = <String>[];

@@ -578,6 +578,17 @@ class InputModel {
       handleKeyDownEventModifiers(e);
     }
 
+    // Toolbar modifiers only live in Dart, so HID events cannot carry them.
+    // Route iOS Enter/Tab through inputKey for both key-down and key-up,
+    // regardless of the current modifier state, to keep each pair balanced.
+    if (isIOS &&
+        (e.logicalKey == LogicalKeyboardKey.enter ||
+            e.logicalKey == LogicalKeyboardKey.numpadEnter ||
+            e.logicalKey == LogicalKeyboardKey.tab)) {
+      legacyKeyboardMode(e);
+      return KeyEventResult.handled;
+    }
+
     bool isMobileAndMapMode = false;
     if (isMobile) {
       // Do not use map mode if mobile -> Android. Android does not support map mode for now.

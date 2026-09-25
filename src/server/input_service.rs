@@ -1521,7 +1521,9 @@ pub(super) fn mark_android_hangul_input(mut evt: KeyEvent, peer_platform: &str) 
     // existing input path, including old clients and shared portable services.
     // Keep the existing wire/IPC field for compatibility. Both mobile clients
     // send soft-keyboard Hangul as text and need the same ANSI editor handling.
-    evt.android_legacy_hangul = matches!(peer_platform, "Android" | "iOS");
+    // whoami 1.x reports iOS through Platform::Unknown on its fallback target,
+    // so deployed iPad clients send "Unknown: iOS" in LoginRequest.my_platform.
+    evt.android_legacy_hangul = matches!(peer_platform, "Android" | "iOS" | "Unknown: iOS");
     evt
 }
 
@@ -1554,10 +1556,122 @@ fn android_legacy_text(evt: &KeyEvent) -> Option<std::borrow::Cow<'_, str>> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn mobile_legacy_text_events(evt: &KeyEvent) -> Option<Vec<KeyEvent>> {
+    let text = android_legacy_text(evt)?;
+    if !text.chars().any(|c| matches!(c, '\r' | '\n' | '\t')) {
+        return None;
+    }
+    // Mobile IMEs can deliver Enter/Tab through TextInput as text, including
+    // alongside committed Hangul. VK_PACKET for LF/TAB is not a key press.
+    // Keep the edits ordered and emit actual control-key down/up pairs.
+    let mut template = evt.clone();
+    template.union = None;
+    template.press = false;
+    let mut events = Vec::new();
+    let mut pending = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(chr) = chars.next() {
+        let control = match chr {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                ControlKey::Return
+            }
+            '\n' => ControlKey::Return,
+            '\t' => ControlKey::Tab,
+            _ => {
+                pending.push(chr);
+                continue;
+            }
+        };
+        if !pending.is_empty() {
+            let mut text_event = template.clone();
+            text_event.set_seq(std::mem::take(&mut pending));
+            events.push(text_event);
+        }
+        let mut key = template.clone();
+        key.set_control_key(control);
+        key.down = true;
+        events.push(key.clone());
+        key.down = false;
+        events.push(key);
+    }
+    if !pending.is_empty() {
+        let mut text_event = template;
+        text_event.set_seq(pending);
+        events.push(text_event);
+    }
+    Some(events)
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod android_hangul_tests {
     use super::*;
     use hbb_common::protobuf::Message;
+
+    #[test]
+    fn mobile_ime_enter_and_tab_become_ordered_control_keys() {
+        for platform in ["Android", "iOS", "Unknown: iOS"] {
+            let mut original = KeyEvent::new();
+            original.set_seq("한\r\n글\t다\n\r끝".into());
+            let original = mark_android_hangul_input(original, platform);
+            let events = mobile_legacy_text_events(&original).unwrap();
+            assert_eq!(events.len(), 12);
+            for (index, text) in [(0, "한"), (3, "글"), (6, "다"), (11, "끝")] {
+                assert_eq!(events[index].seq(), text);
+                assert!(events[index].android_legacy_hangul);
+            }
+            for (index, control) in [(1, ControlKey::Return), (4, ControlKey::Tab),
+                (7, ControlKey::Return), (9, ControlKey::Return)] {
+                assert_eq!(events[index].control_key(), control);
+                assert!(events[index].down);
+                let mut released = events[index].clone();
+                released.down = false;
+                assert_eq!(events[index + 1], released);
+            }
+            assert!(events.iter().all(|event| !event.press && mobile_legacy_text_events(event).is_none()));
+        }
+        for (chr, control) in [('\n', ControlKey::Return), ('\r', ControlKey::Return), ('\t', ControlKey::Tab)] {
+            for scalar in [false, true] {
+                let mut input = KeyEvent::new();
+                if scalar { input.set_unicode(chr as u32); } else { input.set_seq(chr.to_string()); }
+                let input = mark_android_hangul_input(input, "Unknown: iOS");
+                let events = mobile_legacy_text_events(&input).unwrap();
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].control_key(), control);
+                assert!(events[0].down);
+                assert!(!events[1].down);
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_control_text_keeps_desktop_shortcuts_and_physical_keys_unchanged() {
+        let mut input = KeyEvent::new();
+        input.set_seq("한글\n\t".into());
+        assert!(mobile_legacy_text_events(&mark_android_hangul_input(input.clone(), "Windows")).is_none());
+        let input = mark_android_hangul_input(input, "Unknown: iOS");
+        for mode in [KeyboardMode::Map, KeyboardMode::Translate] {
+            let mut event = input.clone();
+            event.mode = mode.into();
+            assert!(mobile_legacy_text_events(&event).is_none());
+        }
+        for modifier in [ControlKey::Control, ControlKey::Alt, ControlKey::Meta, ControlKey::Shift] {
+            let mut event = input.clone();
+            event.modifiers.push(modifier.into());
+            assert!(mobile_legacy_text_events(&event).is_none());
+        }
+        for control in [ControlKey::Return, ControlKey::Tab, ControlKey::Backspace] {
+            let mut event = input.clone();
+            event.set_control_key(control);
+            assert!(mobile_legacy_text_events(&event).is_none());
+        }
+        let mut text = input;
+        text.set_seq("한글 abc😀".into());
+        assert!(mobile_legacy_text_events(&text).is_none());
+    }
 
     #[test]
     fn desktop_keyboard_events_keep_their_original_input_path() {
@@ -1588,7 +1702,7 @@ mod android_hangul_tests {
     fn mobile_compatibility_survives_portable_service_serialization() {
         let mut original = KeyEvent::new();
         original.set_seq("한글".into());
-        for platform in ["Android", "iOS"] {
+        for platform in ["Android", "iOS", "Unknown: iOS"] {
             let marked = mark_android_hangul_input(original.clone(), platform);
             let decoded = KeyEvent::parse_from_bytes(&marked.write_to_bytes().unwrap()).unwrap();
             assert!(decoded.android_legacy_hangul);
@@ -1624,6 +1738,47 @@ mod android_hangul_tests {
         assert_eq!(android_legacy_text(&scalar).as_deref(), Some("한"));
         scalar.set_unicode(0xd800);
         assert!(android_legacy_text(&scalar).is_none());
+    }
+
+    #[test]
+    fn deployed_ios_platform_keeps_text_ascii_and_physical_keys_scoped() {
+        // Real LoginRequest value from the failing iPad session (whoami 1.x).
+        let platform = hbb_common::whoami::Platform::Unknown("iOS".into()).to_string();
+        assert_eq!(platform, "Unknown: iOS");
+        let mut text = KeyEvent::new();
+        text.set_seq("한글".into());
+        let marked = mark_android_hangul_input(text.clone(), &platform);
+        assert_eq!(marked, mark_android_hangul_input(text.clone(), "iOS"));
+        assert_eq!(android_legacy_text(&marked).as_deref(), Some("한글"));
+
+        let mut scalar = text.clone();
+        scalar.set_unicode('한' as u32);
+        let scalar = mark_android_hangul_input(scalar, &platform);
+        assert_eq!(android_legacy_text(&scalar).as_deref(), Some("한"));
+
+        for down in [true, false] {
+            let mut ascii = KeyEvent::new();
+            ascii.set_chr('A' as u32);
+            ascii.down = down;
+            let ascii = mark_android_hangul_input(ascii, &platform);
+            assert_eq!(android_legacy_ascii(&ascii), Some('A' as u32));
+            for mode in [KeyboardMode::Map, KeyboardMode::Translate] {
+                let mut physical = ascii.clone();
+                physical.mode = mode.into();
+                assert!(android_legacy_ascii(&physical).is_none());
+                assert!(android_legacy_text(&physical).is_none());
+            }
+        }
+        for modifier in [ControlKey::Control, ControlKey::Alt, ControlKey::Shift, ControlKey::Meta] {
+            let mut shortcut = marked.clone();
+            shortcut.modifiers.push(modifier.into());
+            assert!(android_legacy_text(&shortcut).is_none());
+        }
+        for platform in ["Unknown", "Unknown: macOS", "Unknown: ios", "Unknown: iOS Simulator"] {
+            let mut supplied = text.clone();
+            supplied.android_legacy_hangul = true;
+            assert_eq!(mark_android_hangul_input(supplied, platform), text);
+        }
     }
 
     #[test]
@@ -1956,6 +2111,14 @@ fn is_legacy_mode(evt: &KeyEvent) -> bool {
 
 pub fn handle_key_(evt: &KeyEvent) {
     if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(events) = mobile_legacy_text_events(evt) {
+        for event in events {
+            handle_key_(&event);
+        }
         return;
     }
 
