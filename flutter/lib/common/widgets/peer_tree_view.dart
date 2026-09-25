@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/peer_card.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
+import 'package:flutter_hbb/common/widgets/root_overlay_control.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -801,6 +802,17 @@ class _PeerTreeViewState extends State<PeerTreeView> {
               color: Colors.grey.shade500,
             ),
             textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 20),
+          RootOverlayControl(
+            size: const Size(120, 44),
+            child: ElevatedButton(
+              onPressed: loginDialog,
+              style: ElevatedButton.styleFrom(
+                minimumSize: const Size(120, 44),
+              ),
+              child: Text(translate('Login')),
+            ),
           ),
         ],
       ),
