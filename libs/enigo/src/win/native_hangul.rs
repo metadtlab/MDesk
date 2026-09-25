@@ -1,4 +1,4 @@
-//! Android text compatibility for the legacy ANSI Toad editor. Unlike
+//! Android/iOS text compatibility for the legacy ANSI Toad editor. Unlike
 //! VK_PACKET/WM_CHAR, native Korean two-set key strokes work in this control.
 //! Keep the editor in Hangul mode, as for ordinary physical keyboard input.
 
@@ -270,9 +270,9 @@ fn target() -> Option<Target> {
     }
 }
 
-/// Sends an Android printable ASCII character literally in the legacy Toad
+/// Sends a mobile printable ASCII character literally in the legacy Toad
 /// editor, so the editor can remain in Hangul mode for native Korean input.
-/// Call only for Android Legacy Chr events without shortcut modifiers.
+/// Call only for Android/iOS Legacy Chr events without shortcut modifiers.
 /// A down event sends a complete Unicode click; its separate up is consumed.
 pub fn try_toad_ascii_input(chr: u32, down: bool) -> bool {
     if !(0x21..=0x7e).contains(&chr) || target().is_none() {
@@ -287,7 +287,7 @@ pub fn try_toad_ascii_input(chr: u32, down: bool) -> bool {
 }
 
 /// Tries the native two-set Hangul path for the focused legacy ANSI Toad editor.
-/// Call only for Android legacy text events without shortcut modifiers. The
+/// Call only for Android/iOS legacy text events without shortcut modifiers. The
 /// editor must be in Hangul mode with Caps Lock off (as for the verified native
 /// keyboard probe). No clipboard or IME/language settings are changed.
 /// Returns true once input was attempted, including partial failure, so callers

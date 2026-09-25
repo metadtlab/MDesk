@@ -15,7 +15,7 @@ fn contains_hangul(text: &str) -> bool {
 }
 
 /// Selects a loaded Korean input language for a focused ANSI window receiving
-/// Hangul. Call only for Android legacy text input; ordinary desktop keyboard
+/// Hangul. Call only for Android/iOS legacy text input; ordinary desktop keyboard
 /// handling must continue to use the user's selected layout.
 pub fn prepare_hangul_input(text: &str) {
     if !contains_hangul(text) {

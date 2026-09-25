@@ -1,18 +1,145 @@
-name: Flutter Tag Build
+name: Windows MDesk iOS Hangul Fix
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+
+permissions:
+  contents: read
 
 jobs:
-  run-flutter-tag-build:
-    uses: ./.github/workflows/flutter-build.yml
-    secrets: inherit
-    with:
-      upload-artifact: true
-      upload-tag: ${{ github.ref_name }}
+  package-windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      VCPKG_ROOT: C:\vcpkg
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.1
+          cache: true
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: 120deac3062162151622ca4860575a33844ba10b
+          doNotCache: false
+
+      - name: Install native dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install libvpx:x64-windows-static --classic
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:VCPKG_ROOT\vcpkg.exe" install libyuv:x64-windows-static aom:x64-windows-static opus:x64-windows-static --classic "--overlay-ports=$env:GITHUB_WORKSPACE\res\vcpkg"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Flutter and packaging dependencies
+        shell: pwsh
+        run: |
+          Push-Location flutter
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          python -m pip install -r libs\portable\requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test Android and iOS legacy input routing
+        shell: cmd
+        run: |
+          call setup_windows_x64_env.bat
+          if errorlevel 1 exit /b 1
+          cargo test --features flutter --lib --release android_hangul_tests -- --nocapture
+          if errorlevel 1 exit /b 1
+
+      - name: Build MDesk
+        shell: cmd
+        run: |
+          call setup_windows_x64_env.bat
+          if errorlevel 1 exit /b 1
+          cargo build --features flutter --lib --release
+          if errorlevel 1 exit /b 1
+          cd flutter
+          flutter build windows --release
+          if errorlevel 1 exit /b 1
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $buildDir = 'flutter\build\windows\x64\runner\Release'
+          if (!(Test-Path "$buildDir\MDesk.exe")) { throw 'MDesk.exe was not created' }
+          if (!(Test-Path 'target\release\librustdesk.dll')) { throw 'librustdesk.dll was not created' }
+          Copy-Item 'target\release\librustdesk.dll' "$buildDir\libmdesk.dll" -Force
+          Remove-Item "$buildDir\librustdesk.dll" -Force -ErrorAction SilentlyContinue
+          if (Test-Path 'target\release\deps\dylib_virtual_display.dll') {
+            Copy-Item 'target\release\deps\dylib_virtual_display.dll' $buildDir -Force
+          }
+
+          $labelPath = 'libs\portable\src\res\label.png'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/rustdesk/rustdesk/12d3c59172846cc2890a714bc1d0ed9dd118b9e2/libs/portable/src/res/label.png' -OutFile $labelPath
+          $labelHash = (Get-FileHash $labelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($labelHash -ne 'fd359b0f3af18dc810d81aae036358c9b6c80b9d7a74612524c89c27ed5ce9b5') {
+            throw 'Portable loading label checksum mismatch'
+          }
+
+          Push-Location libs\portable
+          python .\generate.py -f "..\..\$buildDir" -o . -e "..\..\$buildDir\MDesk.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          if (!(Test-Path 'target\release\rustdesk-portable-packer.exe')) {
+            throw 'Portable packer was not created'
+          }
+          Copy-Item 'target\release\rustdesk-portable-packer.exe' 'MDesk_portable.exe' -Force
+
+          $versionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (!$versionLine) { throw 'Unable to read package version' }
+          $version = $versionLine.Matches[0].Groups[1].Value
+          $buildNumber = 1
+          if (Test-Path build_number.txt) {
+            $storedBuildNumber = 0
+            if ([int]::TryParse((Get-Content build_number.txt -Raw).Trim(), [ref]$storedBuildNumber)) {
+              $buildNumber = $storedBuildNumber + 1
+            }
+          }
+          $package = "MDesk-$version.$buildNumber-install.exe"
+          Copy-Item 'MDesk_portable.exe' $package -Force
+          "PACKAGE_PATH=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          $file = Get-Item $env:PACKAGE_PATH
+          if ($file.Length -lt 1MB) { throw 'Package is unexpectedly small' }
+          Get-FileHash $file.FullName -Algorithm SHA256
+          Get-AuthenticodeSignature $file.FullName | Format-List Status,StatusMessage,SignerCertificate
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdesk-windows-${{ github.sha }}
+          path: ${{ env.PACKAGE_PATH }}
+          if-no-files-found: error
+          retention-days: 7
