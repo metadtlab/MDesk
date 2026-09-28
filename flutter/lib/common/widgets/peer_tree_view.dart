@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/peer_card.dart';
+import 'package:flutter_hbb/common/widgets/peer_list_widgets.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/common/widgets/root_overlay_control.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
@@ -221,8 +222,8 @@ class _PeerTreeViewState extends State<PeerTreeView> {
   /// 온라인 상태 업데이트 (나의 관리장치 + 최근 세션)
   void _updateOnlineState(Map<String, dynamic> evt) {
     bool changed = false;
-    final onlines = (evt['onlines'] as String? ?? '').split(',');
-    final offlines = (evt['offlines'] as String? ?? '').split(',');
+    final onlines = (evt['onlines'] as String? ?? '').split(',').toSet();
+    final offlines = (evt['offlines'] as String? ?? '').split(',').toSet();
 
     // 나의 관리장치 온라인 상태 업데이트
     for (var i = 0; i < _myDevices.length; i++) {
@@ -700,17 +701,14 @@ class _PeerTreeViewState extends State<PeerTreeView> {
                               children: [
                                 _buildColumnHeader(),
                                 Expanded(
-                                  child: SingleChildScrollView(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        _buildRecentSessionsCategory(),
-                                        _buildFavoritesCategory(),
-                                        _buildMyDevicesCategory(),
-                                        _buildAddressBookCategory(),
-                                      ],
-                                    ),
+                                  child: CustomScrollView(
+                                    key: const PageStorageKey('peer-tree-list'),
+                                    slivers: [
+                                      _buildRecentSessionsCategory(),
+                                      _buildFavoritesCategory(),
+                                      _buildMyDevicesCategory(),
+                                      _buildAddressBookCategory(),
+                                    ],
                                   ),
                                 ),
                               ],
@@ -990,16 +988,10 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     final isCurrentDevice =
         peer.id.replaceAll(' ', '') == myId && myId.isNotEmpty;
 
-    // 검색 필터
-    if (_searchQuery.isNotEmpty) {
-      final searchLower = _searchQuery.toLowerCase();
-      if (!displayName.toLowerCase().contains(searchLower) &&
-          !peer.id.toLowerCase().contains(searchLower)) {
-        return SizedBox.shrink();
-      }
-    }
-
-    return InkWell(
+    return PeerListRow(
+      key: ValueKey('${peerType.name}:${peer.id}'),
+      selected: isSelected,
+      currentDevice: isCurrentDevice,
       onTap: () {
         _bindMemoController(peer.id, peer);
         setState(() {
@@ -1023,125 +1015,108 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         // 우클릭 메뉴 - 기존 PeerCard 메뉴 사용
         _showPeerContextMenu(context, details.globalPosition, peer, peerType);
       },
-      child: Container(
-        padding: EdgeInsets.only(left: 30, right: 8, top: 5, bottom: 5),
-        decoration: BoxDecoration(
-          color: isSelected
-              ? (isDark ? Colors.blue.shade900 : Colors.blue.shade50)
-              : (isCurrentDevice
-                  ? (isDark ? Color(0xFF2D4A3D) : Colors.green.shade50)
-                  : null),
-          border: Border(
-            bottom: BorderSide(
-              color: isDark ? Colors.grey.shade800 : Colors.grey.shade200,
-              width: 0.5,
-            ),
-          ),
-        ),
-        child: Row(
-          children: [
-            // 이름 컬럼 (아이콘 + 이름)
-            Expanded(
-              flex: 5,
-              child: Row(
-                children: [
-                  // 플랫폼 아이콘 (온라인: 녹색, 오프라인: 회색)
-                  Container(
-                    width: 18,
-                    height: 18,
-                    decoration: BoxDecoration(
-                      color: isOnline
-                          ? Colors.green.shade600
-                          : Colors.grey.shade500,
-                      borderRadius: BorderRadius.circular(3),
-                    ),
-                    child: getPlatformImage(peer.platform, size: 12),
+      child: Row(
+        children: [
+          // 이름 컬럼 (아이콘 + 이름)
+          Expanded(
+            flex: 5,
+            child: Row(
+              children: [
+                // 플랫폼 아이콘 (온라인: 녹색, 오프라인: 회색)
+                Container(
+                  width: 18,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    color:
+                        isOnline ? Colors.green.shade600 : Colors.grey.shade500,
+                    borderRadius: BorderRadius.circular(3),
                   ),
-                  SizedBox(width: 6),
-                  // 이름
-                  Expanded(
-                    child: Row(
-                      children: [
-                        Flexible(
+                  child: getPlatformImage(peer.platform, size: 12),
+                ),
+                SizedBox(width: 6),
+                // 이름
+                Expanded(
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          displayName.isNotEmpty ? displayName : peer.id,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                            color: isOnline
+                                ? (isDark ? Colors.white : Colors.black87)
+                                : Colors.grey.shade500,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      // 현재 기기 표시
+                      if (isCurrentDevice) ...[
+                        SizedBox(width: 4),
+                        Container(
+                          padding:
+                              EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: Colors.green.shade600,
+                            borderRadius: BorderRadius.circular(3),
+                          ),
                           child: Text(
-                            displayName.isNotEmpty ? displayName : peer.id,
+                            '이 장치',
                             style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w500,
-                              color: isOnline
-                                  ? (isDark ? Colors.white : Colors.black87)
-                                  : Colors.grey.shade500,
+                              fontSize: 9,
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
                             ),
-                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                        // 현재 기기 표시
-                        if (isCurrentDevice) ...[
-                          SizedBox(width: 4),
-                          Container(
-                            padding: EdgeInsets.symmetric(
-                                horizontal: 4, vertical: 1),
-                            decoration: BoxDecoration(
-                              color: Colors.green.shade600,
-                              borderRadius: BorderRadius.circular(3),
-                            ),
-                            child: Text(
-                              '이 장치',
-                              style: TextStyle(
-                                fontSize: 9,
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ],
                       ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // ID 컬럼
+          Expanded(
+            flex: 4,
+            child: Text(
+              _formatPeerId(peer.id),
+              style: TextStyle(
+                fontSize: 12,
+                color: isDark ? Colors.grey.shade400 : Colors.grey.shade700,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+          // 상태 컬럼
+          SizedBox(
+            width: 50,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                if (isOnline) ...[
+                  Text(
+                    'Online',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.green.shade600,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ] else ...[
+                  Text(
+                    'Offline',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.grey.shade500,
                     ),
                   ),
                 ],
-              ),
+              ],
             ),
-            // ID 컬럼
-            Expanded(
-              flex: 4,
-              child: Text(
-                _formatPeerId(peer.id),
-                style: TextStyle(
-                  fontSize: 12,
-                  color: isDark ? Colors.grey.shade400 : Colors.grey.shade700,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-            // 상태 컬럼
-            SizedBox(
-              width: 50,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  if (isOnline) ...[
-                    Text(
-                      'Online',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.green.shade600,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ] else ...[
-                    Text(
-                      'Offline',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.grey.shade500,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -1634,6 +1609,38 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     );
   }
 
+  bool _matchesSearch(String name, String id) =>
+      _searchQuery.isEmpty ||
+      name.toLowerCase().contains(_searchQuery) ||
+      id.toLowerCase().contains(_searchQuery);
+
+  // Snapshot/filter while the category's Consumer/Obx is building. The lazy
+  // row builder runs later, outside the reactive subscription's scope.
+  List<Peer> _visiblePeers(Iterable<Peer> peers) => peers
+      .where((peer) => _matchesSearch(_peerDisplayName(peer), peer.id))
+      .toList(growable: false);
+
+  Widget _buildCategoryPlaceholder(
+      {required bool loading, required String text}) {
+    if (loading) {
+      return const Padding(
+        padding: EdgeInsets.all(16),
+        child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 12,
+          color: Colors.grey.shade500,
+          fontStyle: FontStyle.italic,
+        ),
+      ),
+    );
+  }
+
   Widget _buildFavoritesCategory() {
     return ChangeNotifierProvider<Peers>.value(
       value: gFFI.favoritePeersModel,
@@ -1642,22 +1649,18 @@ class _PeerTreeViewState extends State<PeerTreeView> {
           final peerList = peers.peers;
           final isExpanded = _expandedCategories['favorites'] ?? true;
 
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildCategoryHeader(
-                title: translate('Favorites'),
-                categoryKey: 'favorites',
-                itemCount: peerList.length,
-                icon: Icons.star,
-                iconColor: Colors.amber,
-              ),
-              if (isExpanded)
-                ...peerList
-                    .map((peer) =>
-                        _buildPeerItem(peer, TreeViewPeerType.favorite))
-                    .toList(),
-            ],
+          return PeerListSection<Peer>(
+            header: _buildCategoryHeader(
+              title: translate('Favorites'),
+              categoryKey: 'favorites',
+              itemCount: peerList.length,
+              icon: Icons.star,
+              iconColor: Colors.amber,
+            ),
+            expanded: isExpanded,
+            items: isExpanded ? _visiblePeers(peerList) : const [],
+            itemBuilder: (_, peer) =>
+                _buildPeerItem(peer, TreeViewPeerType.favorite),
           );
         },
       ),
@@ -1667,52 +1670,26 @@ class _PeerTreeViewState extends State<PeerTreeView> {
   Widget _buildMyDevicesCategory() {
     final isExpanded = _expandedCategories['mydevices'] ?? true;
 
-    // 확장된 경우 표시할 위젯 리스트 생성
-    List<Widget> expandedWidgets = [];
-    if (isExpanded) {
-      if (_myDevicesLoading) {
-        expandedWidgets.add(
-          Padding(
-            padding: EdgeInsets.all(16),
-            child: Center(
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          ),
-        );
-      } else if (_myDevices.isEmpty) {
-        expandedWidgets.add(
-          Padding(
-            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Text(
-              translate('No devices registered'),
-              style: TextStyle(
-                fontSize: 12,
-                color: Colors.grey.shade500,
-                fontStyle: FontStyle.italic,
-              ),
-            ),
-          ),
-        );
-      } else {
-        expandedWidgets.addAll(
-          _myDevices
-              .map((peer) => _buildPeerItem(peer, TreeViewPeerType.mydevices)),
-        );
-      }
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _buildCategoryHeader(
-          title: translate('My Devices'),
-          categoryKey: 'mydevices',
-          itemCount: _myDevices.length,
-          icon: Icons.devices,
-          iconColor: Colors.purple,
-        ),
-        ...expandedWidgets,
-      ],
+    return PeerListSection<Peer>(
+      header: _buildCategoryHeader(
+        title: translate('My Devices'),
+        categoryKey: 'mydevices',
+        itemCount: _myDevices.length,
+        icon: Icons.devices,
+        iconColor: Colors.purple,
+      ),
+      expanded: isExpanded,
+      items: isExpanded && !_myDevicesLoading
+          ? _visiblePeers(_myDevices)
+          : const [],
+      itemBuilder: (_, peer) =>
+          _buildPeerItem(peer, TreeViewPeerType.mydevices),
+      placeholder: _myDevicesLoading || _myDevices.isEmpty
+          ? _buildCategoryPlaceholder(
+              loading: _myDevicesLoading,
+              text: translate('No devices registered'),
+            )
+          : null,
     );
   }
 
@@ -1723,22 +1700,18 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       final peers = currentAb.peers;
       final isExpanded = _expandedCategories['addressbook'] ?? true;
 
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildCategoryHeader(
-            title: translate('Address book'),
-            categoryKey: 'addressbook',
-            itemCount: peers.length,
-            icon: Icons.contacts,
-            iconColor: Colors.green,
-          ),
-          if (isExpanded)
-            ...peers
-                .map((peer) =>
-                    _buildPeerItem(peer, TreeViewPeerType.addressbook))
-                .toList(),
-        ],
+      return PeerListSection<Peer>(
+        header: _buildCategoryHeader(
+          title: translate('Address book'),
+          categoryKey: 'addressbook',
+          itemCount: peers.length,
+          icon: Icons.contacts,
+          iconColor: Colors.green,
+        ),
+        expanded: isExpanded,
+        items: isExpanded ? _visiblePeers(peers) : const [],
+        itemBuilder: (_, peer) =>
+            _buildPeerItem(peer, TreeViewPeerType.addressbook),
       );
     });
   }
@@ -1747,51 +1720,28 @@ class _PeerTreeViewState extends State<PeerTreeView> {
   Widget _buildRecentSessionsCategory() {
     final isExpanded = _expandedCategories['recentApi'] ?? true;
 
-    // 확장된 경우 표시할 위젯 리스트 생성
-    List<Widget> expandedWidgets = [];
-    if (isExpanded) {
-      if (_recentSessionsLoading) {
-        expandedWidgets.add(
-          Padding(
-            padding: EdgeInsets.all(16),
-            child: Center(
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          ),
-        );
-      } else if (_recentSessions.isEmpty) {
-        expandedWidgets.add(
-          Padding(
-            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Text(
-              '최근 연결 기록이 없습니다',
-              style: TextStyle(
-                fontSize: 12,
-                color: Colors.grey.shade500,
-                fontStyle: FontStyle.italic,
-              ),
-            ),
-          ),
-        );
-      } else {
-        expandedWidgets.addAll(
-          _recentSessions.map((session) => _buildSessionItem(session)),
-        );
-      }
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _buildCategoryHeader(
-          title: '최근 세션',
-          categoryKey: 'recentApi',
-          itemCount: _recentSessions.length,
-          icon: Icons.access_time,
-          iconColor: Colors.blue,
-        ),
-        ...expandedWidgets,
-      ],
+    return PeerListSection<RecentSession>(
+      header: _buildCategoryHeader(
+        title: '최근 세션',
+        categoryKey: 'recentApi',
+        itemCount: _recentSessions.length,
+        icon: Icons.access_time,
+        iconColor: Colors.blue,
+      ),
+      expanded: isExpanded,
+      items: isExpanded && !_recentSessionsLoading
+          ? _recentSessions
+              .where((session) =>
+                  _matchesSearch(session.displayName, session.peerId))
+              .toList(growable: false)
+          : const [],
+      itemBuilder: (_, session) => _buildSessionItem(session),
+      placeholder: _recentSessionsLoading || _recentSessions.isEmpty
+          ? _buildCategoryPlaceholder(
+              loading: _recentSessionsLoading,
+              text: '최근 연결 기록이 없습니다',
+            )
+          : null,
     );
   }
 
@@ -1806,16 +1756,9 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     // 최근 세션 온라인 상태 확인
     final isOnline = _recentSessionsOnline[session.peerId] ?? false;
 
-    // 검색 필터
-    if (_searchQuery.isNotEmpty) {
-      final searchLower = _searchQuery.toLowerCase();
-      if (!displayName.toLowerCase().contains(searchLower) &&
-          !session.peerId.toLowerCase().contains(searchLower)) {
-        return SizedBox.shrink();
-      }
-    }
-
-    return InkWell(
+    return PeerListRow(
+      key: ValueKey('recentApi:${session.peerId}'),
+      selected: isSelected,
       onTap: () {
         final pid = session.peerId;
         final peer = _findPeerById(pid) ??
@@ -1872,88 +1815,73 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         _showPeerContextMenu(
             context, details.globalPosition, peer, TreeViewPeerType.recentApi);
       },
-      child: Container(
-        padding: EdgeInsets.only(left: 30, right: 8, top: 5, bottom: 5),
-        decoration: BoxDecoration(
-          color: isSelected
-              ? (isDark ? Colors.blue.shade900 : Colors.blue.shade50)
-              : Colors.transparent,
-          border: Border(
-            bottom: BorderSide(
-                color: isDark ? Colors.grey.shade800 : Colors.grey.shade200,
-                width: 0.5),
-          ),
-        ),
-        child: Row(
-          children: [
-            // 이름 컬럼 (아이콘 + 이름)
-            Expanded(
-              flex: 5,
-              child: Row(
-                children: [
-                  // 아이콘 (온라인: 녹색, 오프라인: 회색)
-                  Container(
-                    width: 18,
-                    height: 18,
-                    decoration: BoxDecoration(
+      child: Row(
+        children: [
+          // 이름 컬럼 (아이콘 + 이름)
+          Expanded(
+            flex: 5,
+            child: Row(
+              children: [
+                // 아이콘 (온라인: 녹색, 오프라인: 회색)
+                Container(
+                  width: 18,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    color:
+                        isOnline ? Colors.green.shade600 : Colors.grey.shade500,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Icon(
+                    Icons.history,
+                    size: 12,
+                    color: Colors.white,
+                  ),
+                ),
+                SizedBox(width: 6),
+                // 이름 (alias > hostname > id)
+                Expanded(
+                  child: Text(
+                    displayName,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
                       color: isOnline
-                          ? Colors.green.shade600
+                          ? (isDark ? Colors.white : Colors.black87)
                           : Colors.grey.shade500,
-                      borderRadius: BorderRadius.circular(3),
                     ),
-                    child: Icon(
-                      Icons.history,
-                      size: 12,
-                      color: Colors.white,
-                    ),
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  SizedBox(width: 6),
-                  // 이름 (alias > hostname > id)
-                  Expanded(
-                    child: Text(
-                      displayName,
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                        color: isOnline
-                            ? (isDark ? Colors.white : Colors.black87)
-                            : Colors.grey.shade500,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            // ID 컬럼
-            Expanded(
-              flex: 4,
-              child: Text(
-                _formatPeerId(session.peerId),
-                style: TextStyle(
-                  fontSize: 12,
-                  color: isOnline
-                      ? (isDark ? Colors.white70 : Colors.black54)
-                      : Colors.grey.shade500,
                 ),
+              ],
+            ),
+          ),
+          // ID 컬럼
+          Expanded(
+            flex: 4,
+            child: Text(
+              _formatPeerId(session.peerId),
+              style: TextStyle(
+                fontSize: 12,
+                color: isOnline
+                    ? (isDark ? Colors.white70 : Colors.black54)
+                    : Colors.grey.shade500,
               ),
             ),
-            // 상태 컬럼 (Online/Offline 텍스트)
-            SizedBox(
-              width: 50,
-              child: Text(
-                isOnline ? 'Online' : 'Offline',
-                style: TextStyle(
-                  fontSize: 11,
-                  color:
-                      isOnline ? Colors.green.shade600 : Colors.grey.shade500,
-                  fontWeight: isOnline ? FontWeight.w500 : FontWeight.normal,
-                ),
-                textAlign: TextAlign.center,
+          ),
+          // 상태 컬럼 (Online/Offline 텍스트)
+          SizedBox(
+            width: 50,
+            child: Text(
+              isOnline ? 'Online' : 'Offline',
+              style: TextStyle(
+                fontSize: 11,
+                color: isOnline ? Colors.green.shade600 : Colors.grey.shade500,
+                fontWeight: isOnline ? FontWeight.w500 : FontWeight.normal,
               ),
+              textAlign: TextAlign.center,
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

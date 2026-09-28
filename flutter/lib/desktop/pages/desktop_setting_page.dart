@@ -942,7 +942,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   Future<void> _loadRegisteredUsers() async {
     try {
       // 로컬 옵션에서 원격자 목록 로드
-      final saved = bind.mainGetLocalOption(key: 'registered_remote_users');
+      final saved = isLinux
+          ? await _linuxRegisteredUsers()
+          : bind.mainGetLocalOption(key: 'registered_remote_users');
+      if (!mounted) return;
       if (saved.isNotEmpty) {
         final List<dynamic> decoded = jsonDecode(saved);
         bool needsMigration = false;
@@ -970,10 +973,25 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       }
     } catch (e) {
       debugPrint('Failed to load registered users: $e');
+      if (isLinux) {
+        showToast('등록된 원격자 정보를 불러오지 못했습니다. MDesk 서비스를 확인해 주세요.');
+      }
     }
   }
 
-  Future<void> _saveRegisteredUsers() async {
+  Future<String> _linuxRegisteredUsers([String? value]) async {
+    final result = jsonDecode(await bind.mainGetCommon(
+      key: value == null
+          ? 'linux-registered-users:get'
+          : 'linux-registered-users:set:$value',
+    )) as Map<String, dynamic>;
+    if (result['error'] != null) {
+      throw StateError(result['error'].toString());
+    }
+    return result['value'] as String;
+  }
+
+  Future<bool> _saveRegisteredUsers() async {
     try {
       // 저장 전 암호 암호화
       final encryptedUsers = registeredUsers.map((u) {
@@ -985,17 +1003,26 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         return user;
       }).toList();
 
-      await bind.mainSetLocalOption(
-        key: 'registered_remote_users',
-        value: jsonEncode(encryptedUsers),
-      );
+      if (isLinux) {
+        await _linuxRegisteredUsers(jsonEncode(encryptedUsers));
+      } else {
+        await bind.mainSetLocalOption(
+          key: 'registered_remote_users',
+          value: jsonEncode(encryptedUsers),
+        );
+      }
+      return true;
     } catch (e) {
       debugPrint('Failed to save registered users: $e');
+      showToast('원격자 정보를 저장하지 못했습니다. MDesk 서비스를 확인해 주세요.');
+      return false;
     }
   }
 
-  Future<void> _addOrUpdateRemoteUser(
+  Future<bool> _addOrUpdateRemoteUser(
       String id, String name, String connectionPassword) async {
+    final previous =
+        registeredUsers.map((u) => Map<String, String>.from(u)).toList();
     // 로컬 목록에 추가/업데이트 후 저장
     final exists = registeredUsers.any((u) => u['id'] == id);
     if (!exists) {
@@ -1011,10 +1038,19 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         registeredUsers[index]['connectionPassword'] = connectionPassword;
       }
     }
-    await _saveRegisteredUsers();
+    if (await _saveRegisteredUsers()) return true;
+    registeredUsers = previous;
+    return false;
   }
 
-  Future<void> _removeRemoteUser(String userId) async {
+  Future<bool> _removeRemoteUser(String userId) async {
+    final previous =
+        registeredUsers.map((u) => Map<String, String>.from(u)).toList();
+    registeredUsers.removeWhere((u) => u['id'] == userId);
+    if (!await _saveRegisteredUsers()) {
+      registeredUsers = previous;
+      return false;
+    }
     try {
       // 서버에서 기기 등록 해제 API 호출
       final remoteId = await bind.mainGetMyId();
@@ -1036,9 +1072,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       debugPrint('_removeRemoteUser: Error calling unregister API - $e');
     }
 
-    // 로컬에서도 삭제
-    registeredUsers.removeWhere((u) => u['id'] == userId);
-    await _saveRegisteredUsers();
+    return true;
   }
 
   @override
@@ -1098,10 +1132,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                           SizedBox(width: 4),
                           InkWell(
                             onTap: () async {
-                              await _removeRemoteUser(user['id'] ?? '');
-                              setState(() {
-                                registeredUsers.remove(user);
-                              });
+                              if (await _removeRemoteUser(user['id'] ?? '') &&
+                                  mounted) {
+                                setState(() {});
+                              }
                             },
                             child:
                                 Icon(Icons.close, size: 16, color: Colors.red),
@@ -1337,8 +1371,10 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                           if (!registered) return;
 
                           // 서버 등록이 성공한 경우에만 로컬 목록에 저장
-                          await _addOrUpdateRemoteUser(
-                              userId, userName, connPassword);
+                          if (!await _addOrUpdateRemoteUser(
+                              userId, userName, connPassword)) {
+                            return;
+                          }
 
                           setState(() {});
 

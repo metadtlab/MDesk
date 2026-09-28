@@ -1,0 +1,15 @@
+Upstream: https://github.com/TerminalStudio/xterm.dart
+Base: pub.dev xterm 4.0.0 (lib/, pubspec.yaml, LICENSE)
+License: MIT; see LICENSE.
+
+Local patch:
+- CustomTextEdit._openInputConnection passes View.of(context).viewId to
+  TextInputConfiguration. Flutter Windows rejects a null viewId, leaving
+  printable/IME input disconnected while hardware Enter still works.
+- Declare Flutter >=3.38.1, matching MDesk's resolved Flutter minimum.
+
+Keep the IME path enabled. hardwareKeyboardOnly is not a substitute because
+it bypasses composed text input. Desktop and mobile share this package.
+Regression coverage: ../../test/terminal_text_input_test.dart
+
+When upgrading xterm, retain this patch until upstream supplies the view ID.

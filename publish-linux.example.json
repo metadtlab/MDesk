@@ -1,0 +1,17 @@
+{
+  "wslDistribution": "Ubuntu",
+  "wslUser": "owner",
+  "baseUrl": "https://787.kr/linux",
+  "suite": "noble",
+  "architecture": "amd64",
+  "outputDirectory": "dist/linux-publish",
+  "gpgHome": "~/.local/share/mdesk-publish/gnupg",
+  "signingKey": "",
+  "keyIdentity": "MDesk Linux Repository (787.kr)",
+  "buildDirectory": "~/mdesk-builds/linux-release",
+  "buildOutputDirectory": "dist/linux-build",
+  "flutterSdk": "~/flutter_linux_3.41.9_sdk/flutter",
+  "vcpkgRoot": "~/vcpkg-rustdesk",
+  "rustToolchain": "stable",
+  "buildJobs": 6
+}

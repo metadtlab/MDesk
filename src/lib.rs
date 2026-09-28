@@ -43,6 +43,8 @@ pub mod flutter;
 pub mod flutter_ffi;
 use common::*;
 mod auth_2fa;
+#[cfg(target_os = "linux")]
+mod registered_remote_users;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(not(target_os = "ios"))]

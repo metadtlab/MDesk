@@ -12,6 +12,8 @@ src/version.rs
 *.[mM][dD]
 *.mdx
 !/README.md
+!/docs/linux-prelogin.md
+!/docs/linux-publish.md
 *exe
 *tgz
 cert.pfx
@@ -91,6 +93,8 @@ push_with_token.bat
 push_to_github_force.bat
 push_to_github.bat
 setup_github_ssh.bat
+publish-linux.local.json
+publish-linux.local.json.tmp
 
 # Local task data: keep folder placeholders, ignore private task contents.
 !tasks/

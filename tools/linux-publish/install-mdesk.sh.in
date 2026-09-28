@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE_URL='@BASE_URL@'
+EXPECTED_FINGERPRINT='@FINGERPRINT@'
+
+if [[ "$EUID" -ne 0 ]]; then
+  echo 'Run: sudo bash install-mdesk.sh' >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source /etc/os-release
+architecture="$(dpkg --print-architecture 2>/dev/null || printf unknown)"
+case "${ID:-}:${VERSION_ID:-}:$architecture" in
+  ubuntu:24.04:amd64|ubuntu:26.04:amd64) ;;
+  *)
+    echo 'This package supports Ubuntu 24.04 or 26.04 LTS, amd64 (x64).' >&2
+    printf 'Detected: %s; ID=%s; VERSION_ID=%s; architecture=%s\n' \
+      "${PRETTY_NAME:-unknown}" "${ID:-unknown}" "${VERSION_ID:-unknown}" "$architecture" >&2
+    exit 1
+    ;;
+esac
+if ! command -v systemctl >/dev/null || [[ ! -d /run/systemd/system ]]; then
+  echo 'A running systemd installation is required.' >&2
+  exit 1
+fi
+# Refresh the key before updating an existing MDesk source (e.g. key renewal).
+if ! command -v curl >/dev/null || ! command -v gpg >/dev/null || [[ ! -s /etc/ssl/certs/ca-certificates.crt ]]; then
+  apt-get -o APT::Update::Error-Mode=any update
+  apt-get install -y ca-certificates curl gnupg
+fi
+work="$(mktemp -d)"
+trap 'rm -rf -- "$work"' EXIT
+mkdir -m 700 "$work/gnupg"
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+  "$BASE_URL/mdesk-archive-keyring.asc" -o "$work/key.asc"
+fingerprints="$(gpg --homedir "$work/gnupg" --batch --with-colons --show-keys "$work/key.asc" |
+  awk -F: '$1=="pub" {primary=1; next} $1=="sub" {primary=0} $1=="fpr" && primary {print $10; primary=0}')"
+if [[ "$fingerprints" != "$EXPECTED_FINGERPRINT" ]]; then
+  echo 'Signing key fingerprint mismatch. Repository was not added.' >&2
+  exit 1
+fi
+install -d -m 755 /etc/apt/keyrings
+install -m 644 "$work/key.asc" /etc/apt/keyrings/mdesk-archive-keyring.asc
+cat > "$work/mdesk.sources" <<EOF
+Types: deb
+URIs: $BASE_URL
+Suites: noble
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/mdesk-archive-keyring.asc
+EOF
+install -m 644 "$work/mdesk.sources" /etc/apt/sources.list.d/mdesk.sources
+apt-get -o APT::Update::Error-Mode=any update
+apt-get install -y mdesk
+systemctl enable --now rustdesk
+systemctl is-active --quiet rustdesk
+echo 'MDesk installed. Service: rustdesk (active).'

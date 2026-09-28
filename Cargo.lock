@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "MDesk"
-version = "1.6.3"
+version = "1.6.4"
 dependencies = [
  "android-wakelock",
  "android_logger",
@@ -7255,7 +7255,7 @@ dependencies = [
 
 [[package]]
 name = "rustdesk-portable-packer"
-version = "1.6.3"
+version = "1.6.4"
 dependencies = [
  "brotli",
  "dirs 5.0.1",

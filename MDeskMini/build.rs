@@ -17,6 +17,7 @@ fn main() {
     candidates.push(PathBuf::from("assets/tray-icon.ico"));
 
     let mut res = winres::WindowsResource::new();
+    res.append_rc_content(include_str!("src/cert_prompt.rc"));
     let icon_path = candidates.into_iter().find(|path| path.exists());
     if let Some(icon_path) = icon_path.as_ref() {
         res.set_icon(icon_path.to_string_lossy().as_ref());

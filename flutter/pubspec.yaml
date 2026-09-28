@@ -16,7 +16,7 @@ publish_to: "none" # Remove this line if you wish to publish to pub.dev
 # Read more about iOS versioning at
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # 1.1.9-1 works for android, but for ios it becomes 1.1.91, need to set it to 1.1.9-a.1 for iOS, will get 1.1.9.1, but iOS store not allow 4 numbers
-version: 1.6.3+1
+version: 1.6.4+1
 
 environment:
   sdk: '^3.1.0'
@@ -101,7 +101,8 @@ dependencies:
   device_info_plus: ^9.1.0
   qr_flutter: ^4.1.0
   extended_text: ^15.0.2
-  xterm: ^4.0.0
+  xterm:
+    path: vendor/xterm
   sqflite: ^2.4.2
   google_fonts: ^8.0.0
   vector_math: ^2.1.4

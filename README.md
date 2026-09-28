@@ -238,29 +238,30 @@ MDeskMini\build_release_32bit.bat
 ### 고객 PC에서 실행
 
 1. MDesk의 사용자 정의 원격에서 발급한 유효한 인증번호를 준비합니다.
-2. 고객 안내 페이지 흐름을 통해 번호를 전달하거나, 개발 테스트에서는 아래처럼
-   **실제 발급된 번호**를 클립보드에 넣습니다. 임의의 번호로는 검증을 통과할 수 없습니다.
-3. 고객 PC에서 Mini를 실행하고 Windows 관리자 권한 요청을 확인합니다.
+2. 고객 PC에서 Mini를 실행하고 Windows 관리자 권한 요청을 확인합니다.
+3. 표시되는 인증번호 입력창에 **실제 발급된 번호**를 입력하고 확인을 누릅니다.
+   임의의 번호로는 검증을 통과할 수 없습니다. 취소하거나 창을 닫으면 종료합니다.
 4. 인증번호 검증과 서버 준비가 완료되면 상담사 MDesk에서 원격 접속합니다.
 
 프로젝트 루트에서 32비트 빌드를 테스트하는 예입니다. 64비트는 실행 파일 경로를
 `MDeskMini\target\release\mdeskmini.exe`로 바꿉니다.
 
 ```bat
-set /p "CERTNO=발급받은 인증번호 입력: "
-echo certno:%CERTNO%| clip
 start "" "MDeskMini\target\i686-pc-windows-msvc\release\mdeskmini.exe"
 ```
 
-Mini는 클립보드의 `certno:숫자`를 읽어 HTTPS API에서 검증합니다.
-번호가 없거나 검증에 실패하면 원격 대기를 시작하지 않습니다.
-검증 성공 시 해당 번호를 클립보드에서 지우므로 재실행 때는 유효한 번호를 다시 준비합니다.
+인자 없이 실행하면 입력창의 번호를 HTTPS API에서 검증합니다.
+빈 값이나 숫자가 아닌 입력은 입력창에서 안내하며, 검증에 실패하면 원격 대기를 시작하지 않습니다.
+`serve` 명령으로 실행하는 기존 자동화는 클립보드의 `certno:숫자`를 사용합니다.
+검증 성공 시 클립보드에 같은 번호가 있으면 지우므로 재실행 때는 유효한 번호를 다시 준비합니다.
 
 기본 `auto` 모드는 검증 후 Mini가 대기하는 동안 개별 연결 확인창 없이 수락합니다.
 이 시작 단계의 인증번호 검증은 각 접속자의 신원을 따로 인증하는 절차는 아닙니다.
-수동 승인 테스트가 필요하면, 번호를 다시 준비한 뒤 다음 옵션으로 실행합니다.
+수동 승인 테스트가 필요하면, 다음처럼 번호를 클립보드에 넣고 실행합니다.
 
 ```bat
+set /p "CERTNO=발급받은 인증번호 입력: "
+echo certno:%CERTNO%| clip
 start "" "MDeskMini\target\i686-pc-windows-msvc\release\mdeskmini.exe" serve --approve-mode click
 ```
 
@@ -274,6 +275,9 @@ start "" "MDeskMini\target\i686-pc-windows-msvc\release\mdeskmini.exe" serve --a
 Windows 7 전용 배치는 `MDeskMini\build_release_win7_32bit.bat`와
 `MDeskMini\build_release_win7_64bit.bat`입니다. Rust 표준 라이브러리 소스,
 호환성 패치 및 바이너리 검사가 추가되므로 일반 Windows 빌드와 구분합니다.
+Mini의 잠금 파일은 Windows 7 호환성을 위해 `system_shutdown 4.0.1`을 사용합니다.
+`4.1.0`에서 추가되는 Windows 바인딩은 `combase.dll` 의존성 검사를 실패시키므로,
+의존성을 갱신할 때도 배치파일의 호환성 검사를 통과하는지 확인합니다.
 기존 PC의 Cargo 캐시 수정은 새 PC에 자동 복제되지 않으며, 새 환경 재현과
 실제 Windows 7 실행 검증은 별도로 필요합니다.
 
@@ -293,7 +297,7 @@ flutter analyze --no-pub
 - libclang 로딩 실패: `LIBCLANG_PATH`에 실제 `libclang.dll`이 있는지 확인합니다.
 - UPX 실패: UPX의 PATH 등록과 최종 실행 파일 경로를 확인합니다.
 - 본체 실행 시 DLL 오류: `libmdesk.dll`, Flutter DLL 및 data 폴더가 Release 폴더에 있는지 확인합니다.
-- Mini가 원격 대기에 진입하지 않음: 인증번호의 유효성, 클립보드 내용,
+- Mini가 원격 대기에 진입하지 않음: 입력한 인증번호의 유효성(`serve` 실행은 클립보드 내용),
   API 연결 및 HTTPS 인증서 검증 실패 여부를 확인합니다. TLS 검증을 끄는 방식으로 우회하지 않습니다.
 - `--locked` 실패: 잠금 파일과 의존성 변경 원인을 먼저 확인합니다.
   무조건 캐시를 삭제하거나 잠금 파일을 갱신하지 않습니다.

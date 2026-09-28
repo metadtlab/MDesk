@@ -27,6 +27,9 @@ use std::{
 use terminfo::{capability as cap, Database};
 use wallpaper;
 
+#[path = "linux_process.rs"]
+mod process;
+
 type Xdo = *const c_void;
 
 pub const PA_SAMPLE_RATE: u32 = 48000;
@@ -461,10 +464,17 @@ fn set_x11_env(desktop: &Desktop) {
 
 #[inline]
 fn stop_rustdesk_servers() {
-    let _ = run_cmds(&format!(
-        r##"ps -ef | grep -E '{} +--server' | awk '{{print $2}}' | xargs -r kill -9"##,
-        crate::get_app_name().to_lowercase(),
-    ));
+    stop_role_processes("--server");
+}
+
+fn stop_role_processes(role: &str) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    for pid in process::role_processes(Path::new("/proc"), &executable, role) {
+        log::info!("Stopping previous session process: role={role}, pid={pid}");
+        unsafe { hbb_common::libc::kill(pid, hbb_common::libc::SIGKILL) };
+    }
 }
 
 #[inline]
@@ -473,10 +483,7 @@ fn stop_subprocess() {
         r##"ps -ef | grep '/etc/{}/xorg.conf' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9"##,
         crate::get_app_name().to_lowercase(),
     ));
-    let _ = run_cmds(&format!(
-        r##"ps -ef | grep -E '{} +--cm-no-ui' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9"##,
-        crate::get_app_name().to_lowercase(),
-    ));
+    stop_role_processes("--cm-no-ui");
 }
 
 fn should_start_server(

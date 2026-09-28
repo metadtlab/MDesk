@@ -2784,6 +2784,15 @@ pub fn main_get_printer_names() -> SyncReturn<String> {
 }
 
 pub fn main_get_common(key: String) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if key == "linux-registered-users:get" {
+            return crate::registered_remote_users::ui_request(None);
+        }
+        if let Some(value) = key.strip_prefix("linux-registered-users:set:") {
+            return crate::registered_remote_users::ui_request(Some(value));
+        }
+    }
     if key == "is-printer-installed" {
         #[cfg(target_os = "windows")]
         {

@@ -198,7 +198,14 @@ foreach ($name in $forbiddenSymbols) {
 }
 
 $file = Get-Item -LiteralPath $resolvedPath
-$hash = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+# Use the bytes already read above; Get-FileHash may be unavailable in older
+# PowerShell hosts or developer shells with a different module search path.
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $hash = [BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace('-', '')
+} finally {
+    $sha256.Dispose()
+}
 Write-Host ('[OK] {0}, Windows GUI 6.1, {1:N0} bytes' -f $peKind, $file.Length)
 Write-Host ('[OK] {0} imported DLLs; no known Windows 8/10-only loader imports found.' -f $importedDlls.Count)
 Write-Host "SHA256: $hash"

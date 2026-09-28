@@ -3,6 +3,8 @@
 #[cfg(target_os = "windows")]
 mod about;
 #[cfg(target_os = "windows")]
+mod cert_prompt;
+#[cfg(target_os = "windows")]
 mod self_cleanup;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -186,6 +188,7 @@ struct ServeOptions {
     approve_mode: ApproveModeArg,
     password: Option<String>,
     api: Option<String>,
+    certnum: Option<String>,
 }
 
 impl Default for ServeOptions {
@@ -195,6 +198,7 @@ impl Default for ServeOptions {
             approve_mode: ApproveModeArg::Auto,
             password: None,
             api: Some(DEFAULT_API_HINT.to_owned()),
+            certnum: None,
         }
     }
 }
@@ -361,12 +365,40 @@ fn main() {
             approve_mode,
             password,
             api: api.or_else(|| Some(DEFAULT_API_HINT.to_owned())),
+            certnum: None,
         }),
         Some(Commands::Id) => run_id(),
         Some(Commands::Version) => println!("{VERSION}"),
         Some(Commands::SendToController { path }) => run_send_to_controller(path, false, false),
-        None => run_serve(ServeOptions::default()),
+        None => run_default_serve(),
     }
+}
+
+fn run_default_serve() {
+    let options = ServeOptions::default();
+    #[cfg(target_os = "windows")]
+    let options = {
+        diagnostic_event("cert.prompt.open", "requesting certificate number");
+        match cert_prompt::show() {
+            Ok(Some(certnum)) => ServeOptions {
+                certnum: Some(certnum),
+                ..options
+            },
+            Ok(None) => {
+                diagnostic_event("cert.prompt.cancelled", "startup cancelled by user");
+                return;
+            }
+            Err(err) => {
+                diagnostic_event("cert.prompt.failed", &err.to_string());
+                show_error_popup(
+                    "MDeskMini",
+                    "인증번호 입력창을 열지 못했습니다. 다시 실행해 주세요.",
+                );
+                secure_process_exit(1);
+            }
+        }
+    };
+    run_serve(options);
 }
 
 #[cfg(target_os = "windows")]
@@ -839,7 +871,7 @@ fn run_serve(options: ServeOptions) {
         "MDesk 준비중",
         "인증번호를 확인하고 있습니다.",
     );
-    let cert_verification = match require_certificate(apply_clipboard_cert_bootstrap(&options)) {
+    let cert_verification = match require_certificate(apply_certificate_bootstrap(&options)) {
         Ok(verification) => Some(verification),
         Err(err) => {
             diagnostic_event("cert.bootstrap_failed", &err);
@@ -1092,7 +1124,7 @@ fn run_installed_mdesk_handoff(
         "설치된 MDesk 확인",
         "설치된 MDesk를 사용하여 원격 연결을 준비합니다.",
     );
-    let verification = require_certificate(apply_clipboard_cert_bootstrap(options))?;
+    let verification = require_certificate(apply_certificate_bootstrap(options))?;
     show_information_popup(
         "MDeskMini",
         "MDesk가 이미 설치되어 있습니다.\n설치된 MDesk를 실행하여 원격 연결을 준비합니다.",
@@ -1378,23 +1410,25 @@ fn apply_host_policy(options: &ServeOptions) {
     }
 }
 
-fn apply_clipboard_cert_bootstrap(
-    options: &ServeOptions,
-) -> Result<Option<CertVerification>, String> {
-    diagnostic_event(
-        "cert.clipboard.begin",
-        "checking clipboard for certificate number",
-    );
-    let Some(certnum) = clipboard_certnum() else {
-        diagnostic_event("cert.clipboard.empty", "certificate number was not found");
-        return Ok(None);
+fn apply_certificate_bootstrap(options: &ServeOptions) -> Result<Option<CertVerification>, String> {
+    let certnum = if let Some(certnum) = options.certnum.as_ref() {
+        diagnostic_event("cert.prompt.submitted", "using entered certificate number");
+        certnum.clone()
+    } else {
+        diagnostic_event(
+            "cert.clipboard.begin",
+            "checking clipboard for certificate number",
+        );
+        let Some(certnum) = clipboard_certnum() else {
+            diagnostic_event("cert.clipboard.empty", "certificate number was not found");
+            return Ok(None);
+        };
+        diagnostic_event(
+            "cert.clipboard.detected",
+            &format!("digit_count={}", certnum.len()),
+        );
+        certnum
     };
-
-    println!("clipboard certno detected");
-    diagnostic_event(
-        "cert.clipboard.detected",
-        &format!("digit_count={}", certnum.len()),
-    );
 
     match verify_cert_number(&certnum, options.api.as_deref().unwrap_or_default()) {
         Ok(verification) => {

@@ -13,6 +13,7 @@ import 'remote_layout_button.dart';
 import 'remote_pane_drag.dart';
 import 'remote_split_pane.dart';
 import 'remote_split_resize_handles.dart';
+import 'remote_transfer_progress.dart';
 import 'retained_remote_pages.dart';
 import 'tabbar_widget.dart';
 
@@ -508,6 +509,23 @@ class RemoteWorkspaceState extends State<RemoteWorkspace> {
                           layout: layout,
                           onResizeStart: suspendInput,
                           onResizeEnd: resumeInput)),
+                if (!isWeb)
+                  RemoteTransferProgress(
+                    sources: [
+                      // One controller per PC, even when several panes show its
+                      // monitors. Keep transfers from non-active tabs visible.
+                      for (final tab in tabs)
+                        if ((showSplit || tab.key == selected) &&
+                            _ffi(tab.key) != null)
+                          RemoteTransferProgressSource(
+                            _ffi(tab.key)!.fileModel.jobController,
+                            label: showSplit ? _peerLabel(tab.key) : null,
+                          ),
+                    ],
+                    bottom: stateGlobal.showTabBar.value ? 16 : 42,
+                    onInteractionStart: suspendInput,
+                    onInteractionEnd: resumeInput,
+                  ),
                 if (!stateGlobal.showTabBar.value)
                   Positioned(
                       right: 4,

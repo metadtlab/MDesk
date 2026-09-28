@@ -322,6 +322,17 @@ enum AccessAuthMethod {
     TwoFactor,
 }
 
+enum PasswordValidationError {
+    Invalid(String),
+    RegistrationServiceUnavailable,
+}
+
+impl From<String> for PasswordValidationError {
+    fn from(reason: String) -> Self {
+        Self::Invalid(reason)
+    }
+}
+
 impl AccessAuthMethod {
     fn as_audit_str(self) -> &'static str {
         match self {
@@ -3286,21 +3297,35 @@ impl Connection {
         hasher2.finalize()[..] == self.lr.password[..]
     }
 
-    fn validate_password(&mut self) -> Result<AccessAuthMethod, String> {
+    async fn validate_password(&mut self) -> Result<AccessAuthMethod, PasswordValidationError> {
         log::info!("========== 암호 검증 시작 ==========");
         log::info!("접속 시도 피어: {}", self.lr.my_id);
 
         log::info!("[1단계] 등록된 원격자 암호로 인증 시도...");
-        match self.validate_registered_remote_user() {
+        let registration_unavailable = match self.validate_registered_remote_user().await {
             Ok(()) => {
                 log::info!("★★★ 등록된 원격자로 인증 성공: {} ★★★", self.lr.my_id);
                 return Ok(AccessAuthMethod::RegisteredRemoteUser);
             }
-            Err(e) => {
+            Err(PasswordValidationError::Invalid(e)) => {
                 log::info!("[1단계] 등록된 원격자 인증 실패: {}", e);
+                false
             }
-        }
+            Err(PasswordValidationError::RegistrationServiceUnavailable) => true,
+        };
 
+        // Other enabled credentials may still succeed. A service failure must
+        // not be reported as an incorrect registered-user password.
+        self.validate_builtin_password().map_err(|reason| {
+            if registration_unavailable {
+                PasswordValidationError::RegistrationServiceUnavailable
+            } else {
+                reason.into()
+            }
+        })
+    }
+
+    fn validate_builtin_password(&self) -> Result<AccessAuthMethod, String> {
         let is_portable = crate::is_running_portable();
         log::info!("포터블 모드: {}", is_portable);
 
@@ -3374,17 +3399,31 @@ impl Connection {
     }
 
     /// 등록된 원격자의 연결 암호로 인증 확인
-    fn validate_registered_remote_user(&self) -> Result<(), String> {
+    async fn validate_registered_remote_user(&mut self) -> Result<(), PasswordValidationError> {
+        #[cfg(not(target_os = "linux"))]
         use hbb_common::config::{Config, LocalConfig};
 
         log::info!("[RemoteUser] ========== 원격자 인증 시작 ==========");
         log::info!("[RemoteUser] 접속 시도 피어 ID: {}", self.lr.my_id);
         log::info!("[RemoteUser] 포터블 모드: {}", crate::is_running_portable());
 
-        let config_path = Config::path(format!("{}_local.toml", crate::get_app_name()));
-        log::info!("[RemoteUser] 설정 파일 경로: {:?}", config_path);
-        log::info!("[RemoteUser] 파일 존재 여부: {}", config_path.exists());
+        #[cfg(not(target_os = "linux"))]
+        {
+            let config_path = Config::path(format!("{}_local.toml", crate::get_app_name()));
+            log::info!("[RemoteUser] 설정 파일 경로: {:?}", config_path);
+            log::info!("[RemoteUser] 파일 존재 여부: {}", config_path.exists());
+        }
+        #[cfg(target_os = "linux")]
+        log::info!("[RemoteUser] Linux 서비스의 등록 원격자 정보 조회");
 
+        #[cfg(target_os = "linux")]
+        let registered_users_json = crate::registered_remote_users::load()
+            .await
+            .map_err(|error| {
+                log::error!("[RemoteUser] Registration service lookup failed: {error:#}");
+                PasswordValidationError::RegistrationServiceUnavailable
+            })?;
+        #[cfg(not(target_os = "linux"))]
         let registered_users_json = LocalConfig::get_option_from_file("registered_remote_users");
         log::info!(
             "[RemoteUser] registered_remote_users 값 길이: {}",
@@ -3392,14 +3431,8 @@ impl Connection {
         );
 
         if registered_users_json.is_empty() {
-            let cached_value = LocalConfig::get_option("registered_remote_users");
-            log::info!("[RemoteUser] 캐시된 값 길이: {}", cached_value.len());
             log::info!("[RemoteUser] 등록된 원격자 없음 (registered_remote_users 비어있음)");
-            log::info!("[RemoteUser] 설정 파일을 확인하세요: {:?}", config_path);
-            return Err(
-                "registered_remote_users 옵션 비어 있음(LocalConfig/_local.toml에 등록 목록 없음)"
-                    .to_string(),
-            );
+            return Err("registered_remote_users 등록 목록 없음".to_string().into());
         }
 
         log::info!(
@@ -3411,8 +3444,7 @@ impl Connection {
             Ok(v) => v,
             Err(e) => {
                 log::error!("[RemoteUser] JSON 파싱 실패: {}", e);
-                log::error!("[RemoteUser] JSON 내용: {}", registered_users_json);
-                return Err(format!("registered_remote_users JSON 파싱 실패: {}", e));
+                return Err(format!("registered_remote_users JSON 파싱 실패: {}", e).into());
             }
         };
 
@@ -3548,12 +3580,12 @@ impl Connection {
             return Err(format!(
                 "요청 계정 ID('{}', 이름='{}')가 등록 목록과 불일치. 등록 ID: {:?}",
                 requester_account_id, self.lr.my_name, registered_ids
-            ));
+            ).into());
         }
 
         log::info!("[RemoteUser] 일치하는 ID의 등록 원격자 암호 검증 실패");
         log::info!("[RemoteUser] ========== 원격자 인증 종료 ==========");
-        Err("등록 원격자 ID는 일치했으나 연결 암호가 틀림".to_string())
+        Err("등록 원격자 ID는 일치했으나 연결 암호가 틀림".to_string().into())
     }
 
     /// 연결 암호 복호화
@@ -4011,7 +4043,7 @@ impl Connection {
                     );
                     return true;
                 }
-                match self.validate_password() {
+                match self.validate_password().await {
                     Ok(method) => {
                         self.log_access_audit("SUCCESS", Some(method), "비밀번호 검증 성공");
                         self.update_failure(failure, true, 0);
@@ -4029,7 +4061,14 @@ impl Connection {
                             self.send_login_error(err_msg).await;
                         }
                     }
-                    Err(reason) => {
+                    Err(PasswordValidationError::RegistrationServiceUnavailable) => {
+                        self.log_access_audit("FAIL", None, "registered-user service unavailable");
+                        // Built-in credentials were also attempted. Preserve
+                        // throttling even while registration IPC is unavailable.
+                        self.update_failure(failure, false, 0);
+                        self.send_login_error("Registered-user authentication service is unavailable. Please restart the MDesk service on the remote computer.").await;
+                    }
+                    Err(PasswordValidationError::Invalid(reason)) => {
                         self.log_access_audit("FAIL", None, &reason);
                         self.update_failure(failure, false, 0);
                         if err_msg.is_empty() {

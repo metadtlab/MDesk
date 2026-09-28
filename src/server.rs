@@ -768,6 +768,14 @@ async fn sync_and_watch_config_dir() {
                         );
                         continue;
                     }
+                    #[cfg(target_os = "linux")]
+                    if !crate::platform::is_prelogin() {
+                        // The service is now ready. Migrate only an uninitialized
+                        // registry; another profile's stale copy cannot replace it.
+                        if let Err(error) = crate::registered_remote_users::load().await {
+                            log::warn!("Registered-user migration unavailable: {error}");
+                        }
+                    }
                 }
 
                 loop {

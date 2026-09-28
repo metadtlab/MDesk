@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Ubuntu에서 MDesk 원격 제어를 시작하세요. Linux 설치와 업데이트를 간편하게 안내합니다.">
+  <title>MDesk Linux 다운로드</title>
+  <link rel="icon" href="@HOME_URL@/static/favicon.ico">
+  <link rel="stylesheet" href="https://hangeul.pstatic.net/hangeul_static/css/nanum-square-neo.css">
+  <style>
+    :root { color-scheme: light; font-family: 'NanumSquareNeo', 'Nanum Square Neo', 'Malgun Gothic', sans-serif; color: #1f2937; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 280px; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); background-attachment: fixed; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    a { color: inherit; text-decoration: none; }
+    button { font: inherit; cursor: pointer; }
+    button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px solid #526be3; outline-offset: 5px; }
+    [hidden] { display: none !important; }
+    .page { display: flex; min-height: 100vh; padding: 32px 20px; justify-content: center; align-items: center; }
+    .card { width: 100%; max-width: 760px; padding: 30px 44px 28px; border-radius: 30px; background: rgba(255, 255, 255, .97); box-shadow: 0 20px 60px rgba(0, 0, 0, .28); }
+    .topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: #64748b; }
+    .back { display: inline-flex; align-items: center; gap: 6px; padding: 4px 0; }
+    .back:hover { color: #2b58f0; }
+    .edition { color: #6a6e8e; letter-spacing: .12em; font-size: 10px; font-weight: 800; }
+    .icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
+    .back .icon { width: 15px; height: 15px; }
+    .hero { text-align: center; padding-top: 17px; }
+    .logo { display: block; width: 88px; height: 88px; margin: 0 auto 19px; border-radius: 19px; }
+    h1 { margin: 0; font-size: 34px; font-weight: 800; letter-spacing: -1.4px; line-height: 1.3; }
+    .subtitle { margin: 12px 0 18px; color: #64748b; font-size: 14px; line-height: 1.8; word-break: keep-all; }
+    .platforms { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; }
+    .pill { display: inline-flex; gap: 5px; align-items: center; padding: 7px 11px; border: 1px solid #e0e5f1; border-radius: 8px; background: #f0f3fa; color: #546580; font-size: 11px; font-weight: 700; }
+    .pill.os { background: #edf8f3; border-color: #d1ecdd; color: #268655; }
+    .pill .icon { width: 13px; height: 13px; }
+    .install { margin-top: 29px; }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+    h2 { margin: 0; font-size: 14px; font-weight: 800; letter-spacing: -.25px; }
+    .hint { color: #8993a7; font-size: 11px; }
+    .terminal { border: 1px solid #e0e5ee; border-radius: 13px; overflow: hidden; background: #f2f4f9; }
+    .terminal-bar { display: flex; align-items: center; gap: 7px; padding: 10px 15px; background: #eaeef6; color: #7b879d; font-size: 10px; border-bottom: 1px solid #e0e5ee; }
+    .terminal-bar .icon { width: 13px; height: 13px; }
+    pre { margin: 0; padding: 16px 17px; overflow-x: auto; color: #34415a; font: 12px/1.95 ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace; tab-size: 2; }
+    code { font-family: inherit; }
+    .primary { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; min-height: 59px; margin-top: 14px; padding: 14px 18px; color: #fff; border: 0; border-radius: 14px; background: linear-gradient(135deg, #28a745 0%, #20c997 100%); box-shadow: 0 10px 27px rgba(40, 167, 69, .25); font-size: 18px; font-weight: 800; transition: filter .18s, transform .18s; }
+    .primary:hover { filter: brightness(1.04); transform: translateY(-1px); }
+    .primary:active { transform: translateY(0); }
+    .primary .icon { width: 21px; height: 21px; }
+    .copy-status { min-height: 20px; margin: 10px 0 0; text-align: center; font-size: 11px; line-height: 1.8; color: #738099; word-break: keep-all; }
+    .copy-status.success { color: #208555; }
+    .direct-download { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; margin: 16px 0 0; font-size: 12px; }
+    .direct-download span { color: #8b95a8; }
+    .direct-download a { display: inline-flex; align-items: center; gap: 5px; color: #4261be; font-weight: 800; padding: 3px 0; }
+    .direct-download a:hover { text-decoration: underline; text-underline-offset: 4px; }
+    .direct-download .icon { width: 15px; height: 15px; }
+    .extras { margin-top: 27px; border-top: 1px solid #e6e9f0; }
+    details { border-bottom: 1px solid #e6e9f0; }
+    summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 0; cursor: pointer; list-style: none; color: #536079; font-size: 12px; font-weight: 700; }
+    summary::-webkit-details-marker { display: none; }
+    summary .icon { width: 15px; height: 15px; transition: transform .18s; }
+    details[open] summary .icon { transform: rotate(180deg); }
+    .detail-body { padding: 0 0 18px; font-size: 12px; line-height: 1.8; color: #6b778d; }
+    .detail-body p { margin: 0 0 11px; word-break: keep-all; }
+    .detail-body pre { background: #f0f3f8; border: 1px solid #e0e5ee; border-radius: 10px; }
+    .detail-body .small-copy { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 8px 12px; border: 1px solid #dce2ee; border-radius: 8px; background: #fff; color: #526485; font-size: 11px; font-weight: 700; }
+    .small-copy .icon { width: 13px; height: 13px; }
+    .version { display: block; padding: 8px 0 12px; font-size: 11px; overflow-wrap: anywhere; }
+    .file-links { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .file-links a { padding: 7px 11px; color: #4261be; background: #eff3fb; border: 1px solid #dde5f4; border-radius: 7px; font-size: 11px; font-weight: 700; }
+    .file-links a:hover { background: #e4ebfb; }
+    .fingerprint { padding: 10px 12px; border-radius: 8px; background: #f0f3f8; font: 11px/1.8 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; color: #5d6b82; }
+    .footer { margin: 18px 0 0; color: #939bad; font-size: 10px; text-align: center; line-height: 1.7; }
+    .footer strong { color: #6b79a2; font-weight: 700; }
+    @media (max-width: 540px) {
+      .page { padding: 16px 12px; align-items: flex-start; }
+      .card { padding: 24px 22px; border-radius: 24px; }
+      .hero { padding-top: 22px; }
+      .logo { width: 78px; height: 78px; border-radius: 17px; margin-bottom: 17px; }
+      h1 { font-size: 29px; }
+      .subtitle { font-size: 12px; }
+      .pill { font-size: 10px; padding: 7px 8px; }
+      .install { margin-top: 25px; }
+      .section-heading { align-items: baseline; }
+      .hint { font-size: 10px; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; padding: 13px; line-height: 1.9; }
+      .primary { min-height: 56px; font-size: 16px; }
+      .direct-download { font-size: 11px; }
+      .extras { margin-top: 23px; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
+
+    .os-nav { display: flex; justify-content: center; gap: 5px; margin: 21px auto 0; padding: 5px; width: fit-content; border: 1px solid #e1e6f1; border-radius: 12px; background: #edf0f7; }
+    .os-nav a { padding: 9px 18px; border-radius: 8px; font-size: 12px; font-weight: 700; color: #708099; }
+    .os-nav a:hover { color: #415bbb; background: #e3e9f7; }
+    .os-nav a[aria-current="page"] { color: #4261be; background: #fff; box-shadow: 0 2px 7px #263c6812; }
+    @media (max-width: 540px) { .os-nav a { padding: 9px 15px; font-size: 11px; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <article class="card" aria-labelledby="page-title">
+      <div class="topline">
+        <a class="back" href="@HOME_URL@/" aria-label="MDesk 홈페이지로 돌아가기"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>MDesk 홈</a>
+        <span class="edition">LINUX DOWNLOAD</span>
+      </div>
+      <header class="hero">
+        <img class="logo" src="@LOGO_DATA_URL@" alt="MDesk 메타데이터랩" width="88" height="88">
+        <h1 id="page-title">MDesk Linux</h1>
+        <p class="subtitle">리눅스에서도 안전하고 빠른 원격 제어<br>설치 명령어를 복사해 간편하게 시작하세요</p>
+        <div class="platforms" aria-label="지원 환경 및 버전">
+          <span class="pill os"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Ubuntu 24.04 / 26.04 LTS</span>
+          <span class="pill">64비트 (x64)</span>
+          <span class="pill">v@DISPLAY_VERSION@</span>
+        </div>
+<nav class="os-nav" aria-label="운영체제별 다운로드"><a href="@HOME_URL@/windows/">Windows</a><a href="@HOME_URL@/mac/">macOS</a><a href="@HOME_URL@/linux/" aria-current="page">Linux</a></nav>
+      </header>
+      <section class="install" aria-labelledby="install-title">
+        <div class="section-heading"><h2 id="install-title">터미널로 설치</h2><span class="hint">아래 두 줄을 실행하세요</span></div>
+        <div class="terminal">
+          <div class="terminal-bar"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 5 6 6-6 6m9 0h7"/></svg>Terminal</div>
+          <pre><code id="install-command">curl -fsSLo install-mdesk.sh @BASE_URL@/install-mdesk.sh
+sudo bash install-mdesk.sh</code></pre>
+        </div>
+        <button class="primary" type="button" data-copy="install-command" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg><span>설치 명령어 복사</span></button>
+        <p class="copy-status" id="copy-status" role="status" aria-live="polite">터미널에 붙여넣고 실행한 뒤, 리눅스 로그인 암호를 입력하세요.</p>
+        <div class="direct-download"><span>설치 파일이 필요하신가요?</span><a href="pool/main/m/mdesk/@FILENAME@" download><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M12 3v12m-5-5 5 5 5-5"/></svg>.deb 직접 다운로드</a></div>
+      </section>
+      <section class="extras" aria-label="추가 설치 안내">
+        <details>
+          <summary>이미 설치하셨나요? 업데이트 방법<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>
+          <div class="detail-body">
+            <p>위 설치 명령으로 설치했다면, 터미널에서 아래 명령을 실행하세요.</p>
+            <pre><code id="update-command">sudo apt-get update
+sudo apt-get install --only-upgrade mdesk</code></pre>
+            <button class="small-copy" type="button" data-copy="update-command" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg><span>업데이트 명령어 복사</span></button>
+          </div>
+        </details>
+        <details>
+          <summary>설치 파일 및 서명 정보<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary>
+          <div class="detail-body">
+            <p>터미널 설치는 서명된 저장소로 패키지를 검증합니다. .deb 파일을 직접 설치할 경우 아래 공개키와 체크섬으로 파일을 확인할 수 있습니다.</p>
+            <span class="version">패키지 버전: @VERSION@</span>
+            <div class="file-links"><a href="mdesk-archive-keyring.asc" download>공개 서명 키</a><a href="SHA256SUMS" download>체크섬</a><a href="SHA256SUMS.asc" download>체크섬 서명</a></div>
+            <p>서명 키 지문</p>
+            <div class="fingerprint">@FINGERPRINT@</div>
+          </div>
+        </details>
+      </section>
+      <p class="footer"><strong>MDesk</strong> · 안전하고 빠른 원격 데스크톱 제어</p>
+    </article>
+  </main>
+  <script>
+    (() => {
+      const status = document.getElementById('copy-status');
+      async function copyText(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+          try { await navigator.clipboard.writeText(text); return; } catch (_) {}
+        }
+        const previousFocus = document.activeElement;
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('aria-label', '복사할 명령어');
+        textarea.style.cssText = 'position:fixed;left:-9999px;top:0;';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); }
+        finally { textarea.remove(); if (previousFocus instanceof HTMLElement) previousFocus.focus(); }
+        if (!copied) throw new Error('Clipboard unavailable');
+      }
+      document.querySelectorAll('[data-copy]').forEach(button => {
+        button.hidden = false;
+        let timer;
+        button.addEventListener('click', async () => {
+          const label = button.querySelector('span');
+          const original = button.dataset.copy === 'install-command' ? '설치 명령어 복사' : '업데이트 명령어 복사';
+          try {
+            await copyText(document.getElementById(button.dataset.copy).textContent.trim());
+            clearTimeout(timer);
+            label.textContent = '복사 완료!';
+            status.textContent = original.replace(' 복사', '') + '를 복사했습니다. 터미널에 붙여넣고 실행하세요.';
+            status.classList.add('success');
+            timer = setTimeout(() => { label.textContent = original; }, 2400);
+          } catch (_) {
+            status.textContent = '명령어를 선택한 후 직접 복사해 주세요.';
+            status.classList.remove('success');
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

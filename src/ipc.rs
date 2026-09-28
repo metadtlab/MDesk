@@ -288,6 +288,8 @@ pub enum Data {
     FS(FS),
     Test,
     SyncConfig(Option<Box<(Config, Config2)>>),
+    #[cfg(target_os = "linux")]
+    RegisteredRemoteUsers(crate::registered_remote_users::RegistryMessage),
     #[cfg(target_os = "windows")]
     ClipboardFile(ClipboardFile),
     ClipboardFileEnabled(bool),
@@ -404,18 +406,32 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                 }
                                 Ok(Some(data)) => {
                                     // On Linux/macOS, the protected `_service` channel is used only for
-                                    // syncing config between root service and the active user process.
+                                    // syncing config and Linux registered-user credentials between
+                                    // the root service and the active user process.
                                     //
                                     // NOTE: `is_service_ipc_postfix()` also includes `_uinput_*`, but those
                                     // channels are handled by the dedicated uinput listener/protocol in
                                     // `src/server/uinput.rs` and therefore do not share this Data enum
-                                    // allowlist. The SyncConfig allowlist here is intentionally scoped to the
+                                    // allowlist. The configuration/credential allowlist is scoped to the
                                     // `_service` channel only.
                                     //
                                     // Keep this explicit branch to avoid policy drift between `_service` and
                                     // uinput IPC paths while still minimizing exposed message surface here.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     if postfix == crate::POSTFIX_SERVICE {
+                                        #[cfg(target_os = "linux")]
+                                        if let Data::RegisteredRemoteUsers(message) = data {
+                                            // Recheck identity/active UID on every credential request,
+                                            // including connections opened before a session switch.
+                                            if !authorize_service_scoped_ipc_connection(&stream, &postfix) {
+                                                break;
+                                            }
+                                            let may_write = stream.peer_uid() == Some(0)
+                                                || !crate::platform::is_prelogin();
+                                            let response = crate::registered_remote_users::handle_service(message, may_write);
+                                            allow_err!(stream.send(&Data::RegisteredRemoteUsers(response)).await);
+                                            continue;
+                                        }
                                         if matches!(&data, Data::SyncConfig(_)) {
                                             handle(data, &mut stream).await;
                                         } else {
@@ -511,8 +527,7 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
                 // NOTE: On Linux/macOS, some IPC sockets are intentionally world-connectable
                 // (0666) so the active (non-root) user process can connect. Authorization is
                 // enforced at accept-time for these channels, and the protected `_service`
-                // channel is further restricted by an explicit message allowlist (SyncConfig
-                // only).
+                // channel permits only config sync and the Linux registration protocol.
                 let socket_mode = if config::is_service_ipc_postfix(postfix) {
                     0o0666
                 } else {

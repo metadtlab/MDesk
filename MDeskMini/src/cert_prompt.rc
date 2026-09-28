@@ -1,0 +1,16 @@
+#include <windows.h>
+#pragma code_page(65001)
+
+// Resource/control IDs are shared with cert_prompt.rs.
+101 DIALOGEX 0, 0, 250, 112
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "MDeskMini - 인증번호 입력"
+FONT 10, "맑은 고딕"
+BEGIN
+    LTEXT "원격지원을 위해 전달받은 인증번호를 입력해 주세요.", -1, 12, 12, 226, 20
+    LTEXT "인증번호(&N)", -1, 12, 36, 52, 14
+    EDITTEXT 1001, 68, 34, 170, 18, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "", 1002, 12, 58, 226, 16
+    DEFPUSHBUTTON "확인", IDOK, 122, 82, 54, 18
+    PUSHBUTTON "취소", IDCANCEL, 184, 82, 54, 18
+END
