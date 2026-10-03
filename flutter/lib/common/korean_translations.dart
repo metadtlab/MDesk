@@ -46,6 +46,31 @@ const Map<String, String> koreanTranslations = {
   "About": "정보",
   "Slogan_tip": "",
   "Privacy Statement": "개인정보 보호정책",
+  "Request account deletion": "계정 삭제 요청",
+  "Request deletion of your MDesk account and associated personal data by email.":
+      "이메일로 MDesk 계정과 관련 개인정보의 삭제를 요청할 수 있습니다.",
+  "For MetaDataLab MDesk service accounts. For independently hosted or customer-managed accounts, contact your server administrator.":
+      "메타데이터랩 MDesk 서비스 계정의 삭제 요청입니다. 자체 구축하거나 고객사가 관리하는 서버의 계정은 해당 서버 관리자에게 문의해 주세요.",
+  "Opening the email draft does not send it or delete your account. Send the request from your email app. We may need to verify ownership before processing.":
+      "메일 초안을 여는 것만으로 요청이 발송되거나 계정이 삭제되지는 않습니다. 메일 앱에서 내용을 확인하고 직접 보내 주세요. 처리 전에 계정 소유 확인이 필요할 수 있습니다.",
+  "Do not include passwords, verification codes, or access tokens.":
+      "비밀번호, 인증 코드, 액세스 토큰을 보내지 마세요.",
+  "Open deletion request email": "삭제 요청 메일 작성",
+  "Copy email address": "이메일 주소 복사",
+  "Privacy policy": "개인정보처리방침",
+  "No email app could be opened. Copy the email address and send your deletion request manually.":
+      "메일 앱을 열 수 없습니다. 이메일 주소를 복사해 계정과 관련 개인정보의 삭제 요청을 직접 보내 주세요.",
+  "Email address copied.": "이메일 주소를 복사했습니다.",
+  "Could not copy the address. Select and copy it manually.":
+      "주소를 복사하지 못했습니다. 화면의 이메일 주소를 선택해 직접 복사해 주세요.",
+  "Could not open the privacy policy. You can view it at:":
+      "개인정보처리방침을 열 수 없습니다. 다음 주소에서 확인할 수 있습니다:",
+  "MDesk account deletion request": "MDesk 계정 삭제 요청",
+  "Please delete my MDesk account and its associated personal data.":
+      "제 MDesk 계정과 관련 개인정보의 삭제를 요청합니다.",
+  "Account name:": "계정 ID:",
+  "Please let me know how to verify account ownership and complete this deletion request.":
+      "계정 소유 확인 방법과 삭제 요청 처리 절차를 알려 주세요.",
   "Mute": "음소거",
   "Build Date": "빌드 날짜",
   "Version": "버전",
@@ -79,7 +104,8 @@ const Map<String, String> koreanTranslations = {
   "Connecting...": "연결 중...",
   "Connection in progress. Please wait.": "연결이 진행 중입니다. 기다려 주세요.",
   "Please try 1 minute later": "1분 후에 다시 시도하세요",
-  "Too many wrong password attempts. Please try again in {} minutes.": "비밀번호 오류 횟수를 초과하여 접속이 잠겼습니다. {}분 후에 다시 시도하세요.",
+  "Too many wrong password attempts. Please try again in {} minutes.":
+      "비밀번호 오류 횟수를 초과하여 접속이 잠겼습니다. {}분 후에 다시 시도하세요.",
   "Login Error": "로그인 오류",
   "Successful": "성공",
   "Connected, waiting for image...": "연결되었습니다, 이미지를 기다리는 중...",

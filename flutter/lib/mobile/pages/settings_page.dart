@@ -12,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common.dart';
+import '../../common/widgets/account_deletion_dialog.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
 import '../../consts.dart';
@@ -647,6 +648,15 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   }
                 },
               ),
+              SettingsTile(
+                title: Text(translate('Request account deletion')),
+                leading: Icon(Icons.person_remove_outlined),
+                onPressed: (context) => showAccountDeletionDialog(
+                  context,
+                  accountName: gFFI.userModel.userName.value,
+                  translate: translate,
+                ),
+              ),
             ],
           ),
         SettingsSection(title: Text(translate("Settings")), tiles: [
@@ -868,7 +878,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             SettingsTile(
               title: Text(translate("Privacy Statement")),
               onPressed: (context) =>
-                  launchUrlString('https://www.mdesk.co.kr/#privacy-policy'),
+                  launchUrlString('https://www.mdesk.co.kr/privacy-policy.html'),
               leading: Icon(Icons.privacy_tip),
             )
           ],

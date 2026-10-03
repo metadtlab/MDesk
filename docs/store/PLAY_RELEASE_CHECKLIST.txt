@@ -1,0 +1,77 @@
+MDesk Android Remote 1.6.5 (2006) - Release preparation
+Prepared: 2026-10-03
+Status: source changes prepared; NOT built, submitted or released.
+
+Source changes
+- Settings > Account > Request account deletion is available when logged out.
+- The user explicitly opens a deletion request email draft. The app does not
+  send an email, automatically log out, or delete data itself.
+- Default contact: metadtlab@gmail.com, for MetaDataLab service accounts.
+  Independently hosted/customer-managed accounts should contact their server
+  administrator. No credentials/tokens are added to the draft.
+- If there is no mail handler, the address can be selected or copied.
+- Mobile Privacy Statement now opens the published privacy-policy.html.
+- Flutter build number is 2006. Code 2005 has already been uploaded and cannot
+  be reused. The marketing version remains 1.6.5.
+
+Source-only verification
+- 19 selected tests passed: account_deletion_dialog_test.dart,
+  account_request_scope_test.dart and login_session_status_test.dart.
+- Dialog/translation/test analysis passed. Settings page analysis has the
+  existing unused shareScreenTiles warning, unrelated to this change.
+- login_response_test.dart could not load in the clean worktree without the
+  ignored generated_bridge.dart. It is not included in the passing-test count.
+- No Android/Windows build or final-device validation was run on this Mac.
+
+Build on the user's Android build machine
+1. Use the source revision containing these changes; preserve local keystore
+   and signing configuration. Do not add either to Git or source downloads.
+2. Run the existing build_android_remote_release_aab.bat from the repo root.
+   It builds release Remote flavor (kr.co.mdesk.remote), not Android Host.
+3. Output: flutter\build\app\outputs\bundle\remoteRelease\app-remote-release.aab
+   Suggested delivery name: MDesk-Remote-v1.6.5-code2006.aab
+4. Confirm the exact final bundle versionCode 2006 / versionName 1.6.5, upload
+   certificate continuity, target SDK, native 16 KB compatibility and release
+   signing. Test the final installed artifact, not just its filename.
+5. On the final Android app, test Settings > Account > Request account deletion
+   both logged in and logged out, including no mail app and clipboard fallback.
+   Confirm original login and remote control still work.
+
+Deletion webpage - publication still required
+- The operator will add a prominent deletion section to:
+  https://www.mdesk.co.kr/privacy-policy.html
+- Recommended section id: account-deletion, so Play Console can point directly
+  to https://www.mdesk.co.kr/privacy-policy.html#account-deletion
+- docs/store/account-deletion.html is an OPTIONAL, unpublished standalone
+  content/layout reference. It has not been deployed to the website.
+- The operator confirmed: all associated personal data except the former login
+  ID is deleted. Only that login ID is retained to prevent duplicate IDs for
+  two years. State this exception and period clearly before publication.
+- Resolve the existing policy's general 'account data retained one year after
+  withdrawal' wording with the actual deletion-request practice. Do not claim
+  all data is deleted if login IDs are retained.
+- Include: developer/app name, account AND associated-data scope, prominent
+  working email request mechanism, verification steps, retained fields,
+  retention purpose and duration. No password/verification-code request.
+- Verify the public URL loads without sign-in before declaring it in Play.
+
+Play Console - pending before submission
+[ ] Replace the 2005 production draft bundle with verified 2006.
+[ ] Correct Data safety: existing 'no collection' is not accurate. Current source
+    sends user IDs, device IDs, app interactions, notes/user-generated content,
+    and optionally session-recording videos. App-linked account registration
+    collects phone/email/company fields. Confirm server-side optional fields
+    and sharing/processing practices before making final declarations.
+[ ] Do not claim all collected data is encrypted in transit while arbitrary
+    custom HTTP API endpoints remain supported for memo/audit requests.
+[ ] Add the verified public account-deletion URL and account-creation methods.
+[ ] Confirm reviewer test account can reach all relevant features and an online
+    demo PC; give actual required connection steps without exposing customer
+    credentials. Do not invent or assume access.
+[ ] Save and review the release, then submit only when all above items match
+    the exact binary and service. Publication/review has NOT been performed.
+
+Official requirements
+https://support.google.com/googleplay/android-developer/answer/13327111
+https://support.google.com/googleplay/android-developer/answer/10787469
+https://developer.android.com/guide/practices/page-sizes
