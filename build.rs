@@ -47,6 +47,9 @@ fn install_android_deps() {
     if target_os != "android" {
         return;
     }
+    // NDK r27 requires explicit linker options for 16 KB page-size devices.
+    println!("cargo:rustc-link-arg=-Wl,-z,max-page-size=16384");
+    println!("cargo:rustc-link-arg=-Wl,-z,common-page-size=16384");
     let mut target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     if target_arch == "x86_64" {
         target_arch = "x64".to_owned();

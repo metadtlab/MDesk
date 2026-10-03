@@ -1,3 +1,4 @@
+use super::password_attempts::{lockout_message, PasswordAttemptLimiter};
 use super::{input_service::*, *};
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::clipboard::try_empty_clipboard_files;
@@ -67,7 +68,8 @@ use std::collections::HashSet;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
 lazy_static::lazy_static! {
-    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
+    static ref PASSWORD_FAILURES: Mutex<PasswordAttemptLimiter> = Default::default();
+    static ref TWO_FACTOR_FAILURES: Mutex<HashMap<String, (i32, i32, i32)>> = Default::default();
     static ref SESSIONS: Arc::<Mutex<HashMap<SessionKey, Session>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
@@ -3812,6 +3814,9 @@ impl Connection {
             if self.authorized {
                 return true;
             }
+            if !self.check_password_lockout().await {
+                return true;
+            }
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Connection::permission(keys::OPTION_ENABLE_FILE_TRANSFER) {
@@ -4034,19 +4039,13 @@ impl Connection {
                     .await;
                 }
             } else {
-                let (failure, res) = self.check_failure(0).await;
-                if !res {
-                    self.log_access_audit(
-                        "FAIL",
-                        None,
-                        "동일 IP에서 단시간 내 로그인 실패 획수 초과(차단) — Too many wrong attempts / Please try 1 minute later",
-                    );
-                    return true;
-                }
                 match self.validate_password().await {
                     Ok(method) => {
+                        if let Some(remaining) = self.update_password_failure(true) {
+                            self.send_password_lockout(remaining).await;
+                            return true;
+                        }
                         self.log_access_audit("SUCCESS", Some(method), "비밀번호 검증 성공");
-                        self.update_failure(failure, true, 0);
                         if err_msg.is_empty() {
                             #[cfg(target_os = "linux")]
                             self.linux_headless_handle.wait_desktop_cm_ready().await;
@@ -4065,12 +4064,18 @@ impl Connection {
                         self.log_access_audit("FAIL", None, "registered-user service unavailable");
                         // Built-in credentials were also attempted. Preserve
                         // throttling even while registration IPC is unavailable.
-                        self.update_failure(failure, false, 0);
-                        self.send_login_error("Registered-user authentication service is unavailable. Please restart the MDesk service on the remote computer.").await;
+                        if let Some(remaining) = self.update_password_failure(false) {
+                            self.send_password_lockout(remaining).await;
+                        } else {
+                            self.send_login_error("Registered-user authentication service is unavailable. Please restart the MDesk service on the remote computer.").await;
+                        }
                     }
                     Err(PasswordValidationError::Invalid(reason)) => {
                         self.log_access_audit("FAIL", None, &reason);
-                        self.update_failure(failure, false, 0);
+                        if let Some(remaining) = self.update_password_failure(false) {
+                            self.send_password_lockout(remaining).await;
+                            return true;
+                        }
                         if err_msg.is_empty() {
                             self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
                                 .await;
@@ -4085,7 +4090,10 @@ impl Connection {
                 }
             }
         } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
-            let (failure, res) = self.check_failure(1).await;
+            if !self.check_password_lockout().await {
+                return true;
+            }
+            let (failure, res) = self.check_2fa_failure().await;
             if !res {
                 self.log_access_audit(
                     "FAIL",
@@ -4102,7 +4110,7 @@ impl Connection {
                             Some(AccessAuthMethod::TwoFactor),
                             "2FA(TOTP) 검증 성공",
                         );
-                        self.update_failure(failure, true, 1);
+                        self.update_2fa_failure(failure, true);
                         self.require_2fa.take();
                         raii::AuthedConnID::set_session_2fa(self.session_key());
                         self.send_logon_response().await;
@@ -4126,7 +4134,7 @@ impl Connection {
                             Some(AccessAuthMethod::TwoFactor),
                             "2FA(TOTP) 코드 불일치",
                         );
-                        self.update_failure(failure, false, 1);
+                        self.update_2fa_failure(failure, false);
                         self.send_login_error(crate::client::LOGIN_MSG_2FA_WRONG)
                             .await;
                     }
@@ -5374,7 +5382,47 @@ impl Connection {
         Some((p64, p56, p48))
     }
 
-    fn update_failure(&self, (failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
+    async fn check_password_lockout(&mut self) -> bool {
+        let remaining = PASSWORD_FAILURES.lock().unwrap().blocked_for(
+            &self.ip,
+            &self.lr.my_id,
+            std::time::Instant::now(),
+        );
+        if let Some(remaining) = remaining {
+            self.send_password_lockout(remaining).await;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn update_password_failure(&self, success: bool) -> Option<Duration> {
+        let mut limiter = PASSWORD_FAILURES.lock().unwrap();
+        let now = std::time::Instant::now();
+        if success {
+            limiter.record_success(&self.ip, &self.lr.my_id, now)
+        } else {
+            limiter.record_failure(&self.ip, &self.lr.my_id, now)
+        }
+    }
+
+    async fn send_password_lockout(&mut self, remaining: Duration) {
+        let message = lockout_message(remaining);
+        self.log_access_audit("FAIL", None, &message);
+        self.send_login_error(message).await;
+        Self::post_alarm_audit(
+            AlarmAuditType::PasswordAttemptsLocked,
+            json!({
+                "ip": self.ip,
+                "id": self.lr.my_id,
+                "name": self.lr.my_name,
+                "retry_after_seconds": remaining.as_secs()
+                    + u64::from(remaining.subsec_nanos() != 0),
+            }),
+        );
+    }
+
+    fn update_2fa_failure(&self, (failure, time): ((i32, i32, i32), i32), remove: bool) {
         fn bump(mut cur: (i32, i32, i32), time: i32) -> (i32, i32, i32) {
             if cur.0 == time {
                 cur.1 += 1;
@@ -5386,7 +5434,7 @@ impl Connection {
             }
             cur
         }
-        let map_mutex = &LOGIN_FAILURES[i];
+        let map_mutex = &TWO_FACTOR_FAILURES;
         if remove {
             if failure.0 != 0 {
                 if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
@@ -5417,15 +5465,14 @@ impl Connection {
         }
     }
 
-    async fn check_failure_ipv6_prefix(
+    async fn check_2fa_failure_ipv6_prefix(
         &mut self,
-        i: usize,
         time: i32,
         prefix: &str,
         prefix_num: i8,
         thresh: i32,
     ) -> Option<(((i32, i32, i32), i32), bool)> {
-        let failure_prefix = LOGIN_FAILURES[i]
+        let failure_prefix = TWO_FACTOR_FAILURES
             .lock()
             .unwrap()
             .get(prefix)
@@ -5452,24 +5499,33 @@ impl Connection {
         }
     }
 
-    async fn check_failure(&mut self, i: usize) -> (((i32, i32, i32), i32), bool) {
+    async fn check_2fa_failure(&mut self) -> (((i32, i32, i32), i32), bool) {
         let time = (get_time() / 60_000) as i32;
 
         // IPv6 addresses are cheap to make so we check prefix/netblock as well
         if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
-            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p64, 64, 60).await {
+            if let Some(res) = self
+                .check_2fa_failure_ipv6_prefix(time, &p64, 64, 60)
+                .await
+            {
                 return res;
             }
-            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p56, 56, 80).await {
+            if let Some(res) = self
+                .check_2fa_failure_ipv6_prefix(time, &p56, 56, 80)
+                .await
+            {
                 return res;
             }
-            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p48, 48, 100).await {
+            if let Some(res) = self
+                .check_2fa_failure_ipv6_prefix(time, &p48, 48, 100)
+                .await
+            {
                 return res;
             }
         }
 
         // checks IPv6 and IPv4 direct addresses
-        let failure = LOGIN_FAILURES[i]
+        let failure = TWO_FACTOR_FAILURES
             .lock()
             .unwrap()
             .get(&self.ip)
@@ -7298,6 +7354,7 @@ pub enum AlarmAuditType {
     // MultipleLoginsAttemptsWithinOneMinute = 4,
     // MultipleLoginsAttemptsWithinOneHour = 5,
     ExceedIPv6PrefixAttempts = 6,
+    PasswordAttemptsLocked = 7,
 }
 
 pub enum FileAuditType {

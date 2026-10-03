@@ -9,6 +9,7 @@ import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/common/widgets/root_overlay_control.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
+import 'package:flutter_hbb/models/account_request_scope.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
     as mod_menu;
@@ -33,6 +34,49 @@ class PeerTreeView extends StatefulWidget {
 }
 
 class _PeerTreeViewState extends State<PeerTreeView> {
+  final _accountScope = AccountRequestScope();
+  final List<StreamSubscription<String>> _accountSubscriptions = [];
+
+  bool _acceptsAccountRequest(int generation) =>
+      mounted &&
+      _accountScope.accepts(generation, gFFI.userModel.userName.value,
+          gFFI.userModel.userPkid.value);
+
+  void _onAccountChanged() {
+    if (!mounted ||
+        !_accountScope.update(gFFI.userModel.userName.value,
+            gFFI.userModel.userPkid.value)) {
+      return;
+    }
+    setState(() {
+      // Never save the previous account's draft with the new account's token.
+      _memoSaveTimer?.cancel();
+      _pendingMemoPeerId = null;
+      _pendingMemoText = null;
+      _disposeMemoController();
+      _myDevices = [];
+      _myDevicesLoading = false;
+      _myDevicesLoaded = false;
+      _lastUserPkid = null;
+      _recentSessions = [];
+      _recentSessionsLoading = false;
+      _recentSessionsLoaded = false;
+      _peerOnlineStates = {};
+      _peerMemoLocal.clear();
+      _selectedPeerId = null;
+      _selectedSource = null;
+      _selectedSessionExtra = null;
+      _onlineQueried = false;
+    });
+    final generation = _accountScope.generation;
+    loadFavPeers();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_acceptsAccountRequest(generation)) return;
+      _loadMyDevices();
+      _loadRecentSessions();
+    });
+  }
+
   // 카테고리별 접힘 상태
   final Map<String, bool> _expandedCategories = {
     'recent': true,
@@ -60,6 +104,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
   // 온라인 상태 쿼리 여부
   bool _onlineQueried = false;
+  Timer? _onlineStatusTimer;
 
   // 나의 관리장치 목록
   List<Peer> _myDevices = [];
@@ -72,12 +117,18 @@ class _PeerTreeViewState extends State<PeerTreeView> {
   bool _recentSessionsLoading = false;
   bool _recentSessionsLoaded = false;
 
-  // 최근 세션 온라인 상태 (peerId -> online)
-  Map<String, bool> _recentSessionsOnline = {};
+  // 카테고리 공통 온라인 상태 (peerId -> online)
+  Map<String, bool> _peerOnlineStates = {};
 
   @override
   void initState() {
     super.initState();
+    _accountScope.update(
+        gFFI.userModel.userName.value, gFFI.userModel.userPkid.value);
+    _accountSubscriptions.addAll([
+      gFFI.userModel.userName.listen((_) => _onAccountChanged()),
+      gFFI.userModel.userPkid.listen((_) => _onAccountChanged()),
+    ]);
     // 나의 관리장치 새로고침 콜백 등록
     refreshMyDevicesCallback = () {
       _loadMyDevices(force: true);
@@ -93,10 +144,17 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         (evt) async {
       _updateOnlineState(evt);
     });
+    _onlineStatusTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (mounted) _queryAllOnlineStatus();
+    });
   }
 
   @override
   void dispose() {
+    _onlineStatusTimer?.cancel();
+    for (final subscription in _accountSubscriptions) {
+      subscription.cancel();
+    }
     _disposeMemoController();
     refreshMyDevicesCallback = null;
     platformFFI.unregisterEventHandler(
@@ -176,11 +234,18 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
   Future<void> _saveMemoToServer(String peerId, String memo) async {
     if (!gFFI.userModel.isLogin) return;
-
-    final apiServer = await bind.mainGetApiServer();
+    final generation = _accountScope.generation;
     final accessToken = bind.mainGetLocalOption(key: 'access_token');
     final userPkid = gFFI.userModel.userPkid.value;
     final userId = gFFI.userModel.userName.value;
+    final apiServer = await bind.mainGetApiServer();
+    // A normal widget disposal still flushes its draft, but never under a
+    // different account/token if logout or login happens during the await.
+    if (!_accountScope.accepts(generation, gFFI.userModel.userName.value,
+            gFFI.userModel.userPkid.value) ||
+        accessToken != bind.mainGetLocalOption(key: 'access_token')) {
+      return;
+    }
 
     if (apiServer.isEmpty ||
         accessToken.isEmpty ||
@@ -197,9 +262,11 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       remoteId: peerId,
       memo: memo,
     );
+    if (!_acceptsAccountRequest(generation)) return;
 
     if (response.isUnauthorized) {
       final sessionKept = await gFFI.userModel.recoverUnauthorized();
+      if (!_acceptsAccountRequest(generation)) return;
       if (sessionKept) return;
       if (mounted) {
         showToast('비밀번호가 변경되어 다시 로그인해주세요');
@@ -221,9 +288,25 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
   /// 온라인 상태 업데이트 (나의 관리장치 + 최근 세션)
   void _updateOnlineState(Map<String, dynamic> evt) {
+    if (!mounted) return;
     bool changed = false;
     final onlines = (evt['onlines'] as String? ?? '').split(',').toSet();
     final offlines = (evt['offlines'] as String? ?? '').split(',').toSet();
+
+    // Keep one status per ID so every category uses the same confirmed result,
+    // including a response that arrives before a category finishes loading.
+    for (final peerId in onlines.where((id) => id.isNotEmpty)) {
+      if (_peerOnlineStates[peerId] != true) {
+        _peerOnlineStates[peerId] = true;
+        changed = true;
+      }
+    }
+    for (final peerId in offlines.where((id) => id.isNotEmpty)) {
+      if (_peerOnlineStates[peerId] != false) {
+        _peerOnlineStates[peerId] = false;
+        changed = true;
+      }
+    }
 
     // 나의 관리장치 온라인 상태 업데이트
     for (var i = 0; i < _myDevices.length; i++) {
@@ -234,22 +317,6 @@ class _PeerTreeViewState extends State<PeerTreeView> {
       } else if (offlines.contains(peer.id) && peer.online) {
         _myDevices[i].online = false;
         changed = true;
-      }
-    }
-
-    // 최근 세션 온라인 상태 업데이트
-    for (var session in _recentSessions) {
-      final peerId = session.peerId;
-      if (onlines.contains(peerId)) {
-        if (_recentSessionsOnline[peerId] != true) {
-          _recentSessionsOnline[peerId] = true;
-          changed = true;
-        }
-      } else if (offlines.contains(peerId)) {
-        if (_recentSessionsOnline[peerId] != false) {
-          _recentSessionsOnline[peerId] = false;
-          changed = true;
-        }
       }
     }
 
@@ -266,6 +333,8 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
   /// API 기반 최근 세션 목록 로드
   Future<void> _loadRecentSessions({bool force = false}) async {
+    final generation = _accountScope.generation;
+    if (!mounted) return;
     if (!gFFI.userModel.isLogin) {
       setState(() {
         _recentSessions = [];
@@ -290,6 +359,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
     try {
       final apiServer = await bind.mainGetApiServer();
+      if (!_acceptsAccountRequest(generation)) return;
       final accessToken = bind.mainGetLocalOption(key: 'access_token');
       final userId = gFFI.userModel.userName.value;
 
@@ -308,11 +378,13 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         userId: userId,
         limit: 5,
       );
+      if (!_acceptsAccountRequest(generation)) return;
 
       // 401 응답 처리 (토큰 무효화)
       if (response.isUnauthorized) {
         debugPrint('PeerTreeView: 401 Unauthorized on recent sessions');
         final sessionKept = await gFFI.userModel.recoverUnauthorized();
+        if (!_acceptsAccountRequest(generation)) return;
         if (sessionKept) {
           final retryToken = bind.mainGetLocalOption(key: 'access_token');
           if (retryToken.isNotEmpty) {
@@ -322,6 +394,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
               userId: userId,
               limit: 5,
             );
+            if (!_acceptsAccountRequest(generation)) return;
           }
         }
         if (response.isUnauthorized && !sessionKept && mounted) {
@@ -365,13 +438,14 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         });
       }
     } catch (e) {
+      if (!_acceptsAccountRequest(generation)) return;
       debugPrint('PeerTreeView: Error loading recent sessions: $e');
       setState(() {
         _recentSessions = [];
         _recentSessionsLoaded = false;
       });
     } finally {
-      if (mounted && _recentSessionsLoading) {
+      if (_acceptsAccountRequest(generation) && _recentSessionsLoading) {
         setState(() => _recentSessionsLoading = false);
       }
     }
@@ -403,6 +477,8 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
   /// 나의 관리장치 목록 로드
   Future<void> _loadMyDevices({bool force = false}) async {
+    final generation = _accountScope.generation;
+    if (!mounted) return;
     if (!gFFI.userModel.isLogin) {
       setState(() {
         _myDevices = [];
@@ -433,6 +509,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
 
     try {
       final apiServer = await bind.mainGetApiServer();
+      if (!_acceptsAccountRequest(generation)) return;
       final accessToken = bind.mainGetLocalOption(key: 'access_token');
 
       if (apiServer.isEmpty || accessToken.isEmpty || userPkid.isEmpty) {
@@ -450,11 +527,13 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         accessToken: accessToken,
         userPkid: userPkid,
       );
+      if (!_acceptsAccountRequest(generation)) return;
 
       // 401 응답 처리 (토큰 무효화)
       if (response.isUnauthorized) {
         debugPrint('PeerTreeView: 401 Unauthorized - Token invalidated');
         final sessionKept = await gFFI.userModel.recoverUnauthorized();
+        if (!_acceptsAccountRequest(generation)) return;
         if (sessionKept) {
           final retryToken = bind.mainGetLocalOption(key: 'access_token');
           if (retryToken.isNotEmpty) {
@@ -463,6 +542,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
               accessToken: retryToken,
               userPkid: userPkid,
             );
+            if (!_acceptsAccountRequest(generation)) return;
           }
         }
         if (response.isUnauthorized && !sessionKept && mounted) {
@@ -513,7 +593,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
             loginName: '',
             device_group_name: '',
             note: device.memo,
-          )..online = device.isOnline;
+          )..online = _peerOnlineStates[device.remoteId] ?? device.isOnline;
         }).toList();
 
         _sortPeersByDisplayName(peers);
@@ -539,6 +619,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         });
       }
     } catch (e) {
+      if (!_acceptsAccountRequest(generation)) return;
       debugPrint('Error loading my devices: $e');
       setState(() {
         _myDevices = [];
@@ -546,7 +627,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         _lastUserPkid = null;
       });
     } finally {
-      if (mounted && _myDevicesLoading) {
+      if (_acceptsAccountRequest(generation) && _myDevicesLoading) {
         setState(() => _myDevicesLoading = false);
       }
     }
@@ -559,6 +640,9 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     // 최근 세션 피어 ID 수집
     for (final peer in gFFI.recentPeersModel.peers) {
       allPeerIds.add(peer.id);
+    }
+    for (final session in _recentSessions) {
+      allPeerIds.add(session.peerId);
     }
 
     // 즐겨찾기 피어 ID 수집
@@ -577,6 +661,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     }
 
     // 온라인 상태 쿼리
+    allPeerIds.removeWhere((id) => id.trim().isEmpty);
     if (allPeerIds.isNotEmpty) {
       bind.queryOnlines(ids: allPeerIds.toList());
     }
@@ -587,6 +672,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     return Obx(() {
       // 로그인 상태 확인 (Obx로 감싸서 자동 업데이트)
       final isLoggedIn = gFFI.userModel.isLogin;
+      final generation = _accountScope.generation;
 
       // 로그인 상태에서만 온라인 상태 쿼리 및 나의 관리장치 로드
       if (isLoggedIn) {
@@ -595,9 +681,11 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         if (currentUserPkid.isNotEmpty &&
             (_lastUserPkid != currentUserPkid || !_myDevicesLoaded)) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!_acceptsAccountRequest(generation)) return;
             if (!_onlineQueried) {
               _onlineQueried = true;
               Future.delayed(Duration(milliseconds: 500), () {
+                if (!_acceptsAccountRequest(generation)) return;
                 _queryAllOnlineStatus();
               });
             }
@@ -617,9 +705,11 @@ class _PeerTreeViewState extends State<PeerTreeView> {
           });
         } else if (!_onlineQueried) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!_acceptsAccountRequest(generation)) return;
             if (!_onlineQueried) {
               _onlineQueried = true;
               Future.delayed(Duration(milliseconds: 500), () {
+                if (!_acceptsAccountRequest(generation)) return;
                 _queryAllOnlineStatus();
               });
             }
@@ -634,7 +724,8 @@ class _PeerTreeViewState extends State<PeerTreeView> {
             _recentSessionsLoaded) {
           // 빌드 중 setState 호출 방지 - addPostFrameCallback 사용
           WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted &&
+            if (mounted && !gFFI.userModel.isLogin &&
+                generation == _accountScope.generation &&
                 (_myDevices.isNotEmpty ||
                     _myDevicesLoaded ||
                     _recentSessions.isNotEmpty ||
@@ -646,7 +737,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
                 _lastUserPkid = null;
                 _recentSessions = [];
                 _recentSessionsLoaded = false;
-                _recentSessionsOnline = {};
+                _peerOnlineStates = {};
                 _peerMemoLocal.clear();
                 _selectedPeerId = null;
                 _selectedSource = null;
@@ -1229,7 +1320,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
         ? session.displayName
         : (peer != null ? _peerDisplayName(peer) : id);
     final online = session != null
-        ? (_recentSessionsOnline[id] ?? false)
+        ? (_peerOnlineStates[id] ?? false)
         : (peer?.online ?? false);
     final myId = gFFI.serverModel.serverId.text.replaceAll(' ', '');
     final isCurrent = id.replaceAll(' ', '') == myId && myId.isNotEmpty;
@@ -1754,7 +1845,7 @@ class _PeerTreeViewState extends State<PeerTreeView> {
     final displayName = session.displayName;
 
     // 최근 세션 온라인 상태 확인
-    final isOnline = _recentSessionsOnline[session.peerId] ?? false;
+    final isOnline = _peerOnlineStates[session.peerId] ?? false;
 
     return PeerListRow(
       key: ValueKey('recentApi:${session.peerId}'),

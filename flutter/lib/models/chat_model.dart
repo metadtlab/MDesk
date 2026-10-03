@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:dash_chat_2/dash_chat_2.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -209,6 +210,7 @@ class ChatModel with ChangeNotifier {
       gFFI.chatModel.mobileClearClientUnread(gFFI.chatModel.currentKey.connId);
     }
     final overlay = OverlayEntry(builder: (context) {
+      final screen = MediaQuery.of(context).size;
       return Listener(
           onPointerDown: (_) {
             if (!isWindowFocus.value) {
@@ -218,8 +220,8 @@ class ChatModel with ChangeNotifier {
           },
           child: DraggableChatWindow(
               position: chatInitPos ?? chatWindowPosition,
-              width: 250,
-              height: 350,
+              width: math.min(320, math.max(0, screen.width - 24)),
+              height: math.min(460, math.max(0, screen.height - 24)),
               chatModel: this));
     });
     overlayState.insert(overlay);

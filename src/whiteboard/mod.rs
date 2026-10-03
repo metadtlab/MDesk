@@ -1,6 +1,8 @@
 use serde_derive::{Deserialize, Serialize};
 
 mod client;
+#[cfg(target_os = "windows")]
+mod fade;
 mod server;
 
 #[cfg(target_os = "linux")]

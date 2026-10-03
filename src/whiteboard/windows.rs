@@ -1,4 +1,5 @@
 use super::{
+    fade::StrokeFade,
     server::{Ripple, EVENT_PROXY},
     win_linux::{create_font_face, draw_text},
     Cursor, CustomEvent, DrawStroke,
@@ -71,7 +72,7 @@ pub(super) fn create_event_loop() -> ResultType<()> {
 
     let mut ripples: Vec<Ripple> = Vec::new();
     let mut last_cursors: HashMap<String, Cursor> = HashMap::new();
-    let mut draw_strokes: Vec<DrawStroke> = Vec::new();
+    let mut draw_strokes: Vec<(DrawStroke, StrokeFade)> = Vec::new();
     let mut resized = final_size.is_none();
 
     event_loop.run(move |event, _, control_flow| {
@@ -147,7 +148,9 @@ pub(super) fn create_event_loop() -> ResultType<()> {
                 }
 
                 // 드로잉 스트로크 렌더링
-                for stroke in &draw_strokes {
+                let now = Instant::now();
+                draw_strokes.retain(|(_, fade)| fade.opacity_at(now) > 0.0);
+                for (stroke, fade) in &draw_strokes {
                     if stroke.points.len() < 2 {
                         continue;
                     }
@@ -164,7 +167,12 @@ pub(super) fn create_event_loop() -> ResultType<()> {
                     };
 
                     // Note: The real color is bgra here.
-                    paint.set_color_rgba8(rgba.2, rgba.1, rgba.0, alpha);
+                    paint.set_color_rgba8(
+                        rgba.2,
+                        rgba.1,
+                        rgba.0,
+                        (alpha as f32 * fade.opacity_at(now)) as u8,
+                    );
                     paint.anti_alias = true;
 
                     let mut pb = PathBuilder::new();
@@ -277,7 +285,7 @@ pub(super) fn create_event_loop() -> ResultType<()> {
                     last_cursors.insert(k, cursor);
                 }
                 CustomEvent::Draw(stroke) => {
-                    draw_strokes.push(stroke);
+                    draw_strokes.push((stroke, StrokeFade::new()));
                 }
                 CustomEvent::ClearDraw => {
                     draw_strokes.clear();

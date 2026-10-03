@@ -7,10 +7,10 @@ import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 
 import '../../consts.dart';
-import '../../desktop/widgets/tabbar_widget.dart';
 import '../../models/chat_model.dart';
 import '../../models/model.dart';
 import 'chat_page.dart';
+import 'chat_view.dart';
 
 class DraggableChatWindow extends StatelessWidget {
   const DraggableChatWindow(
@@ -67,86 +67,63 @@ class DraggableChatWindow extends StatelessWidget {
                 body: ChatPage(chatModel: chatModel),
               );
               return Container(
-                  decoration:
-                      BoxDecoration(border: Border.all(color: MyTheme.border)),
-                  child: child);
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0x66536B7C)),
+                  boxShadow: const [
+                    BoxShadow(
+                        color: Color(0x26000000),
+                        blurRadius: 20,
+                        offset: Offset(0, 6)),
+                  ],
+                ),
+                child: ClipRRect(
+                    borderRadius: BorderRadius.circular(11), child: child),
+              );
             });
   }
 
   Widget _buildMobileAppBar(BuildContext context) {
-    return Container(
-      color: Theme.of(context).colorScheme.primary,
-      height: 50,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 15),
-              child: Text(
-                translate("Chat"),
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontFamily: 'WorkSans',
-                    fontWeight: FontWeight.bold,
-                    fontSize: 20),
-              )),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              IconButton(
-                  onPressed: () {
-                    chatModel.hideChatWindowOverlay();
-                  },
-                  icon: const Icon(
-                    Icons.keyboard_arrow_down,
-                    color: Colors.white,
-                  )),
-              IconButton(
-                  onPressed: () {
-                    chatModel.hideChatWindowOverlay();
-                    chatModel.hideChatIconOverlay();
-                  },
-                  icon: const Icon(
-                    Icons.close,
-                    color: Colors.white,
-                  ))
-            ],
-          )
-        ],
+    return _buildChatHeader(
+      Row(mainAxisSize: MainAxisSize.min, children: [
+        IconButton(
+            tooltip: translate('Hide'),
+            onPressed: chatModel.hideChatWindowOverlay,
+            icon: const Icon(Icons.keyboard_arrow_down,
+                color: MDeskChatColors.text, size: 20)),
+        IconButton(
+            tooltip: translate('Close'),
+            onPressed: () {
+              chatModel.hideChatWindowOverlay();
+              chatModel.hideChatIconOverlay();
+            },
+            icon:
+                const Icon(Icons.close, color: MDeskChatColors.text, size: 18)),
+      ]),
+    );
+  }
+
+  Widget _buildChatHeader(Widget trailing) {
+    return AnimatedBuilder(
+      animation: chatModel,
+      builder: (context, _) => MDeskChatHeader(
+        title: chatModel.currentUser?.firstName?.isNotEmpty == true
+            ? chatModel.currentUser!.firstName!
+            : translate('Chat'),
+        subtitle: chatModel.currentUser?.id,
+        trailing: trailing,
       ),
     );
   }
 
   Widget _buildDesktopAppBar(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-          border: Border(
-              bottom: BorderSide(
-                  color: Theme.of(context).hintColor.withOpacity(0.4)))),
-      height: 38,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 8),
-              child: Obx(() => Opacity(
-                  opacity: chatModel.isWindowFocus.value ? 1.0 : 0.4,
-                  child: Row(children: [
-                    Icon(Icons.chat_bubble_outline,
-                        size: 20, color: Theme.of(context).colorScheme.primary),
-                    SizedBox(width: 6),
-                    Text(translate("Chat"))
-                  ])))),
-          Padding(
-              padding: EdgeInsets.all(2),
-              child: ActionIcon(
-                message: 'Close',
-                icon: IconFont.close,
-                onTap: chatModel.hideChatWindowOverlay,
-                isClose: true,
-                boxSize: 32,
-              ))
-        ],
+    return _buildChatHeader(
+      IconButton(
+        tooltip: translate('Close'),
+        onPressed: chatModel.hideChatWindowOverlay,
+        icon: const Icon(Icons.close, color: MDeskChatColors.text, size: 18),
+        constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+        padding: EdgeInsets.zero,
       ),
     );
   }

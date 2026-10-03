@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -9,6 +10,8 @@ import 'package:flutter_hbb/models/platform_model.dart';
 
 /// 화이트보드 메시지 접두사 (채팅과 구분용)
 const String kWhiteboardPrefix = '##WB##';
+const Duration kWhiteboardStrokeFadeDuration = Duration(seconds: 3);
+const Duration _whiteboardFadeFrameInterval = Duration(milliseconds: 33);
 
 /// 화이트보드 그리기 도구 종류
 enum WhiteboardTool {
@@ -28,6 +31,7 @@ class DrawingStroke {
   final double strokeWidth;
   final WhiteboardTool tool;
   final bool isEraser;
+  final DateTime completedAt;
 
   DrawingStroke({
     required this.points,
@@ -35,7 +39,15 @@ class DrawingStroke {
     required this.strokeWidth,
     required this.tool,
     this.isEraser = false,
-  });
+    DateTime? completedAt,
+  }) : completedAt = completedAt ?? DateTime.now();
+
+  double opacityAt(DateTime time) {
+    final age = time.difference(completedAt).inMicroseconds;
+    return (1 - age / kWhiteboardStrokeFadeDuration.inMicroseconds)
+        .clamp(0.0, 1.0)
+        .toDouble();
+  }
   
   /// JSON 직렬화
   Map<String, dynamic> toJson() {
@@ -62,10 +74,55 @@ class DrawingStroke {
   }
 }
 
-/// 화이트보드 컨트롤러
-class WhiteboardController extends GetxController {
-  final RxBool isEnabled = false.obs;
+/// Completed strokes fade independently; erasers keep masking older strokes
+/// until those strokes have expired, so erased lines never reappear.
+abstract class _FadingWhiteboardController extends GetxController {
   final RxList<DrawingStroke> strokes = <DrawingStroke>[].obs;
+  final DateTime Function() _now;
+  late final Rx<DateTime> fadeTime = _now().obs;
+  Timer? _fadeTimer;
+
+  _FadingWhiteboardController({DateTime Function()? now})
+      : _now = now ?? DateTime.now;
+
+  void _addCompletedStroke(DrawingStroke stroke) {
+    strokes.add(stroke);
+    fadeTime.value = _now();
+    _fadeTimer ??= Timer.periodic(_whiteboardFadeFrameInterval, (_) {
+      final time = _now();
+      strokes.removeWhere((stroke) => stroke.opacityAt(time) == 0);
+      fadeTime.value = time;
+      if (strokes.isEmpty) _stopFading();
+    });
+  }
+
+  void _stopFading() {
+    _fadeTimer?.cancel();
+    _fadeTimer = null;
+  }
+
+  void _clearCompletedStrokes() {
+    _stopFading();
+    strokes.clear();
+  }
+
+  void _undoCompletedStroke() {
+    if (strokes.isNotEmpty) strokes.removeLast();
+    if (strokes.isEmpty) _stopFading();
+  }
+
+  @override
+  void onClose() {
+    _stopFading();
+    super.onClose();
+  }
+}
+
+/// 화이트보드 컨트롤러
+class WhiteboardController extends _FadingWhiteboardController {
+  WhiteboardController({DateTime Function()? now}) : super(now: now);
+
+  final RxBool isEnabled = false.obs;
   final Rx<WhiteboardTool> currentTool = WhiteboardTool.pen.obs;
   final Rx<Color> currentColor = Colors.red.obs;
   final RxDouble currentStrokeWidth = 3.0.obs;
@@ -138,7 +195,7 @@ class WhiteboardController extends GetxController {
   
   /// 제어자 화면의 그림만 지우기 (피제어자에게 전송하지 않음)
   void clearLocalOnly() {
-    strokes.clear();
+    _clearCompletedStrokes();
     currentPoints.clear();
     debugPrint('Whiteboard: Local strokes cleared due to resize');
   }
@@ -183,8 +240,9 @@ class WhiteboardController extends GetxController {
         strokeWidth: isEraser ? currentStrokeWidth.value * 3 : currentStrokeWidth.value,
         tool: currentTool.value,
         isEraser: isEraser,
+        completedAt: _now(),
       );
-      strokes.add(stroke);
+      _addCompletedStroke(stroke);
       currentPoints.clear();
       
       // 스트로크 전송
@@ -193,7 +251,7 @@ class WhiteboardController extends GetxController {
   }
   
   void clear() {
-    strokes.clear();
+    _clearCompletedStrokes();
     currentPoints.clear();
     // 클리어 명령 전송
     _sendClearCommand();
@@ -201,7 +259,7 @@ class WhiteboardController extends GetxController {
   
   void undo() {
     if (strokes.isNotEmpty) {
-      strokes.removeLast();
+      _undoCompletedStroke();
       // 실행취소 명령 전송
       _sendUndoCommand();
     }
@@ -343,9 +401,10 @@ class WhiteboardController extends GetxController {
 }
 
 /// 피제어자용 화이트보드 수신 컨트롤러
-class WhiteboardReceiverController extends GetxController {
+class WhiteboardReceiverController extends _FadingWhiteboardController {
+  WhiteboardReceiverController({DateTime Function()? now}) : super(now: now);
+
   final RxBool isEnabled = false.obs;
-  final RxList<DrawingStroke> strokes = <DrawingStroke>[].obs;
   
   // 캔버스 크기 (좌표 역정규화용)
   Size canvasSize = Size.zero;
@@ -369,19 +428,17 @@ class WhiteboardReceiverController extends GetxController {
         case 'state':
           isEnabled.value = data['enabled'] ?? false;
           if (!isEnabled.value) {
-            strokes.clear();
+            _clearCompletedStrokes();
           }
           break;
         case 'stroke':
           _handleStroke(data);
           break;
         case 'clear':
-          strokes.clear();
+          _clearCompletedStrokes();
           break;
         case 'undo':
-          if (strokes.isNotEmpty) {
-            strokes.removeLast();
-          }
+          _undoCompletedStroke();
           break;
       }
       
@@ -408,13 +465,14 @@ class WhiteboardReceiverController extends GetxController {
       strokeWidth: (data['strokeWidth'] as num).toDouble(),
       tool: WhiteboardTool.values[data['tool']],
       isEraser: data['isEraser'] ?? false,
+      completedAt: _now(),
     );
     
-    strokes.add(stroke);
+    _addCompletedStroke(stroke);
   }
   
   void clear() {
-    strokes.clear();
+    _clearCompletedStrokes();
     isEnabled.value = false;
   }
 }
@@ -562,6 +620,7 @@ class WhiteboardOverlay extends StatelessWidget {
                   child: Obx(() => CustomPaint(
                     painter: WhiteboardPainter(
                       strokes: controller.strokes.toList(),
+                      fadeTime: controller.fadeTime.value,
                       currentPoints: controller.currentPoints.toList(),
                       currentColor: controller.currentColor.value,
                       currentStrokeWidth: controller.currentStrokeWidth.value,
@@ -787,6 +846,7 @@ class WhiteboardOverlay extends StatelessWidget {
 /// 화이트보드 페인터
 class WhiteboardPainter extends CustomPainter {
   final List<DrawingStroke> strokes;
+  final DateTime fadeTime;
   final List<Offset> currentPoints;
   final Color currentColor;
   final double currentStrokeWidth;
@@ -794,6 +854,7 @@ class WhiteboardPainter extends CustomPainter {
   
   WhiteboardPainter({
     required this.strokes,
+    required this.fadeTime,
     required this.currentPoints,
     required this.currentColor,
     required this.currentStrokeWidth,
@@ -810,7 +871,9 @@ class WhiteboardPainter extends CustomPainter {
       if (stroke.isEraser) {
         _drawEraser(canvas, stroke);
       } else {
-        _drawStroke(canvas, stroke.points, stroke.color, stroke.strokeWidth, stroke.tool);
+        _drawStroke(canvas, stroke.points, stroke.color, stroke.strokeWidth,
+            stroke.tool,
+            opacity: stroke.opacityAt(fadeTime));
       }
     }
     
@@ -837,16 +900,16 @@ class WhiteboardPainter extends CustomPainter {
     _drawPath(canvas, points, paint);
   }
   
-  void _drawStroke(Canvas canvas, List<Offset> points, Color color, double strokeWidth, WhiteboardTool tool) {
+  void _drawStroke(Canvas canvas, List<Offset> points, Color color,
+      double strokeWidth, WhiteboardTool tool,
+      {double opacity = 1}) {
     if (points.isEmpty) return;
     
     final paint = Paint()
-      ..color = tool == WhiteboardTool.highlighter 
-          ? color.withOpacity(0.4) 
-          : color
-      ..strokeWidth = tool == WhiteboardTool.highlighter 
-          ? strokeWidth * 3 
-          : strokeWidth
+      ..color = color.withValues(
+          alpha: (tool == WhiteboardTool.highlighter ? 0.4 : color.a) * opacity)
+      ..strokeWidth =
+          tool == WhiteboardTool.highlighter ? strokeWidth * 3 : strokeWidth
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round
       ..style = PaintingStyle.stroke;
@@ -895,9 +958,11 @@ class WhiteboardPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant WhiteboardPainter oldDelegate) {
     return strokes != oldDelegate.strokes ||
+           fadeTime != oldDelegate.fadeTime ||
            currentPoints != oldDelegate.currentPoints ||
            currentColor != oldDelegate.currentColor ||
-           currentStrokeWidth != oldDelegate.currentStrokeWidth;
+           currentStrokeWidth != oldDelegate.currentStrokeWidth ||
+           currentTool != oldDelegate.currentTool;
   }
 }
 
@@ -930,6 +995,7 @@ class WhiteboardReceiverOverlay extends StatelessWidget {
               return Obx(() => CustomPaint(
                 painter: WhiteboardReceiverPainter(
                   strokes: controller.strokes.toList(),
+                  fadeTime: controller.fadeTime.value,
                 ),
                 size: Size.infinite,
               ));
@@ -944,13 +1010,16 @@ class WhiteboardReceiverOverlay extends StatelessWidget {
 /// 피제어자용 화이트보드 페인터 (수신 전용)
 class WhiteboardReceiverPainter extends CustomPainter {
   final List<DrawingStroke> strokes;
+  final DateTime fadeTime;
   
   WhiteboardReceiverPainter({
     required this.strokes,
+    required this.fadeTime,
   });
   
   @override
   void paint(Canvas canvas, Size size) {
+    canvas.saveLayer(Offset.zero & size, Paint());
     for (final stroke in strokes) {
       if (stroke.isEraser) {
         _drawEraser(canvas, stroke);
@@ -958,15 +1027,16 @@ class WhiteboardReceiverPainter extends CustomPainter {
         _drawStroke(canvas, stroke);
       }
     }
+    canvas.restore();
   }
   
   void _drawStroke(Canvas canvas, DrawingStroke stroke) {
     if (stroke.points.isEmpty) return;
     
     final paint = Paint()
-      ..color = stroke.tool == WhiteboardTool.highlighter 
-          ? stroke.color.withOpacity(0.4) 
-          : stroke.color
+      ..color = stroke.color.withValues(
+          alpha: (stroke.tool == WhiteboardTool.highlighter ? 0.4 : stroke.color.a) *
+              stroke.opacityAt(fadeTime))
       ..strokeWidth = stroke.tool == WhiteboardTool.highlighter 
           ? stroke.strokeWidth * 3 
           : stroke.strokeWidth
@@ -1014,6 +1084,6 @@ class WhiteboardReceiverPainter extends CustomPainter {
   
   @override
   bool shouldRepaint(covariant WhiteboardReceiverPainter oldDelegate) {
-    return strokes != oldDelegate.strokes;
+    return strokes != oldDelegate.strokes || fadeTime != oldDelegate.fadeTime;
   }
 }

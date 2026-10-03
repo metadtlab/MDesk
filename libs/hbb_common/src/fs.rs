@@ -7,20 +7,20 @@ use std::{
     io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicI32, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream as TokioBufStream},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufStream as TokioBufStream},
 };
 
 use crate::{anyhow::anyhow, bail, get_version_number, message_proto::*, ResultType, Stream};
 // https://doc.rust-lang.org/std/os/windows/fs/trait.MetadataExt.html
 use crate::{
-    compress::{compress, decompress},
+    compress::{compress_file, decompress},
     config::Config,
 };
 
@@ -59,6 +59,10 @@ pub const DIRECT_TRANSFER_MAX_PATH_BYTES: usize = 4 * 1024;
 pub const DIRECT_TRANSFER_MAX_DEPTH: usize = 64;
 pub const DIRECT_TRANSFER_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DIRECT_TRANSFER_MAX_BLOCK_BYTES: usize = 128 * 1024;
+// Batch disk reads and sender work without changing the peer's block framing.
+const FILE_READ_BUFFER_BYTES: usize = 1024 * 1024;
+const FILE_SEND_BURST_BLOCKS: usize = 32;
+const FILE_SEND_BURST_BUDGET: Duration = Duration::from_millis(4);
 
 #[derive(Debug)]
 pub struct DirectTransferManifest {
@@ -837,7 +841,8 @@ pub fn resolve_remote_drop_downloads_path(path: &str) -> Result<Option<PathBuf>,
         if path != DEVICE_REMOTE_TARGET {
             return Err("Invalid DeviceRemote target".to_string());
         }
-        return get_download_dir_strict().map(|dir| Some(dir.join("DeviceRemote.exe")))
+        return get_download_dir_strict()
+            .map(|dir| Some(dir.join("DeviceRemote.exe")))
             .map_err(|err| err.to_string());
     }
     let Some(relative) = path.strip_prefix(REMOTE_DROP_DOWNLOADS_PREFIX) else {
@@ -1018,7 +1023,9 @@ pub fn get_empty_dirs_recursive(
     path: &str,
     include_hidden: bool,
 ) -> ResultType<Vec<FileDirectory>> {
-    with_user_file_access(|| read_empty_dirs_recursive(&get_path(path), &get_path(""), include_hidden))
+    with_user_file_access(|| {
+        read_empty_dirs_recursive(&get_path(path), &get_path(""), include_hidden)
+    })
 }
 
 #[inline]
@@ -1123,6 +1130,7 @@ impl DataSource {
 
 enum DataStream {
     FileStream(File),
+    FileReader(BufReader<File>),
     BufStream(TokioBufStream<Cursor<Vec<u8>>>),
 }
 
@@ -1130,15 +1138,23 @@ impl Debug for DataStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DataStream::FileStream(fs) => write!(f, "{:?}", fs),
+            DataStream::FileReader(fs) => write!(f, "{:?}", fs),
             DataStream::BufStream(_) => write!(f, "BufStream"),
         }
     }
 }
 
 impl DataStream {
+    fn file_reader(file: File, remaining: u64) -> Self {
+        // Avoid allocating/zeroing a 1 MiB buffer for every tiny file.
+        let capacity = remaining.min(FILE_READ_BUFFER_BYTES as u64).max(8192) as usize;
+        Self::FileReader(BufReader::with_capacity(capacity, file))
+    }
+
     async fn write_all(&mut self, buf: &[u8]) -> ResultType<()> {
         match self {
             DataStream::FileStream(fs) => fs.write_all(buf).await?,
+            DataStream::FileReader(_) => bail!("cannot write to a transfer reader"),
             DataStream::BufStream(bs) => bs.write_all(buf).await?,
         }
         Ok(())
@@ -1147,8 +1163,32 @@ impl DataStream {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             DataStream::FileStream(fs) => fs.read(buf).await,
+            DataStream::FileReader(fs) => fs.read(buf).await,
             DataStream::BufStream(bs) => bs.read(buf).await,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FileCompression {
+    blocks_until_probe: u8,
+}
+
+impl FileCompression {
+    fn should_probe(&mut self) -> bool {
+        if self.blocks_until_probe == 0 {
+            return true;
+        }
+        self.blocks_until_probe -= 1;
+        false
+    }
+
+    fn worthwhile(&mut self, raw_size: usize, compressed_size: usize) -> bool {
+        // Empty output means compression failed; never turn it into an EOF.
+        let useful = compressed_size != 0 && compressed_size < raw_size - raw_size / 100;
+        // Reprobe every 2 MiB so mixed-content files can start compressing again.
+        self.blocks_until_probe = if useful { 0 } else { 15 };
+        useful
     }
 }
 
@@ -1178,6 +1218,8 @@ pub struct TransferJob {
 
     #[serde(skip_serializing)]
     data_stream: Option<DataStream>,
+    #[serde(skip_serializing)]
+    compression: FileCompression,
     pub total_size: u64,
     finished_size: u64,
     transferred: u64,
@@ -1260,9 +1302,15 @@ fn get_ext(name: &str) -> &str {
 
 #[inline]
 fn is_compressed_file(name: &str) -> bool {
-    let compressed_exts = ["xz", "gz", "zip", "7z", "rar", "bz2", "tgz", "png", "jpg"];
+    let compressed_exts = [
+        "xz", "gz", "zip", "7z", "rar", "bz2", "tgz", "zst", "lz4", "png", "jpg", "jpeg", "webp",
+        "avif", "heic", "mp4", "m4v", "mov", "mkv", "webm", "mp3", "aac", "ogg", "flac", "docx",
+        "xlsx", "pptx",
+    ];
     let ext = get_ext(name);
-    compressed_exts.contains(&ext)
+    compressed_exts
+        .iter()
+        .any(|known| ext.eq_ignore_ascii_case(known))
 }
 
 pub fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
@@ -1364,7 +1412,11 @@ fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
 impl TransferJob {
     /// Stream an already authorized, opened clipboard file. The caller owns
     /// generation/path authorization; no remote path is accepted here.
-    pub async fn from_clipboard_file(file: std::fs::File, offset: u64, file_name: &str) -> ResultType<Self> {
+    pub async fn from_clipboard_file(
+        file: std::fs::File,
+        offset: u64,
+        file_name: &str,
+    ) -> ResultType<Self> {
         let metadata = file.metadata()?;
         let size = metadata.len();
         if offset > size || !metadata.is_file() {
@@ -1375,8 +1427,12 @@ impl TransferJob {
         Ok(Self {
             r#type: JobType::Generic,
             data_source: DataSource::FilePath(PathBuf::from("clipboard.bin")),
-            data_stream: Some(DataStream::FileStream(file)),
-            files: vec![FileEntry { name: file_name.to_owned(), size, ..Default::default() }],
+            data_stream: Some(DataStream::file_reader(file, size - offset)),
+            files: vec![FileEntry {
+                name: file_name.to_owned(),
+                size,
+                ..Default::default()
+            }],
             total_size: size,
             finished_size: offset,
             file_confirmed: true,
@@ -1639,6 +1695,7 @@ impl TransferJob {
     pub async fn finalize_write(&mut self) -> ResultType<()> {
         match self.data_stream.as_mut() {
             Some(DataStream::FileStream(file)) => file.sync_all().await?,
+            Some(DataStream::FileReader(_)) => bail!("cannot finalize a transfer reader"),
             Some(DataStream::BufStream(stream)) => stream.flush().await?,
             None => return Ok(()),
         }
@@ -1887,6 +1944,7 @@ impl TransferJob {
         let direct_file_name = self.files.get(file_num).map(|file| file.name.clone());
         let direct_expected_identity = self.direct_source_identities.get(file_num).copied();
         let direct_file_count = self.files.len();
+        let current_size = self.files.get(file_num).map_or(0, |entry| entry.size);
         match &mut self.data_source {
             DataSource::FilePath(p) => {
                 if file_num >= self.files.len() {
@@ -1947,7 +2005,8 @@ impl TransferJob {
                                     return Err(err);
                                 }
                             }
-                            self.data_stream = Some(DataStream::FileStream(file));
+                            self.data_stream = Some(DataStream::file_reader(file, current_size));
+                            self.compression = FileCompression::default();
                             self.file_confirmed = false;
                             self.file_is_waiting = false;
                         }
@@ -1978,6 +2037,7 @@ impl TransferJob {
     async fn get_current_digest(&self) -> ResultType<(u64, u64)> {
         let meta = match self.data_stream.as_ref().ok_or(anyhow!("file is None"))? {
             DataStream::FileStream(file) => file.metadata().await?,
+            DataStream::FileReader(file) => file.get_ref().metadata().await?,
             DataStream::BufStream(_) => bail!("No digest for buf stream"),
         };
         let last_modified = meta
@@ -2087,9 +2147,12 @@ impl TransferJob {
             self.file_is_waiting = false;
         } else {
             self.finished_size += offset as u64;
-            if matches!(self.data_source, DataSource::FilePath(_)) && !is_compressed_file(name) {
-                let tmp = compress(&buf);
-                if tmp.len() < buf.len() {
+            if matches!(self.data_source, DataSource::FilePath(_))
+                && !is_compressed_file(name)
+                && self.compression.should_probe()
+            {
+                let tmp = compress_file(&buf);
+                if self.compression.worthwhile(buf.len(), tmp.len()) {
                     buf = tmp;
                     compressed = true;
                 }
@@ -2225,7 +2288,8 @@ impl TransferJob {
             let download_path = format!("{}.download", &file_path);
             let digest_path = format!("{}.digest", &file_path);
 
-            let mut f = if Path::new(&download_path).exists() && Path::new(&digest_path).exists() {
+            let is_writer = Path::new(&download_path).exists() && Path::new(&digest_path).exists();
+            let mut f = if is_writer {
                 // If both download and digest files exist, seek (writer) to the offset
                 match OpenOptions::new()
                     .create(true)
@@ -2257,7 +2321,12 @@ impl TransferJob {
                 return;
             };
             if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
-                self.data_stream = Some(DataStream::FileStream(f));
+                self.data_stream = Some(if is_writer {
+                    DataStream::FileStream(f)
+                } else {
+                    DataStream::file_reader(f, entry.size.saturating_sub(offset))
+                });
+                self.compression = FileCompression::default();
                 self.transferred += offset;
                 self.finished_size += offset;
             }
@@ -2475,37 +2544,54 @@ pub async fn handle_read_jobs(
         if job.is_last_job {
             continue;
         }
-        match job.read().await {
-            Err(err) => {
-                stream
-                    .send(&new_error(job.id(), err, job.file_num()))
-                    .await?;
-            }
-            Ok(Some(block)) => {
-                stream.send(&new_block(block)).await?;
-            }
-            Ok(None) => {
-                if job.job_completed() {
-                    job_log = serialize_transfer_job(job, true, false, "");
-                    finished.push(job.id());
-                    let audit_error = job.audit_error();
-                    outcomes.push(ReadJobOutcome {
-                        id: job.id(),
-                        succeeded: audit_error.is_none(),
-                    });
-                    let job_error = job.job_error();
-                    match job_error {
-                        Some(err) => {
-                            job_log = serialize_transfer_job(job, false, false, &err);
-                            stream
-                                .send(&new_error(job.id(), err, job.file_num()))
-                                .await?
-                        }
-                        None => stream.send(&new_done(job.id(), job.file_num())).await?,
-                    }
-                } else {
-                    // waiting confirmation.
+        // Keep one job's ordering, but fill the stream in a bounded burst. In
+        // particular, compressible blocks must not each wait for a Windows timer.
+        let started = Instant::now();
+        for _ in 0..FILE_SEND_BURST_BLOCKS {
+            match job.read().await {
+                Err(err) => {
+                    stream
+                        .send(&new_error(job.id(), err, job.file_num()))
+                        .await?;
+                    break;
                 }
+                Ok(Some(block)) => {
+                    let eof = block.data.is_empty();
+                    stream.send(&new_block(block)).await?;
+                    // Open/digest/confirm the next file on the next invocation.
+                    if eof {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    if job.job_completed() {
+                        job_log = serialize_transfer_job(job, true, false, "");
+                        finished.push(job.id());
+                        let audit_error = job.audit_error();
+                        outcomes.push(ReadJobOutcome {
+                            id: job.id(),
+                            succeeded: audit_error.is_none(),
+                        });
+                        let job_error = job.job_error();
+                        match job_error {
+                            Some(err) => {
+                                job_log = serialize_transfer_job(job, false, false, &err);
+                                stream
+                                    .send(&new_error(job.id(), err, job.file_num()))
+                                    .await?
+                            }
+                            None => stream.send(&new_done(job.id(), job.file_num())).await?,
+                        }
+                    } else {
+                        // waiting confirmation.
+                    }
+                    break;
+                }
+            }
+            // Bound CPU work and yield between bursts to input, cancellation,
+            // clipboard credit and other messages sharing this connection.
+            if started.elapsed() >= FILE_SEND_BURST_BUDGET {
+                break;
             }
         }
         // Break to handle jobs one by one.
@@ -2665,6 +2751,7 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::compress;
 
     fn file_entry(name: &str) -> FileEntry {
         FileEntry {
@@ -2693,6 +2780,159 @@ mod tests {
             false,
             false,
         )
+    }
+
+    #[test]
+    fn compression_backoff_reprobes_and_never_accepts_failed_output() {
+        let mut policy = FileCompression::default();
+        assert!(policy.should_probe());
+        assert!(!policy.worthwhile(128 * 1024, 0));
+        for _ in 0..15 {
+            assert!(!policy.should_probe());
+        }
+        assert!(policy.should_probe());
+        assert!(!policy.worthwhile(128 * 1024, 128 * 1024 - 1));
+        for _ in 0..15 {
+            assert!(!policy.should_probe());
+        }
+        assert!(policy.should_probe());
+        assert!(policy.worthwhile(128 * 1024, 1024));
+        assert!(policy.should_probe());
+    }
+
+    #[tokio::test]
+    async fn buffered_reader_preserves_unaligned_resume_and_mixed_compression() {
+        use crate::rand::{rngs::StdRng, RngCore, SeedableRng};
+        let path =
+            std::env::temp_dir().join(format!("mdesk-buffered-{}.bin", uuid::Uuid::new_v4()));
+        let mut bytes = vec![0; DIRECT_TRANSFER_MAX_BLOCK_BYTES * 20 + 71];
+        StdRng::seed_from_u64(7123).fill_bytes(&mut bytes);
+        bytes[DIRECT_TRANSFER_MAX_BLOCK_BYTES * 16 + 19..].fill(b'a');
+        std::fs::write(&path, &bytes).unwrap();
+        let mut job =
+            TransferJob::from_clipboard_file(std::fs::File::open(&path).unwrap(), 19, "mixed.bin")
+                .await
+                .unwrap();
+        let mut actual = Vec::new();
+        let mut compressed_blocks = 0;
+        while let Some(block) = job.read().await.unwrap() {
+            if block.data.is_empty() {
+                break;
+            }
+            if block.compressed {
+                compressed_blocks += 1;
+                actual.extend(decompress(&block.data));
+            } else {
+                actual.extend_from_slice(&block.data);
+            }
+        }
+        assert_eq!(actual, bytes[19..]);
+        assert!(
+            compressed_blocks >= 4,
+            "compression must resume after the random prefix"
+        );
+        assert_eq!(job.finished_size(), bytes.len() as u64);
+        drop(job);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_resume_keeps_digest_confirmation_and_destination_writable() {
+        use crate::rand::{rngs::StdRng, RngCore, SeedableRng};
+        let dir = std::env::temp_dir().join(format!("mdesk-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("source.bin");
+        let destination = dir.join("destination.bin");
+        let mut bytes = vec![0; DIRECT_TRANSFER_MAX_BLOCK_BYTES * 2 + 17];
+        StdRng::seed_from_u64(9381).fill_bytes(&mut bytes);
+        std::fs::write(&source, &bytes).unwrap();
+        let mut read = TransferJob::new_read(
+            81,
+            JobType::Generic,
+            String::new(),
+            DataSource::FilePath(source.clone()),
+            0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        read.open_data_stream().await.unwrap();
+        assert_eq!(
+            read.get_current_digest().await.unwrap().1,
+            bytes.len() as u64
+        );
+        assert!(
+            read.read().await.unwrap().is_none(),
+            "no payload before overwrite confirmation"
+        );
+        let entries = read.files.clone();
+        read.set_file_confirmed(true);
+        let first = read.read().await.unwrap().unwrap();
+        let mut write = TransferJob::new_write(
+            81,
+            JobType::Generic,
+            String::new(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(entries.clone())
+        .unwrap();
+        write.write(first).await.unwrap();
+        if let Some(DataStream::FileStream(file)) = write.data_stream.as_mut() {
+            file.flush().await.unwrap();
+        }
+        drop(write); // Disconnect leaves the durable prefix available to resume.
+        let mut write = TransferJob::new_write(
+            81,
+            JobType::Generic,
+            String::new(),
+            DataSource::FilePath(destination.clone()),
+            0,
+            false,
+            true,
+            false,
+        )
+        .with_files(entries)
+        .unwrap();
+        write
+            .set_stream_offset(0, DIRECT_TRANSFER_MAX_BLOCK_BYTES as u64)
+            .await;
+        assert!(matches!(write.data_stream, Some(DataStream::FileStream(_))));
+        drop(read);
+        let mut read = TransferJob::new_read(
+            81,
+            JobType::Generic,
+            String::new(),
+            DataSource::FilePath(source),
+            0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        read.set_file_confirmed(true);
+        read.set_stream_offset(0, DIRECT_TRANSFER_MAX_BLOCK_BYTES as u64)
+            .await;
+        assert!(matches!(read.data_stream, Some(DataStream::FileReader(_))));
+        while let Some(block) = read.read().await.unwrap() {
+            let eof = block.data.is_empty();
+            write.write(block).await.unwrap();
+            if eof {
+                break;
+            }
+        }
+        write.finalize_write().await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        assert_eq!(read.finished_size(), bytes.len() as u64);
+        assert_eq!(write.finished_size(), bytes.len() as u64);
+        drop(read);
+        std::fs::remove_file(dir.join("source.bin")).unwrap();
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

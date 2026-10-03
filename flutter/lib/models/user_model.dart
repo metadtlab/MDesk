@@ -13,7 +13,9 @@ import 'package:http/http.dart' as flutter_http;
 import '../common.dart';
 import '../utils/http_service.dart' as http;
 import 'model.dart';
+import 'login_session_status.dart';
 import 'platform_model.dart';
+import '../utils/multi_window_manager.dart';
 
 bool refreshingUser = false;
 
@@ -30,6 +32,9 @@ class UserModel {
 
   Timer? _refreshTimer;
   Future<TokenRefreshResult>? _accessRefreshFuture;
+  Future<bool>? _sessionStatusFuture;
+  final _sessionWrites = LoginSessionWrites();
+  DateTime _nextUserRefresh = DateTime.now();
   int _sessionGeneration = 0;
 
   static const _refreshTokenKey = 'refresh_token';
@@ -58,23 +63,99 @@ class UserModel {
         gFFI.serverModel.stopService();
       }
     });
-    // 10분마다 자동 리프레쉬 타이머 설정 (600초)
-    _refreshTimer = Timer.periodic(const Duration(minutes: 10), (timer) {
+    _refreshTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
+      if (parent.target == null) {
+        _refreshTimer?.cancel();
+        _refreshTimer = null;
+        return;
+      }
+      // FFI instances for remote tabs must not run account monitors.
+      if (!identical(parent.target, gFFI) ||
+          (isDesktop && desktopType != DesktopType.main)) {
+        return;
+      }
       if (isLogin) {
-        refreshCurrentUser();
+        if (isDesktop && !await checkLoginSession()) return;
+        if (DateTime.now().isAfter(_nextUserRefresh)) {
+          _nextUserRefresh = DateTime.now().add(const Duration(minutes: 10));
+          await refreshCurrentUser();
+        }
       }
     });
+  }
+
+  /// Poll immediately before a new connection as well as while idle.
+  Future<bool> checkLoginSession() async {
+    if (bind.isDisableAccount()) return true;
+    final pending = _sessionStatusFuture;
+    if (pending != null) return pending;
+    final request = _checkLoginSession();
+    _sessionStatusFuture = request;
+    try {
+      return await request;
+    } finally {
+      if (identical(_sessionStatusFuture, request)) _sessionStatusFuture = null;
+    }
+  }
+
+  Future<bool> _checkLoginSession() async {
+    final snapshot = LoginSessionSnapshot(
+        _sessionGeneration, bind.mainGetLocalOption(key: 'access_token'));
+    if (snapshot.accessToken.isEmpty) return !isLogin;
+    bool isCurrent() => snapshot.matches(
+        _sessionGeneration, bind.mainGetLocalOption(key: 'access_token'));
+    try {
+      final url = await _accountApiServer();
+      if (!isCurrent()) return isLogin;
+      final response = await flutter_http.get(
+        Uri.parse('$url/api/session/status'),
+        headers: {'Authorization': 'Bearer ${snapshot.accessToken}'},
+      ).timeout(const Duration(seconds: 5));
+      if (!isCurrent()) return isLogin;
+      final status =
+          parseLoginSessionStatus(response.statusCode, response.body);
+      if (status == LoginSessionStatus.replaced ||
+          status == LoginSessionStatus.revoked) {
+        await _endRevokedSession(status);
+        return false;
+      }
+      if (status == LoginSessionStatus.expired) {
+        return recoverUnauthorized();
+      }
+    } catch (e) {
+      debugPrint('Login session check unavailable: $e');
+    }
+    return true;
+  }
+
+  Future<void> _endRevokedSession(LoginSessionStatus status) async {
+    final revokedGeneration = _sessionGeneration + 1;
+    await reset(resetOther: true);
+    if (_sessionGeneration != revokedGeneration) return;
+    if (isDesktop && desktopType == DesktopType.main) {
+      try {
+        await RustDeskMultiWindowManager.instance.closeAllSubWindows();
+      } catch (e) {
+        debugPrint('Failed to close revoked account sessions: $e');
+      }
+    }
+    if (status == LoginSessionStatus.replaced) {
+      showToast('다른 PC에서 로그인하여 로그아웃되었습니다.');
+    }
   }
 
   Future<void> refreshCurrentUser() async {
     if (bind.isDisableAccount()) return;
     if (refreshingUser) return;
     refreshingUser = true;
+    final generation = _sessionGeneration;
+    bool isCurrent() => generation == _sessionGeneration;
     networkError.value = '';
     try {
       var token = bind.mainGetLocalOption(key: 'access_token');
       if (token.isEmpty) {
         final recovery = await refreshAccessToken(force: true);
+        if (!isCurrent()) return;
         if (recovery == TokenRefreshResult.unavailable) {
           debugPrint('UserModel: No access token, skipping refresh');
           return;
@@ -89,6 +170,7 @@ class UserModel {
 
       if (_shouldRefreshAccessToken()) {
         final proactive = await refreshAccessToken();
+        if (!isCurrent()) return;
         if (proactive == TokenRefreshResult.rejected) {
           await reset(resetOther: true);
           return;
@@ -99,15 +181,25 @@ class UserModel {
       }
 
       final url = await _accountApiServer();
+      if (!isCurrent()) return;
       debugPrint('UserModel: Refreshing user from $url/api/userInfo');
       var response = await _requestCurrentUser(url, token);
+      if (!isCurrent() ||
+          token != bind.mainGetLocalOption(key: 'access_token')) {
+        return;
+      }
       var status = response.statusCode;
       debugPrint('UserModel: Refresh response status: $status');
       if (status == 401 || status == 400) {
         final recovery = await refreshAccessToken(force: true);
+        if (!isCurrent()) return;
         if (recovery == TokenRefreshResult.success) {
           token = bind.mainGetLocalOption(key: 'access_token');
           response = await _requestCurrentUser(url, token);
+          if (!isCurrent() ||
+              token != bind.mainGetLocalOption(key: 'access_token')) {
+            return;
+          }
           status = response.statusCode;
           debugPrint('UserModel: Refresh retry status: $status');
         } else if (recovery == TokenRefreshResult.unavailable) {
@@ -150,7 +242,15 @@ class UserModel {
             'UserModel: Refreshed user info from userInfo API - Name: ${user.name}, Membership: ${user.membershipLevel}, UserPkid: ${user.userPkid}');
         debugPrint('UserModel: Raw userData keys: ${userData.keys.toList()}');
         debugPrint('UserModel: Raw user_pkid value: ${userData['user_pkid']}');
-        _parseAndUpdateUser(user);
+        await _sessionWrites.run(() async {
+          if (!isCurrent() ||
+              token != bind.mainGetLocalOption(key: 'access_token')) {
+            return;
+          }
+          await bind.mainSetLocalOption(
+              key: 'user_info', value: jsonEncode(user));
+          if (isCurrent()) _parseAndUpdateUser(user);
+        });
 
         // 기기 등록은 "원격자 등록" 다이얼로그에서만 수행
         // (로그인 시 자동 등록 제거)
@@ -158,6 +258,7 @@ class UserModel {
         debugPrint('UserModel: API response code is not 1 or data is null');
       }
     } catch (e) {
+      if (!isCurrent()) return;
       networkError.value = e.toString();
       debugPrint('Failed to refreshCurrentUser: $e');
     } finally {
@@ -171,7 +272,7 @@ class UserModel {
     return flutter_http.get(Uri.parse('$url/api/userInfo'), headers: {
       'Content-Type': 'application/json',
       'Authorization': 'Bearer $accessToken'
-    });
+    }).timeout(const Duration(seconds: 10));
   }
 
   Future<String> _accountApiServer() async {
@@ -214,7 +315,9 @@ class UserModel {
   /// offline). Returns false after a rejected/non-refreshable session is reset.
   Future<bool> recoverUnauthorized({bool resetOther = true}) async {
     if (isWithinLoginProtection()) return true;
+    final generation = _sessionGeneration;
     final result = await refreshAccessToken(force: true);
+    if (generation != _sessionGeneration) return isLogin;
     if (result == TokenRefreshResult.success ||
         result == TokenRefreshResult.unavailable) {
       return true;
@@ -252,6 +355,10 @@ class UserModel {
           )
           .timeout(const Duration(seconds: 10));
 
+      if (refreshGeneration != _sessionGeneration) {
+        return TokenRefreshResult.rejected;
+      }
+
       if (response.statusCode == 200) {
         final body = jsonDecode(response.body) as Map<String, dynamic>;
         final refreshed = LoginResponse.fromJson(body);
@@ -262,11 +369,20 @@ class UserModel {
         if (refreshGeneration != _sessionGeneration) {
           return TokenRefreshResult.rejected;
         }
-        await storeLoginSession(refreshed);
+        await storeLoginSession(refreshed, generation: refreshGeneration);
+        if (refreshGeneration != _sessionGeneration) {
+          return TokenRefreshResult.rejected;
+        }
         debugPrint('UserModel: Access token refreshed');
         return TokenRefreshResult.success;
       }
       if (response.statusCode == 400 || response.statusCode == 401) {
+        final status =
+            parseLoginSessionStatus(response.statusCode, response.body);
+        if (status == LoginSessionStatus.replaced ||
+            status == LoginSessionStatus.revoked) {
+          await _endRevokedSession(status);
+        }
         debugPrint('UserModel: Refresh session rejected');
         return TokenRefreshResult.rejected;
       }
@@ -279,7 +395,15 @@ class UserModel {
     }
   }
 
-  Future<void> storeLoginSession(LoginResponse response) async {
+  Future<void> storeLoginSession(LoginResponse response, {int? generation}) {
+    final expectedGeneration = generation ?? _sessionGeneration;
+    return _sessionWrites.run(() async {
+      if (expectedGeneration != _sessionGeneration) return;
+      await _storeLoginSession(response);
+    });
+  }
+
+  Future<void> _storeLoginSession(LoginResponse response) async {
     final accessToken = response.access_token ?? '';
     if (accessToken.isEmpty) return;
 
@@ -308,14 +432,21 @@ class UserModel {
     LoginResponse response, {
     required bool storeSession,
   }) async {
-    if (storeSession) {
-      await storeLoginSession(response);
-    }
-    final user = response.user;
-    if (user == null) return;
-
-    await bind.mainSetLocalOption(key: 'user_info', value: jsonEncode(user));
-    _parseAndUpdateUser(user);
+    // A new login invalidates responses and refreshes from the previous session.
+    final generation = ++_sessionGeneration;
+    _accessRefreshFuture = null;
+    _sessionStatusFuture = null;
+    await _sessionWrites.run(() async {
+      if (generation != _sessionGeneration) return;
+      if (storeSession) await _storeLoginSession(response);
+      if (generation != _sessionGeneration) return;
+      final user = response.user;
+      if (user == null) return;
+      await bind.mainSetLocalOption(key: 'user_info', value: jsonEncode(user));
+      if (generation != _sessionGeneration) return;
+      _lastLoginTime = DateTime.now();
+      _parseAndUpdateUser(user);
+    });
   }
 
   static Map<String, dynamic>? getLocalUserInfo() {
@@ -340,8 +471,15 @@ class UserModel {
     }
   }
 
-  Future<void> reset({bool resetOther = false}) async {
-    _sessionGeneration++;
+  Future<void> reset({bool resetOther = false}) {
+    final generation = ++_sessionGeneration;
+    return _sessionWrites.run(() async {
+      if (generation != _sessionGeneration) return;
+      await _resetSession(resetOther: resetOther);
+    });
+  }
+
+  Future<void> _resetSession({required bool resetOther}) async {
     debugPrint('UserModel.reset called with resetOther=$resetOther');
     debugPrint('UserModel.reset called from:');
     debugPrint(StackTrace.current.toString().split('\n').take(10).join('\n'));
@@ -350,13 +488,15 @@ class UserModel {
     await bind.mainSetLocalOption(key: _accessTokenExpiresAtKey, value: '');
     await bind.mainSetLocalOption(key: _sessionExpiresAtKey, value: '');
     await bind.mainSetLocalOption(key: 'user_info', value: '');
+    userName.value = '';
+    isAdmin.value = false;
+    _lastLoginTime = null;
+    membershipLevel.value = 'free';
+    userPkid.value = '';
     if (resetOther) {
       await gFFI.abModel.reset();
       await gFFI.groupModel.reset();
     }
-    userName.value = '';
-    membershipLevel.value = 'free';
-    userPkid.value = '';
   }
 
   _parseAndUpdateUser(UserPayload user) {
@@ -367,13 +507,10 @@ class UserModel {
     if (user.userPkid.isNotEmpty) {
       userPkid.value = user.userPkid;
     }
-    bind.mainSetLocalOption(key: 'user_info', value: jsonEncode(user));
     if (isWeb) {
       // ugly here, tmp solution
       bind.mainSetLocalOption(key: 'verifier', value: user.verifier ?? '');
     }
-    // 로그인 성공 시간 기록 (디버그 모드 타이밍 이슈 방지)
-    _lastLoginTime = DateTime.now();
   }
 
   /// 현재 기기를 API 서버에 등록

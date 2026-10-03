@@ -177,8 +177,9 @@ class RegisteredDevice {
       memo: json['memo'] ?? '',
       hostname: json['hostname'] ?? '',
       platform: json['platform'] ?? '',
-      // API 응답에서 is_active 또는 is_online 필드 지원
-      isOnline: json['is_active'] ?? json['is_online'] ?? false,
+      // is_active means registration is enabled, not that the PC is reachable.
+      // The native online query supplies live status when the API omits it.
+      isOnline: _jsonBool(json['is_online']) ?? false,
       lastOnlineAt: json['last_online_at'] ?? json['updated_at'],
       registeredAt: json['registered_at'] ?? '',
     );

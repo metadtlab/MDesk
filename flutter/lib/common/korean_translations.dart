@@ -79,6 +79,7 @@ const Map<String, String> koreanTranslations = {
   "Connecting...": "연결 중...",
   "Connection in progress. Please wait.": "연결이 진행 중입니다. 기다려 주세요.",
   "Please try 1 minute later": "1분 후에 다시 시도하세요",
+  "Too many wrong password attempts. Please try again in {} minutes.": "비밀번호 오류 횟수를 초과하여 접속이 잠겼습니다. {}분 후에 다시 시도하세요.",
   "Login Error": "로그인 오류",
   "Successful": "성공",
   "Connected, waiting for image...": "연결되었습니다, 이미지를 기다리는 중...",

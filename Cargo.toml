@@ -1,6 +1,6 @@
 [package]
 name = "MDesk"
-version = "1.6.4"
+version = "1.6.5"
 authors = ["MDesk <metadtlab@Gmail.com>"]
 edition = "2021"
 build= "build.rs"
@@ -230,6 +230,7 @@ os-version = "0.2"
 [dev-dependencies]
 hound = "3.5"
 docopt = "1.1"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 
 [package.metadata.bundle]
 name = "RustDesk"

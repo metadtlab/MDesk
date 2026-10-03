@@ -162,6 +162,10 @@ impl Drop for SimpleCallOnReturn {
 }
 
 pub fn global_init() -> bool {
+    if hbb_common::tcp::init_sodium().is_err() {
+        log::error!("Failed to initialize libsodium");
+        return false;
+    }
     crate::connection_diagnostics::event("app", "", "process.start", &[]);
     #[cfg(target_os = "linux")]
     {

@@ -177,6 +177,36 @@ pub async fn connect_tcp_local<
     ))
 }
 
+/// Native connection signaling gives hbbs the NAT mapping needed for direct
+/// peers. Host registration must use UDP or WS; hbbs rejects RegisterPk on its
+/// native TCP signaling port. Keep Mini/proxy/explicit WS on their existing
+/// transport and retain WS fallback when a native port is blocked.
+pub async fn connect_rendezvous(
+    target: &str,
+    prefer_native: bool,
+    ms_timeout: u64,
+) -> ResultType<crate::Stream> {
+    if !prefer_native || is_ws_endpoint(target) {
+        return connect_tcp(target, ms_timeout).await;
+    }
+    let native_timeout = ms_timeout.min(crate::config::DIRECT_CONNECT_TIMEOUT);
+    match crate::timeout(
+        native_timeout,
+        connect_tcp_local(target, None, native_timeout),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Ok(stream),
+        native_result if crate::config::use_ws() => {
+            log::debug!("Native rendezvous unavailable; using allowed WebSocket fallback");
+            drop(native_result);
+            connect_tcp(target, ms_timeout).await
+        }
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(err.into()),
+    }
+}
+
 #[inline]
 pub fn is_ipv4(target: &TargetAddr<'_>) -> bool {
     match target {
@@ -276,6 +306,98 @@ mod tests {
     use std::net::ToSocketAddrs;
 
     use super::*;
+
+    #[tokio::test]
+    async fn registered_and_mini_rendezvous_routing() {
+        use crate::config::{keys, replace_websocket_requirement_for_test};
+        use tokio::net::TcpListener;
+
+        struct Restore {
+            options: std::collections::HashMap<String, String>,
+            required_ws: bool,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                Config::set_options(std::mem::take(&mut self.options));
+                replace_websocket_requirement_for_test(self.required_ws);
+            }
+        }
+        let _restore = Restore {
+            options: Config::get_options(),
+            required_ws: replace_websocket_requirement_for_test(false),
+        };
+        Config::set_option(keys::OPTION_ALLOW_WEBSOCKET.to_owned(), "Y".to_owned());
+        assert!(!crate::config::relay_required(false));
+        assert!(crate::config::relay_required(true));
+
+        // Native success must win even with WS allowed and with a valid WS
+        // listener available. This is the installed/registered target policy.
+        let (native, ws, target) = loop {
+            let native = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = native.local_addr().unwrap();
+            if let Some(port) = addr.port().checked_add(2) {
+                if let Ok(ws) = TcpListener::bind((addr.ip(), port)).await {
+                    break (native, ws, addr.to_string());
+                }
+            }
+        };
+        Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            target.clone(),
+        );
+        let stream = connect_rendezvous(&target, true, 1_000).await.unwrap();
+        assert!(matches!(stream, Stream::Tcp(_)));
+        let (native_peer, _) = native.accept().await.unwrap();
+        assert!(crate::timeout(40, ws.accept()).await.is_err());
+        drop(native_peer);
+        drop(stream);
+
+        // The same listener pair must route Mini directly to WS, ignoring the
+        // installed preference. No native connection may be created.
+        crate::config::require_websocket_for_process();
+        assert!(crate::config::relay_required(false));
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let stream = connect_rendezvous(&target, !crate::config::relay_required(false), 1_000)
+            .await
+            .unwrap();
+        assert!(matches!(stream, Stream::WebSocket(_)));
+        assert!(crate::timeout(40, native.accept()).await.is_err());
+        let ws_peer = ws_server.await.unwrap();
+        drop(ws_peer);
+        drop(stream);
+        replace_websocket_requirement_for_test(false);
+
+        // A blocked native port must still work through allowed WS fallback.
+        let (native, ws, target) = loop {
+            let native = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = native.local_addr().unwrap();
+            if let Some(port) = addr.port().checked_add(2) {
+                if let Ok(ws) = TcpListener::bind((addr.ip(), port)).await {
+                    break (native, ws, addr.to_string());
+                }
+            }
+        };
+        Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            target.clone(),
+        );
+        drop(native);
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let stream = connect_rendezvous(&target, true, 1_000).await.unwrap();
+        assert!(matches!(stream, Stream::WebSocket(_)));
+        let ws_peer = ws_server.await.unwrap();
+        drop(ws_peer);
+        drop(stream);
+
+        Config::set_option(keys::OPTION_ALLOW_WEBSOCKET.to_owned(), "N".to_owned());
+        assert!(connect_rendezvous(&target, true, 100).await.is_err());
+    }
 
     #[test]
     fn test_nat64() {

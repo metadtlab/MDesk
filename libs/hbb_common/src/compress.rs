@@ -7,25 +7,33 @@ use zstd::bulk::Compressor;
 // value 0 means default, which is controlled by ZSTD_CLEVEL_DEFAULT
 thread_local! {
     static COMPRESSOR: RefCell<io::Result<Compressor<'static>>> = RefCell::new(Compressor::new(crate::config::COMPRESS_LEVEL));
+    // File transfer favors latency/throughput; keep other consumers' level unchanged.
+    static FILE_COMPRESSOR: RefCell<io::Result<Compressor<'static>>> = RefCell::new(Compressor::new(1));
 }
 
 pub fn compress(data: &[u8]) -> Vec<u8> {
+    COMPRESSOR.with(|c| compress_with(data, c))
+}
+
+pub fn compress_file(data: &[u8]) -> Vec<u8> {
+    FILE_COMPRESSOR.with(|c| compress_with(data, c))
+}
+
+fn compress_with(data: &[u8], c: &RefCell<io::Result<Compressor<'static>>>) -> Vec<u8> {
     let mut out = Vec::new();
-    COMPRESSOR.with(|c| {
-        if let Ok(mut c) = c.try_borrow_mut() {
-            match &mut *c {
-                Ok(c) => match c.compress(data) {
-                    Ok(res) => out = res,
-                    Err(err) => {
-                        crate::log::debug!("Failed to compress: {}", err);
-                    }
-                },
+    if let Ok(mut c) = c.try_borrow_mut() {
+        match &mut *c {
+            Ok(c) => match c.compress(data) {
+                Ok(res) => out = res,
                 Err(err) => {
-                    crate::log::debug!("Failed to get compressor: {}", err);
+                    crate::log::debug!("Failed to compress: {}", err);
                 }
+            },
+            Err(err) => {
+                crate::log::debug!("Failed to get compressor: {}", err);
             }
         }
-    });
+    }
     out
 }
 

@@ -61,6 +61,11 @@ pub struct RendezvousMediator {
     host: String,
     host_prefix: String,
     keep_alive: i32,
+    registered: bool,
+}
+
+fn register_over_stream(force_relay: bool, udp_disabled: bool, host: &str) -> bool {
+    force_relay || udp_disabled || hbb_common::websocket::is_ws_endpoint(host)
 }
 
 impl RendezvousMediator {
@@ -175,13 +180,29 @@ impl RendezvousMediator {
     pub async fn start_udp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start udp: {host}");
-        let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
+        let fallback_allowed = use_ws();
+        let bootstrap_timeout = if fallback_allowed {
+            config::DIRECT_CONNECT_TIMEOUT
+        } else {
+            CONNECT_TIMEOUT
+        };
+        let bootstrap_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(bootstrap_timeout);
+        let (mut socket, mut addr) =
+            hbb_common::timeout(bootstrap_timeout, new_udp_for(&host, bootstrap_timeout)).await??;
         let mut rz = Self {
             addr: addr.clone(),
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
+            registered: false,
         };
+        crate::connection_diagnostics::event(
+            "host",
+            "",
+            "registration.transport",
+            &[("route", "UDP")],
+        );
 
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         const MIN_REG_TIMEOUT: i64 = 3_000;
@@ -225,6 +246,12 @@ impl RendezvousMediator {
                 }
             };
             select! {
+                _ = tokio::time::sleep_until(bootstrap_deadline), if fallback_allowed && !rz.registered => {
+                    if SHOULD_EXIT.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    bail!("UDP registration was not confirmed within 3 seconds");
+                },
                 n = socket.next() => {
                     match n {
                         Some(Ok((bytes, _))) => {
@@ -300,10 +327,16 @@ impl RendezvousMediator {
             Some(rendezvous_message::Union::RegisterPeerResponse(rpr)) => {
                 update_latency();
                 if rpr.request_pk {
-                    crate::connection_diagnostics::event("host", "", "registration.key_requested", &[("server", &self.host)]);
+                    crate::connection_diagnostics::event(
+                        "host",
+                        "",
+                        "registration.key_requested",
+                        &[("server", &self.host)],
+                    );
                     log::info!("request_pk received from {}", self.host);
                     self.register_pk(sink).await?;
                 } else {
+                    self.registered = true;
                     mark_rendezvous_registered(&self.host);
                 }
             }
@@ -314,13 +347,17 @@ impl RendezvousMediator {
                         Config::set_key_confirmed(true);
                         Config::set_host_key_confirmed(&self.host_prefix, true);
                         *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
+                        self.registered = true;
                         mark_rendezvous_registered(&self.host);
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
                     }
+                    Ok(register_pk_response::Result::NOT_SUPPORT) => {
+                        bail!("Rendezvous server does not support registration on this transport");
+                    }
                     _ => {
-                        log::error!("unknown RegisterPkResponse");
+                        log::error!("RegisterPkResponse rejected: {:?}", rpr.result);
                     }
                 }
                 if rpr.keep_alive > 0 {
@@ -367,8 +404,23 @@ impl RendezvousMediator {
 
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
-        log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
-        let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
+        // Native hbbs TCP supports connection signaling, but rejects RegisterPk
+        // with NOT_SUPPORT. Host registration uses UDP, or WS on this path.
+        let mut conn = connect_tcp(host.as_str(), CONNECT_TIMEOUT).await?;
+        crate::connection_diagnostics::event(
+            "host",
+            "",
+            "registration.transport",
+            &[(
+                "route",
+                if matches!(&conn, Stream::WebSocket(_)) {
+                    "WebSocket"
+                } else {
+                    "TCP"
+                },
+            )],
+        );
+        log::info!("start rendezvous registration: {}", host);
         let key = crate::get_key(true).await;
         crate::secure_tcp(&mut conn, &key).await?;
         let mut rz = Self {
@@ -376,6 +428,7 @@ impl RendezvousMediator {
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
+            registered: false,
         };
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
@@ -424,21 +477,44 @@ impl RendezvousMediator {
     }
 
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
-        let _diagnostic = crate::connection_diagnostics::Span::lifetime("host", "", "registration.channel");
-        crate::connection_diagnostics::event("host", "", "registration.start", &[
-            ("server", &host), ("key_confirmed", &Config::get_key_confirmed().to_string()),
-            ("route", if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some()) || Config::is_proxy() || use_ws() || crate::is_udp_disabled() { "tcp" } else { "udp" }),
-        ]);
+        let _diagnostic =
+            crate::connection_diagnostics::Span::lifetime("host", "", "registration.channel");
+        let stream_registration = (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
+            || register_over_stream(
+                config::relay_required(false),
+                crate::is_udp_disabled(),
+                &host,
+            );
+        crate::connection_diagnostics::event(
+            "host",
+            "",
+            "registration.start",
+            &[
+                ("server", &host),
+                ("key_confirmed", &Config::get_key_confirmed().to_string()),
+                ("route", if stream_registration { "stream" } else { "udp" }),
+            ],
+        );
         log::info!("start rendezvous mediator of {}", host);
-        //If the investment agent type is http or https, then tcp forwarding is enabled.
-        if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
-            || Config::is_proxy()
-            || use_ws()
-            || crate::is_udp_disabled()
-        {
+        if stream_registration {
             Self::start_tcp(server, host).await
         } else {
-            Self::start_udp(server, host).await
+            // Allowing WS does not make installed peers relay-only. Try hbbs'
+            // supported native registration first, then recover through WS if
+            // UDP is blocked or its initial registration is not confirmed.
+            match Self::start_udp(server.clone(), host.clone()).await {
+                Err(err) if use_ws() && !SHOULD_EXIT.load(Ordering::SeqCst) => {
+                    log::warn!("Native UDP registration failed; using WebSocket fallback: {err}");
+                    crate::connection_diagnostics::event(
+                        "host",
+                        "",
+                        "registration.fallback",
+                        &[("route", "WebSocket")],
+                    );
+                    Self::start_tcp(server, host).await
+                }
+                result => result,
+            }
         }
     }
 
@@ -521,7 +597,7 @@ impl RendezvousMediator {
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
         let relay_server = self.get_relay_server(fla.relay_server.clone());
-        let relay = use_ws() || Config::is_proxy();
+        let relay = config::relay_required(false);
         let mut socket_addr_v6 = Default::default();
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(peer_addr_v6, addr, server.clone()).await;
@@ -563,7 +639,7 @@ impl RendezvousMediator {
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&fla.socket_addr);
         log::debug!("Handle intranet from {:?}", peer_addr);
-        let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+        let mut socket = socket_client::connect_tcp_local(&*self.host, None, config::DIRECT_CONNECT_TIMEOUT).await?;
         let local_addr = socket.local_addr();
         // we saw invalid local_addr while using proxy, local_addr.ip() == "::1"
         let local_addr: SocketAddr =
@@ -593,14 +669,14 @@ impl RendezvousMediator {
             return Ok(());
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
-        let relay = use_ws() || Config::is_proxy() || ph.force_relay;
+        let relay = config::relay_required(ph.force_relay);
         crate::connection_diagnostics::event("host", "", "connection.requested", &[("force_relay", &relay.to_string())]);
         let mut socket_addr_v6 = Default::default();
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(peer_addr_v6, peer_addr, server.clone()).await;
         }
         let relay_server = self.get_relay_server(ph.relay_server);
-        // for ensure, websocket go relay directly
+        // Mini/explicit relay and NAT constraints retain the relay path.
         if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
             || Config::get_nat_type() == NatType::SYMMETRIC as i32
             || relay
@@ -637,7 +713,7 @@ impl RendezvousMediator {
         }
         log::debug!("Punch tcp hole to {:?}", peer_addr);
         let mut socket = {
-            let socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+            let socket = socket_client::connect_tcp_local(&*self.host, None, config::DIRECT_CONNECT_TIMEOUT).await?;
             let local_addr = socket.local_addr();
             // key important here for punch hole to tell my gateway incoming peer is safe.
             // it can not be async here, because local_addr can not be reused, we must close the connection before use it again.
@@ -883,4 +959,215 @@ async fn udp_nat_listen(
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use hbb_common::futures::{SinkExt, StreamExt};
+    use std::process::Command;
+    use tokio::net::{TcpListener, UdpSocket};
+
+    const TEST_CASE: &str = "MDESK_REGISTRATION_TEST_CASE";
+    const TEST_APP: &str = "MDESK_REGISTRATION_TEST_APP";
+
+    #[test]
+    fn registration_transport_policy() {
+        assert!(!register_over_stream(false, false, "787.kr"));
+        assert!(register_over_stream(true, false, "787.kr")); // Mini/proxy
+        assert!(register_over_stream(false, true, "787.kr"));
+        assert!(register_over_stream(false, false, "wss://787.kr/ws/id"));
+    }
+
+    #[test]
+    fn registration_matches_hbbs_protocol() {
+        if let Ok(case) = std::env::var(TEST_CASE) {
+            // hbb_common is a normal dependency of root unit tests. Its cfg(test)
+            // profile override is not active here. Isolate before any lazy config
+            // is loaded, using a fresh process and unique resolved app directory.
+            let name = std::env::var(TEST_APP).unwrap();
+            assert!(name.starts_with("mdesk-registration-test-"));
+            *config::APP_NAME.write().unwrap() = name.clone();
+            assert!(!Config::file().exists());
+            assert!(!config::Config2::file().exists());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(registration_case(&case));
+            assert_eq!(config::APP_NAME.read().unwrap().as_str(), name);
+            // Only remove known test files and empty folders in this namespace.
+            let directory = Config::file().parent().unwrap().to_path_buf();
+            let profile = directory.parent().unwrap();
+            assert_eq!(profile.file_name().unwrap(), name.as_str());
+            for file in [Config::file(), config::Config2::file()] {
+                if file.exists() {
+                    std::fs::remove_file(file).unwrap();
+                }
+            }
+            std::fs::remove_dir(&directory).unwrap();
+            std::fs::remove_dir(profile).unwrap();
+            return;
+        }
+        for case in ["udp", "blocked_udp", "mini"] {
+            let name = format!("mdesk-registration-test-{}", Uuid::new_v4());
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rendezvous_mediator::registration_tests::registration_matches_hbbs_protocol",
+                    "--nocapture",
+                ])
+                .env(TEST_CASE, case)
+                .env(TEST_APP, name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    async fn registration_case(case: &str) {
+        hbb_common::sodiumoxide::init().unwrap();
+        let (udp, tcp, ws, target) = loop {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = udp.local_addr().unwrap();
+            if let Some(port) = addr.port().checked_add(2) {
+                if let (Ok(tcp), Ok(ws)) = (
+                    TcpListener::bind(addr).await,
+                    TcpListener::bind((addr.ip(), port)).await,
+                ) {
+                    break (udp, tcp, ws, addr.to_string());
+                }
+            }
+        };
+        Config::set_option(OPTION_ALLOW_WEBSOCKET.into(), "Y".into());
+        Config::set_option(OPTION_CUSTOM_RENDEZVOUS_SERVER.into(), target.clone());
+        Config::set_option(OPTION_DISABLE_UDP.into(), "N".into());
+        Config::set_key_confirmed(false);
+        Config::set_host_key_confirmed(&target, false);
+        Config::reset_online();
+        SHOULD_EXIT.store(false, Ordering::SeqCst);
+        RENDEZVOUS_REGISTERED.store(false, Ordering::SeqCst);
+        if case == "mini" {
+            config::require_websocket_for_process();
+        }
+        let started = Instant::now();
+        let app = tokio::spawn(RendezvousMediator::start(
+            crate::server::new_registration_test_server(),
+            target,
+        ));
+        let mut buffer = [0; 4096];
+        if case != "mini" {
+            let (len, addr) =
+                tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buffer))
+                    .await
+                    .expect("installed registration must attempt UDP first")
+                    .unwrap();
+            let request = Message::parse_from_bytes(&buffer[..len]).unwrap();
+            assert!(matches!(
+                request.union,
+                Some(rendezvous_message::Union::RegisterPk(_))
+            ));
+            if case == "udp" {
+                udp.send_to(&accepted_registration(), addr).await.unwrap();
+                wait_for_registration().await;
+                // A successful native registration remains native past the
+                // initial fallback deadline, even though WS is available.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(3_200), ws.accept())
+                        .await
+                        .is_err()
+                );
+                assert!(is_rendezvous_registered());
+                assert!(config::get_online_state() > 0);
+            }
+        }
+        if case != "udp" {
+            let (socket, _) = tokio::time::timeout(Duration::from_secs(5), ws.accept())
+                .await
+                .expect("blocked UDP and Mini must recover over WS")
+                .unwrap();
+            if case == "blocked_udp" {
+                assert!(started.elapsed() >= Duration::from_millis(2_900));
+                assert!(started.elapsed() < Duration::from_secs(5));
+            } else {
+                assert!(started.elapsed() < Duration::from_secs(2));
+            }
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(2), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let request = Message::parse_from_bytes(&request.into_data()).unwrap();
+            assert!(matches!(
+                request.union,
+                Some(rendezvous_message::Union::RegisterPk(_))
+            ));
+            websocket
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    accepted_registration().into(),
+                ))
+                .await
+                .unwrap();
+            wait_for_registration().await;
+            if case == "mini" {
+                assert!(tokio::time::timeout(
+                    Duration::from_millis(50),
+                    udp.recv_from(&mut buffer)
+                )
+                .await
+                .is_err());
+            }
+            assert!(config::get_online_state() > 0);
+            assert_no_tcp_registration(&tcp).await;
+            app.abort();
+            let _ = app.await;
+            return;
+        }
+        assert_no_tcp_registration(&tcp).await;
+        app.abort();
+        let _ = app.await;
+    }
+
+    fn accepted_registration() -> Vec<u8> {
+        let mut response = Message::new();
+        response.set_register_pk_response(RegisterPkResponse {
+            result: register_pk_response::Result::OK.into(),
+            keep_alive: 20,
+            ..Default::default()
+        });
+        response.write_to_bytes().unwrap()
+    }
+
+    async fn wait_for_registration() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !is_rendezvous_registered() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accepted registration must update readiness");
+    }
+
+    async fn assert_no_tcp_registration(tcp: &TcpListener) {
+        // new_udp_for probes TCP briefly to choose the address family. This is
+        // allowed; the regression is sending RegisterPk on that TCP socket.
+        while let Ok(Ok((socket, addr))) =
+            tokio::time::timeout(Duration::from_millis(50), tcp.accept()).await
+        {
+            let mut socket = hbb_common::tcp::FramedStream::from(socket, addr);
+            if let Some(Ok(bytes)) = socket.next_timeout(50).await {
+                let msg = Message::parse_from_bytes(&bytes).unwrap();
+                assert!(!matches!(
+                    msg.union,
+                    Some(rendezvous_message::Union::RegisterPk(_))
+                ));
+            }
+        }
+    }
 }

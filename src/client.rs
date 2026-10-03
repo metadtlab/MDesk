@@ -58,7 +58,9 @@ use hbb_common::{
     rand,
     rendezvous_proto::*,
     sha2::{Digest, Sha256},
-    socket_client::{connect_tcp, connect_tcp_local, ipv4_to_ipv6, new_direct_udp_for},
+    socket_client::{
+        connect_rendezvous, connect_tcp, connect_tcp_local, ipv4_to_ipv6, new_direct_udp_for,
+    },
     sodiumoxide::{base64, crypto::sign},
     timeout,
     tokio::{
@@ -72,6 +74,7 @@ use hbb_common::{
     },
     AddrMangle, ResultType, Stream,
 };
+
 pub use helper::*;
 use scrap::{
     codec::Decoder,
@@ -172,9 +175,60 @@ lazy_static::lazy_static! {
 }
 
 const PUBLIC_SERVER: &str = "public";
-const FAST_RELAY_FALLBACK_TIMEOUT: u64 = 3_000;
-const DIRECT_SECURE_HANDSHAKE_TIMEOUT: u64 = 1_000;
+const FAST_RELAY_FALLBACK_TIMEOUT: u64 = config::DIRECT_CONNECT_TIMEOUT;
 const MAX_PUNCH_ATTEMPTS_WITHOUT_RELAY: u64 = 3;
+
+fn direct_remaining_ms(deadline: Option<Instant>, otherwise: u64) -> u64 {
+    deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+        })
+        .unwrap_or(otherwise)
+}
+
+async fn with_direct_deadline<T>(
+    deadline: Option<Instant>,
+    attempt: impl std::future::Future<Output = ResultType<T>>,
+) -> ResultType<T> {
+    if let Some(deadline) = deadline {
+        if deadline <= Instant::now() {
+            bail!("Direct connection exceeded its 3-second deadline");
+        }
+        Ok(tokio::time::timeout_at(deadline, attempt).await??)
+    } else {
+        attempt.await
+    }
+}
+
+async fn select_direct_first<F, T>(
+    attempts: Vec<F>,
+    deadline: Option<Instant>,
+    is_direct: impl Fn(&T) -> bool,
+) -> ResultType<T>
+where
+    F: std::future::Future<Output = ResultType<T>> + Unpin,
+{
+    let (first, mut remaining) = select_ok(attempts).await?;
+    if deadline.is_none() || is_direct(&first) || remaining.is_empty() {
+        return Ok(first);
+    }
+    // Hold an already-working relay while another direct candidate still has
+    // time. A fast relay response must not cancel a viable direct attempt.
+    let direct = with_direct_deadline(deadline, async {
+        while !remaining.is_empty() {
+            let (candidate, pending) = select_ok(remaining).await?;
+            if is_direct(&candidate) {
+                return Ok(candidate);
+            }
+            remaining = pending;
+        }
+        bail!("No direct candidate succeeded")
+    })
+    .await;
+    Ok(direct.unwrap_or(first))
+}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_key_state(key: enigo::Key) -> bool {
@@ -294,7 +348,8 @@ impl Client {
         }
 
         let session = interface.get_lch().read().unwrap().session_id.to_string();
-        let mut discovery = crate::connection_diagnostics::Span::new("controller", &session, "server.lookup");
+        let mut discovery =
+            crate::connection_diagnostics::Span::new("controller", &session, "server.lookup");
         let other_server = interface.get_lch().read().unwrap().other_server.clone();
         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
             (a.as_ref(), b.as_ref(), c.as_ref(), "")
@@ -320,7 +375,8 @@ impl Client {
 
         discovery.success();
         drop(discovery);
-        let mut preparation = crate::connection_diagnostics::Span::new("controller", &session, "network.prepare");
+        let mut preparation =
+            crate::connection_diagnostics::Span::new("controller", &session, "network.prepare");
         if crate::get_ipv6_punch_enabled() {
             crate::test_ipv6().await;
         }
@@ -347,6 +403,8 @@ impl Client {
         };
         preparation.success();
         drop(preparation);
+        let direct_deadline = (!interface.is_force_relay())
+            .then(|| Instant::now() + Duration::from_millis(FAST_RELAY_FALLBACK_TIMEOUT));
         let fut = Self::_start_inner(
             peer.to_owned(),
             key.to_owned(),
@@ -358,6 +416,7 @@ impl Client {
             rendezvous_server.clone(),
             servers.clone(),
             contained,
+            direct_deadline,
         );
         if udp.0.is_none() {
             return fut.await;
@@ -375,12 +434,13 @@ impl Client {
             rendezvous_server,
             servers,
             contained,
+            direct_deadline,
         );
         connect_futures.push(fut.boxed());
-        match select_ok(connect_futures).await {
-            Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
-            Err(e) => Err(e),
-        }
+        select_direct_first(connect_futures, direct_deadline, |connection| {
+            connection.0 .1
+        })
+        .await
     }
 
     async fn _start_inner(
@@ -394,6 +454,7 @@ impl Client {
         mut rendezvous_server: String,
         servers: Vec<String>,
         contained: bool,
+        direct_deadline: Option<Instant>,
     ) -> ResultType<(
         (
             Stream,
@@ -406,10 +467,21 @@ impl Client {
         bool,
     )> {
         let session = interface.get_lch().read().unwrap().session_id.to_string();
-        let mut id_connect = crate::connection_diagnostics::Span::new("controller", &session, "id_server.connect");
-        crate::connection_diagnostics::event("controller", &session, "id_server.selected", &[("server", &rendezvous_server)]);
+        let mut id_connect =
+            crate::connection_diagnostics::Span::new("controller", &session, "id_server.connect");
+        crate::connection_diagnostics::event(
+            "controller",
+            &session,
+            "id_server.selected",
+            &[("server", &rendezvous_server)],
+        );
         let mut start = Instant::now();
-        let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+        let mut socket = connect_rendezvous(
+            &rendezvous_server,
+            direct_deadline.is_some(),
+            CONNECT_TIMEOUT,
+        )
+        .await;
         debug_assert!(!servers.contains(&rendezvous_server));
         let rtt = start.elapsed();
         log::debug!("TCP connection establishment time used: {:?}", rtt);
@@ -417,7 +489,8 @@ impl Client {
             log::info!("try the other servers: {:?}", servers);
             for server in servers {
                 let server = check_port(server, RENDEZVOUS_PORT);
-                socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
+                socket =
+                    connect_rendezvous(&server, direct_deadline.is_some(), CONNECT_TIMEOUT).await;
                 if socket.is_ok() {
                     rendezvous_server = server;
                     break;
@@ -429,6 +502,11 @@ impl Client {
         }
         log::info!("rendezvous server: {}", rendezvous_server);
         let mut socket = socket?;
+        // A WS signaling channel has no usable native NAT mapping. Its fallback
+        // remains relay-only; merely allowing WS does not disable native P2P.
+        let force_relay = interface.is_force_relay() || matches!(&socket, Stream::WebSocket(_));
+        let direct_deadline = if force_relay { None } else { direct_deadline };
+        socket.set_send_timeout(direct_remaining_ms(direct_deadline, CONNECT_TIMEOUT));
         id_connect.success();
         drop(id_connect);
         let my_addr = socket.local_addr();
@@ -441,7 +519,7 @@ impl Client {
         let mut is_local = false;
         let mut feedback = 0;
         use hbb_common::protobuf::Enum;
-        let nat_type = if interface.is_force_relay() {
+        let nat_type = if force_relay {
             NatType::SYMMETRIC
         } else {
             NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
@@ -458,6 +536,9 @@ impl Client {
             loop {
                 let port = *udp.lock().unwrap();
                 if port > 0 {
+                    break;
+                }
+                if direct_deadline.is_some() && direct_remaining_ms(direct_deadline, 0) == 0 {
                     break;
                 }
                 // await for 0.5 RTT
@@ -489,12 +570,12 @@ impl Client {
             conn_type: conn_type.into(),
             version: crate::VERSION.to_owned(),
             udp_port: udp_nat_port as _,
-            force_relay: interface.is_force_relay(),
+            force_relay,
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             ..Default::default()
         });
         let relay_after_first_direct_failure =
-            Self::relay_fallback_available(&fallback_relay_server, interface.is_force_relay());
+            Self::relay_fallback_available(&fallback_relay_server, force_relay);
         let max_punch_attempts = if relay_after_first_direct_failure {
             1
         } else {
@@ -504,8 +585,16 @@ impl Client {
         let mut offline_grace_retry = true;
         let mut force_relay_offline_deadline = None;
         while i < max_punch_attempts {
+            if direct_deadline.is_some() && direct_remaining_ms(direct_deadline, 0) == 0 {
+                break;
+            }
             i += 1;
-            crate::connection_diagnostics::event("controller", &session, "rendezvous.request", &[("attempt", &i.to_string())]);
+            crate::connection_diagnostics::event(
+                "controller",
+                &session,
+                "rendezvous.request",
+                &[("attempt", &i.to_string())],
+            );
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
                 i,
@@ -513,10 +602,18 @@ impl Client {
                 my_addr,
                 peer
             );
-            socket.send(&msg_out).await?;
+            if let Err(err) = socket.send(&msg_out).await {
+                if relay_after_first_direct_failure {
+                    break;
+                }
+                return Err(err);
+            }
             // below timeout should not bigger than hbbs's connection timeout.
-            if let Some(msg_in) =
-                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 3000)).await
+            if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(
+                &mut socket,
+                Some(direct_remaining_ms(direct_deadline, i * 3000)),
+            )
+            .await
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
@@ -529,8 +626,13 @@ impl Client {
                                     bail!("ID does not exist");
                                 }
                                 Ok(punch_hole_response::Failure::OFFLINE) => {
-                                    crate::connection_diagnostics::event("controller", &session, "rendezvous.offline", &[]);
-                                    if interface.is_force_relay() {
+                                    crate::connection_diagnostics::event(
+                                        "controller",
+                                        &session,
+                                        "rendezvous.offline",
+                                        &[],
+                                    );
+                                    if force_relay {
                                         let deadline = *force_relay_offline_deadline
                                             .get_or_insert_with(|| {
                                                 Instant::now() + FORCE_RELAY_OFFLINE_GRACE
@@ -552,7 +654,9 @@ impl Client {
                                         log::info!(
                                             "Peer offline on rendezvous; waiting 3s then retry punch"
                                         );
-                                        hbb_common::sleep(3.).await;
+                                        let wait_ms =
+                                            direct_remaining_ms(direct_deadline, 3_000).min(3_000);
+                                        hbb_common::sleep(wait_ms as f32 / 1000.).await;
                                         i -= 1;
                                         continue;
                                     }
@@ -599,7 +703,12 @@ impl Client {
                         }
                     }
                     Some(rendezvous_message::Union::RelayResponse(rr)) => {
-                        crate::connection_diagnostics::event("controller", &session, "relay.assigned", &[("relay_uuid", &rr.uuid)]);
+                        crate::connection_diagnostics::event(
+                            "controller",
+                            &session,
+                            "relay.assigned",
+                            &[("relay_uuid", &rr.uuid)],
+                        );
                         log::info!(
                             "relay requested from peer, time used: {:?}, relay_server: {}",
                             start.elapsed(),
@@ -611,16 +720,27 @@ impl Client {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
                             if addr.port() > 0 {
                                 if s.connect(addr).await.is_ok() {
-                                    connect_futures
-                                        .push(udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).boxed());
+                                    connect_futures.push(
+                                        udp_nat_connect(
+                                            s,
+                                            "IPv6",
+                                            direct_remaining_ms(direct_deadline, CONNECT_TIMEOUT),
+                                        )
+                                        .boxed(),
+                                    );
                                 }
                             }
                         }
                         signed_id_pk = rr.pk().into();
+                        relay_server = if rr.relay_server.is_empty() {
+                            fallback_relay_server.clone()
+                        } else {
+                            rr.relay_server
+                        };
                         let fut = Self::create_relay(
                             &peer,
                             rr.uuid,
-                            rr.relay_server,
+                            relay_server.clone(),
                             &key,
                             conn_type,
                             my_addr.is_ipv4(),
@@ -632,17 +752,44 @@ impl Client {
                             }
                             .boxed(),
                         );
-                        // Run all connection attempts concurrently, return the first successful one
-                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
-                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-
-                            Err(e) => (Err(e), None, ""),
-                        };
-                        let mut conn = conn?;
+                        let (mut conn, mut kcp, mut typ) =
+                            select_direct_first(connect_futures, direct_deadline, |connection| {
+                                connection.2 == "IPv6"
+                            })
+                            .await?;
                         feedback = rr.feedback;
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
-                        let pk =
-                            Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
+                        let secure_deadline = if typ == "IPv6" { direct_deadline } else { None };
+                        let secure_result = with_direct_deadline(
+                            secure_deadline,
+                            Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut conn),
+                        )
+                        .await;
+                        let pk = match secure_result {
+                            Ok(pk) => pk,
+                            Err(_) if typ == "IPv6" && !relay_server.is_empty() => {
+                                drop(conn);
+                                conn = Self::request_relay(
+                                    &peer,
+                                    relay_server.clone(),
+                                    &rendezvous_server,
+                                    !signed_id_pk.is_empty(),
+                                    &key,
+                                    &token,
+                                    conn_type,
+                                )
+                                .await?;
+                                typ = if matches!(&conn, Stream::WebSocket(_)) {
+                                    "WebSocket"
+                                } else {
+                                    "Relay"
+                                };
+                                kcp = None;
+                                Self::secure_connection(&peer, signed_id_pk, &key, &mut conn)
+                                    .await?
+                            }
+                            Err(err) => return Err(err),
+                        };
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
                             (feedback, rendezvous_server),
@@ -712,6 +859,7 @@ impl Client {
                 udp.0,
                 ipv6.0,
                 punch_type,
+                direct_deadline,
             )
             .await?,
             (feedback, rendezvous_server),
@@ -738,6 +886,7 @@ impl Client {
         udp_socket_nat: Option<Arc<UdpSocket>>,
         udp_socket_v6: Option<Arc<UdpSocket>>,
         punch_type: &str,
+        direct_deadline: Option<Instant>,
     ) -> ResultType<(
         Stream,
         bool,
@@ -777,157 +926,108 @@ impl Client {
                 connect_timeout = MIN;
             }
         }
-        if Self::relay_fallback_available(relay_server, interface.is_force_relay())
-            && connect_timeout > FAST_RELAY_FALLBACK_TIMEOUT
-        {
-            log::info!(
-                "fast relay fallback: cap direct timeout from {} to {} ms",
-                connect_timeout,
-                FAST_RELAY_FALLBACK_TIMEOUT
-            );
-            connect_timeout = FAST_RELAY_FALLBACK_TIMEOUT;
+        if Self::relay_fallback_available(relay_server, interface.is_force_relay()) {
+            connect_timeout = direct_remaining_ms(direct_deadline, FAST_RELAY_FALLBACK_TIMEOUT);
         }
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
 
         let force_relay = interface.is_force_relay();
-        crate::connection_diagnostics::event("controller", &interface.get_lch().read().unwrap().session_id.to_string(), "direct.attempt", &[
-            ("force_relay", &force_relay.to_string()), ("timeout_ms", &connect_timeout.to_string()),
-        ]);
-        let (mut conn, mut kcp, mut typ) = if force_relay {
+        crate::connection_diagnostics::event(
+            "controller",
+            &interface.get_lch().read().unwrap().session_id.to_string(),
+            "direct.attempt",
+            &[
+                ("force_relay", &force_relay.to_string()),
+                ("timeout_ms", &connect_timeout.to_string()),
+            ],
+        );
+        let direct_result = if force_relay {
             log::info!("P2P attempt skipped for relay-only connection");
-            (Err(anyhow!("relay-only connection requested")), None, "")
+            Err(anyhow!("relay-only connection requested"))
         } else {
-            let mut connect_futures = Vec::new();
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            connect_futures.push(
-                async move {
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP"))
+            with_direct_deadline(direct_deadline, async {
+                let mut connect_futures = Vec::new();
+                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+                connect_futures.push(async move { Ok((fut.await?, None, "TCP")) }.boxed());
+                if let Some(udp_socket_nat) = udp_socket_nat {
+                    connect_futures
+                        .push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
                 }
-                .boxed(),
-            );
-            if let Some(udp_socket_nat) = udp_socket_nat {
-                connect_futures
-                    .push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
-            }
-            if let Some(udp_socket_v6) = udp_socket_v6 {
-                connect_futures
-                    .push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
-            }
-            // Run all direct connection attempts concurrently and use the first success.
-            match select_ok(connect_futures).await {
-                Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-                Err(e) => (Err(e), None, ""),
-            }
+                if let Some(udp_socket_v6) = udp_socket_v6 {
+                    connect_futures
+                        .push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
+                }
+                // All direct transports and the secure handshake share one
+                // deadline, including native rendezvous and hole punching.
+                let ((mut conn, kcp, typ), _) = select_ok(connect_futures).await?;
+                let pk =
+                    Self::secure_connection(peer_id, signed_id_pk.clone(), key, &mut conn).await?;
+                Ok((conn, true, pk, kcp, typ))
+            })
+            .await
         };
-
-        let mut direct = !conn.is_err();
-        if force_relay || conn.is_err() {
-            crate::connection_diagnostics::event("controller", &interface.get_lch().read().unwrap().session_id.to_string(), "relay.fallback", &[]);
-            if !relay_server.is_empty() {
-                conn = Self::request_relay(
-                    peer_id,
-                    relay_server.to_owned(),
-                    rendezvous_server,
-                    !signed_id_pk.is_empty(),
-                    key,
-                    token,
-                    conn_type,
-                )
-                .await;
-                if let Err(e) = conn {
-                    // this direct is mainly used by on_establish_connection_error, so we update it here before bail
-                    interface.update_direct(Some(false));
-                    bail!("Failed to connect via relay server: {}", e);
-                }
-                typ = "Relay";
-                direct = false;
-            } else {
-                bail!("Failed to make direct connection to remote desktop");
+        match direct_result {
+            Ok(result) => {
+                log::info!(
+                    "{:?} used to establish {} connection with {} punch",
+                    start.elapsed(),
+                    result.4,
+                    punch_type
+                );
+                return Ok(result);
+            }
+            Err(err) if relay_server.is_empty() => {
+                interface.update_direct(Some(false));
+                return Err(err.context("Failed to make direct connection to remote desktop"));
+            }
+            Err(err) => {
+                crate::connection_diagnostics::event(
+                    "controller",
+                    &interface.get_lch().read().unwrap().session_id.to_string(),
+                    "relay.fallback",
+                    &[(
+                        "reason",
+                        crate::connection_diagnostics::error_kind(&err.to_string()),
+                    )],
+                );
             }
         }
-        let mut conn = conn?;
-        log::info!(
-            "{:?} used to establish {typ} connection with {} punch",
-            start.elapsed(),
-            punch_type
-        );
-        let relay_after_direct_handshake_failure =
-            direct && Self::relay_fallback_available(relay_server, force_relay);
-        let secure_timeout = if relay_after_direct_handshake_failure {
-            DIRECT_SECURE_HANDSHAKE_TIMEOUT
-        } else {
-            READ_TIMEOUT
-        };
-        let res = Self::secure_connection_with_timeout(
+        let relay_start = Instant::now();
+        let mut conn = match Self::request_relay(
             peer_id,
-            signed_id_pk.clone(),
+            relay_server.to_owned(),
+            rendezvous_server,
+            !signed_id_pk.is_empty(),
             key,
-            &mut conn,
-            secure_timeout,
+            token,
+            conn_type,
         )
-        .await;
-        let pk: Option<Vec<u8>> = match res {
-            Ok(pk) => pk,
-            Err(direct_err) if relay_after_direct_handshake_failure => {
-                log::info!(
-                    "direct secure handshake failed within {} ms; switching to relay without restarting session: {}",
-                    DIRECT_SECURE_HANDSHAKE_TIMEOUT,
-                    direct_err
-                );
-                drop(conn);
-                let relay_start = Instant::now();
-                conn = match Self::request_relay(
-                    peer_id,
-                    relay_server.to_owned(),
-                    rendezvous_server,
-                    !signed_id_pk.is_empty(),
-                    key,
-                    token,
-                    conn_type,
-                )
-                .await
-                {
-                    Ok(conn) => conn,
-                    Err(relay_err) => {
-                        interface.update_direct(Some(false));
-                        bail!(
-                            "Direct secure handshake failed: {}; relay fallback failed: {}",
-                            direct_err,
-                            relay_err
-                        );
-                    }
-                };
-                let pk = match Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await
-                {
-                    Ok(pk) => pk,
-                    Err(relay_err) => {
-                        interface.update_direct(Some(false));
-                        bail!(
-                            "Direct secure handshake failed: {}; relay secure handshake failed: {}",
-                            direct_err,
-                            relay_err
-                        );
-                    }
-                };
-                log::info!(
-                    "{:?} used to establish Relay connection after direct secure handshake failure",
-                    relay_start.elapsed()
-                );
-                direct = false;
-                kcp = None;
-                typ = "Relay";
-                pk
-            }
-            Err(e) => {
-                // this direct is mainly used by on_establish_connection_error, so we update it here before bail
-                interface.update_direct(Some(direct));
-                bail!(e);
+        .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                interface.update_direct(Some(false));
+                return Err(err.context("Failed to connect via relay server"));
             }
         };
-        log::debug!("{} punch secure_connection ok", punch_type);
-        Ok((conn, direct, pk, kcp, typ))
+        let pk = match Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await {
+            Ok(pk) => pk,
+            Err(err) => {
+                interface.update_direct(Some(false));
+                return Err(err);
+            }
+        };
+        let typ = if matches!(&conn, Stream::WebSocket(_)) {
+            "WebSocket"
+        } else {
+            "Relay"
+        };
+        log::info!(
+            "{:?} used to establish {typ} connection after direct fallback",
+            relay_start.elapsed()
+        );
+        Ok((conn, false, pk, None, typ))
     }
 
     fn relay_fallback_available(relay_server: &str, force_relay: bool) -> bool {
@@ -2048,6 +2148,187 @@ fn requires_verified_enterprise_audit(conn_type: ConnType, access_token: &str) -
 }
 
 #[cfg(test)]
+mod direct_first_tests {
+    use super::*;
+    use hbb_common::{
+        sodiumoxide::crypto::{box_, secretbox},
+        tcp::FramedStream,
+    };
+
+    #[tokio::test]
+    async fn fast_relay_does_not_preempt_a_viable_direct_candidate() {
+        let attempts = vec![
+            async { Ok(("relay", false)) }.boxed(),
+            async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Ok(("direct", true))
+            }
+            .boxed(),
+        ];
+        let chosen = select_direct_first(
+            attempts,
+            Some(Instant::now() + Duration::from_millis(200)),
+            |route| route.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(chosen, ("direct", true));
+    }
+
+    #[tokio::test]
+    async fn relay_is_retained_when_the_other_direct_candidate_stalls() {
+        let attempts = vec![
+            async { Ok(("relay", false)) }.boxed(),
+            std::future::pending::<ResultType<(&str, bool)>>().boxed(),
+        ];
+        let chosen = select_direct_first(
+            attempts,
+            Some(Instant::now() + Duration::from_millis(60)),
+            |route| route.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(chosen, ("relay", false));
+    }
+
+    #[tokio::test]
+    async fn mini_relay_selection_has_no_direct_wait() {
+        let attempts = vec![
+            async { Ok(("relay", false)) }.boxed(),
+            std::future::pending::<ResultType<(&str, bool)>>().boxed(),
+        ];
+        let chosen = timeout(200, select_direct_first(attempts, None, |route| route.1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen, ("relay", false));
+    }
+
+    fn signed_peer() -> (Vec<u8>, String, Message, box_::SecretKey) {
+        hbb_common::sodiumoxide::init().unwrap();
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let (host_pk, host_sk) = sign::gen_keypair();
+        let (box_pk, box_sk) = box_::gen_keypair();
+        let peer = "registered-test-peer";
+        let signed_peer = sign::sign(
+            &IdPk {
+                id: peer.to_owned(),
+                pk: host_pk.0.to_vec().into(),
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .unwrap(),
+            &server_sk,
+        );
+        let mut hello = Message::new();
+        hello.set_signed_id(SignedId {
+            id: sign::sign(
+                &IdPk {
+                    id: peer.to_owned(),
+                    pk: box_pk.0.to_vec().into(),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .unwrap(),
+                &host_sk,
+            )
+            .into(),
+            ..Default::default()
+        });
+        (
+            signed_peer,
+            base64::encode(&server_pk.0, base64::Variant::Original),
+            hello,
+            box_sk,
+        )
+    }
+
+    #[tokio::test]
+    async fn registered_secure_response_can_take_more_than_one_second() {
+        let (signed_peer, key, hello, box_sk) = signed_peer();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            let mut socket = FramedStream::from(socket, peer);
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            socket.send(&hello).await.unwrap();
+            let response = socket.next_timeout(2_000).await.unwrap().unwrap();
+            let response = Message::parse_from_bytes(&response).unwrap();
+            let public_key = response.public_key();
+            let their_pk = box_::PublicKey::from_slice(&public_key.asymmetric_value).unwrap();
+            let symmetric_key = box_::open(
+                &public_key.symmetric_value,
+                &box_::Nonce([0; box_::NONCEBYTES]),
+                &their_pk,
+                &box_sk,
+            )
+            .unwrap();
+            socket.set_key(secretbox::Key::from_slice(&symmetric_key).unwrap());
+            assert_eq!(
+                socket.next_timeout(2_000).await.unwrap().unwrap().as_ref(),
+                b"encrypted fixture"
+            );
+        });
+        let started = Instant::now();
+        with_direct_deadline(
+            Some(started + Duration::from_millis(FAST_RELAY_FALLBACK_TIMEOUT)),
+            async {
+                let mut socket = connect_tcp_local(addr, None, FAST_RELAY_FALLBACK_TIMEOUT).await?;
+                Client::secure_connection("registered-test-peer", signed_peer, &key, &mut socket)
+                    .await?;
+                socket.send_raw(b"encrypted fixture".to_vec()).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        remote.await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn stalled_direct_handshake_releases_socket_at_three_seconds() {
+        let (signed_peer, key, _, _) = signed_peer();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            let mut socket = FramedStream::from(socket, peer);
+            // No SignedId response: the ordinary secure read timeout is 18s.
+            let closed = socket.next().await;
+            assert!(closed.is_none() || matches!(closed, Some(Err(_))));
+        });
+        let started = Instant::now();
+        let result = with_direct_deadline(
+            Some(started + Duration::from_millis(FAST_RELAY_FALLBACK_TIMEOUT)),
+            async {
+                let mut socket = connect_tcp_local(addr, None, FAST_RELAY_FALLBACK_TIMEOUT).await?;
+                Client::secure_connection("registered-test-peer", signed_peer, &key, &mut socket)
+                    .await
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(2_900));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        timeout(1_000, remote).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_direct_budget_does_not_start_another_transport() {
+        let mut polled = false;
+        let result = with_direct_deadline(Some(Instant::now() - Duration::from_millis(1)), async {
+            polled = true;
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!polled);
+    }
+}
+
+#[cfg(test)]
 mod enterprise_audit_context_tests {
     use super::*;
 
@@ -2286,12 +2567,13 @@ impl LoginConfigHandler {
         // Routing policy:
         // - installed clients try P2P first and fall back to relay;
         // - callers explicitly mark certificate-number MDeskMini sessions as relay-only;
-        // - `/r`, relay retries, WebSocket and proxy connections remain explicit relay paths.
+        // - `/r`, relay retries, Mini and proxy connections remain explicit relay paths;
+        // - installed clients prefer native rendezvous even when WS fallback is allowed.
         //
         // Ignore the legacy per-peer `force-always-relay` value here. Older builds
         // persisted one-shot relay fallbacks into that option, which made later
         // installed-client sessions skip P2P indefinitely.
-        self.force_relay = force_relay || use_ws() || Config::is_proxy();
+        self.force_relay = config::relay_required(force_relay);
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
@@ -4679,75 +4961,105 @@ async fn hc_connection_(
 pub mod peer_online {
     use hbb_common::{
         anyhow::bail,
-        config::{Config, CONNECT_TIMEOUT, READ_TIMEOUT},
+        config::{Config, READ_TIMEOUT},
         log,
         rendezvous_proto::*,
-        sleep,
-        socket_client::connect_tcp,
+        socket_client::connect_tcp_local,
         ResultType, Stream,
     };
 
     pub async fn query_online_states<F: FnOnce(Vec<String>, Vec<String>)>(ids: Vec<String>, f: F) {
-        let test = false;
-        if test {
-            sleep(1.5).await;
-            let mut onlines = ids;
-            let offlines = onlines.drain((onlines.len() / 2)..).collect();
-            f(onlines, offlines)
-        } else {
-            let query_timeout = std::time::Duration::from_millis(3_000);
-            match query_online_states_(&ids, query_timeout).await {
-                Ok((onlines, offlines)) => {
-                    f(onlines, offlines);
-                }
-                Err(e) => {
-                    log::debug!("query onlines, {}", &e);
-                }
+        if ids.is_empty() {
+            return;
+        }
+        let query_timeout = std::time::Duration::from_millis(3_000);
+        match query_online_states_(&ids, query_timeout).await {
+            Ok((onlines, offlines)) => {
+                f(onlines, offlines);
+            }
+            Err(e) => {
+                // An unavailable query is not evidence that every device is offline.
+                log::debug!("query onlines, {}", &e);
             }
         }
     }
 
-    async fn create_online_stream() -> ResultType<Stream> {
+    fn online_server_address(rendezvous_server: &str) -> ResultType<String> {
+        let Some((host, port)) = rendezvous_server.rsplit_once(':') else {
+            bail!("Invalid server address: {}", rendezvous_server);
+        };
+        let port: u16 = port.parse()?;
+        let valid_host = if host.starts_with('[') {
+            host.strip_prefix('[')
+                .and_then(|ip| ip.strip_suffix(']'))
+                .and_then(|ip| ip.parse::<std::net::Ipv6Addr>().ok())
+                .is_some()
+        } else {
+            !host.is_empty() && !host.contains(':') && !host.contains('/')
+        };
+        if !valid_host || port < 2 {
+            bail!("Invalid server address: {}", rendezvous_server);
+        }
+        Ok(format!("{}:{}", host, port - 1))
+    }
+
+    async fn create_online_stream(ms_timeout: u64) -> ResultType<Stream> {
         let (rendezvous_server, _servers, _contained) =
             crate::get_rendezvous_server(READ_TIMEOUT).await;
-        let tmp: Vec<&str> = rendezvous_server.split(":").collect();
-        if tmp.len() != 2 {
-            bail!("Invalid server address: {}", rendezvous_server);
+        let online_server = online_server_address(&rendezvous_server)?;
+        // OnlineRequest is served by hbbs's dedicated PORT-1 TCP listener.
+        // The ID WebSocket listener does not handle it and closes the connection.
+        // This read-only status protocol contains peer IDs, never login tokens.
+        // Keep the normal ID/relay WebSocket transport and TLS policy unchanged.
+        connect_tcp_local(online_server, None, ms_timeout).await
+    }
+
+    fn parse_online_states(
+        ids: &[String],
+        states: &[u8],
+    ) -> ResultType<(Vec<String>, Vec<String>)> {
+        if states.len() < (ids.len() + 7) / 8 {
+            bail!("Incomplete online response");
         }
-        let port: u16 = tmp[1].parse()?;
-        if port == 0 {
-            bail!("Invalid server address: {}", rendezvous_server);
+        let mut onlines = Vec::new();
+        let mut offlines = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let bit_value = 0x01 << (7 - i % 8);
+            if (states[i / 8] & bit_value) != 0 {
+                onlines.push(id.clone());
+            } else {
+                offlines.push(id.clone());
+            }
         }
-        let online_server = format!("{}:{}", tmp[0], port - 1);
-        connect_tcp(online_server, CONNECT_TIMEOUT).await
+        Ok((onlines, offlines))
     }
 
     async fn query_online_states_(
-        ids: &Vec<String>,
+        ids: &[String],
+        timeout: std::time::Duration,
+    ) -> ResultType<(Vec<String>, Vec<String>)> {
+        let socket = create_online_stream(timeout.as_millis() as u64).await?;
+        query_online_states_on_stream(ids, &Config::get_id(), socket, timeout).await
+    }
+
+    async fn query_online_states_on_stream(
+        ids: &[String],
+        source_id: &str,
+        mut socket: Stream,
         timeout: std::time::Duration,
     ) -> ResultType<(Vec<String>, Vec<String>)> {
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_request(OnlineRequest {
-            id: Config::get_id(),
-            peers: ids.clone(),
+            id: source_id.to_owned(),
+            peers: ids.to_vec(),
             ..Default::default()
         });
-
-        let mut socket = match create_online_stream().await {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("Failed to create peers online stream, {e}");
-                return Ok((vec![], ids.clone()));
-            }
-        };
+        socket.set_send_timeout(timeout.as_millis() as u64);
         // TODO: Use long connections to avoid socket creation
         // If we use a Arc<Mutex<Option<FramedStream>>> to hold and reuse the previous socket,
         // we may face the following error:
         // An established connection was aborted by the software in your host machine. (os error 10053)
-        if let Err(e) = socket.send(&msg_out).await {
-            log::debug!("Failed to send peers online states query, {e}");
-            return Ok((vec![], ids.clone()));
-        }
+        socket.send(&msg_out).await?;
         // Retry for 2 times to get the online response
         for _ in 0..2 {
             if let Some(msg_in) =
@@ -4756,19 +5068,7 @@ pub mod peer_online {
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::OnlineResponse(online_response)) => {
-                        let states = online_response.states;
-                        let mut onlines = Vec::new();
-                        let mut offlines = Vec::new();
-                        for i in 0..ids.len() {
-                            // bytes index from left to right
-                            let bit_value = 0x01 << (7 - i % 8);
-                            if (states[i / 8] & bit_value) == bit_value {
-                                onlines.push(ids[i].clone());
-                            } else {
-                                offlines.push(ids[i].clone());
-                            }
-                        }
-                        return Ok((onlines, offlines));
+                        return parse_online_states(ids, &online_response.states);
                     }
                     _ => {
                         // ignore
@@ -4785,22 +5085,93 @@ pub mod peer_online {
 
     #[cfg(test)]
     mod tests {
-        use hbb_common::tokio;
+        use super::*;
+        use hbb_common::{protobuf::Message, tcp::FramedStream, tokio};
 
-        #[tokio::test]
-        async fn test_query_onlines() {
-            super::query_online_states(
-                vec![
-                    "152183996".to_owned(),
-                    "165782066".to_owned(),
-                    "155323351".to_owned(),
-                    "460952777".to_owned(),
-                ],
-                |onlines: Vec<String>, offlines: Vec<String>| {
-                    println!("onlines: {:?}, offlines: {:?}", &onlines, &offlines);
-                },
+        #[test]
+        fn online_address_uses_dedicated_port_and_supports_ipv6() {
+            assert_eq!(
+                online_server_address("787.kr:21116").unwrap(),
+                "787.kr:21115"
+            );
+            assert_eq!(
+                online_server_address("127.0.0.1:23456").unwrap(),
+                "127.0.0.1:23455"
+            );
+            assert_eq!(online_server_address("[::1]:21116").unwrap(), "[::1]:21115");
+            for server in [
+                "787.kr",
+                "787.kr:0",
+                "787.kr:1",
+                "787.kr:65536",
+                ":21116",
+                "[]:21116",
+                "[invalid]:21116",
+                "::1:21116",
+                "wss://787.kr:21116",
+            ] {
+                assert!(online_server_address(server).is_err());
+            }
+        }
+
+        #[test]
+        fn online_bitmap_crosses_byte_boundaries_and_rejects_truncation() {
+            let ids: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+            let (onlines, offlines) = parse_online_states(&ids, &[0x81, 0x40]).unwrap();
+            assert_eq!(onlines, ["0", "7", "9"]);
+            assert_eq!(offlines, ["1", "2", "3", "4", "5", "6", "8"]);
+            assert!(parse_online_states(&ids, &[0x81]).is_err());
+            assert!(parse_online_states(&ids, &[]).is_err());
+        }
+
+        async fn mock_online_query(
+            states: Option<Vec<u8>>,
+        ) -> ResultType<(Vec<String>, Vec<String>)> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let ids = vec!["reachable".to_owned(), "offline".to_owned()];
+            let expected_ids = ids.clone();
+            let server = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.unwrap();
+                let mut stream = FramedStream::from(stream, peer);
+                let bytes = stream.next_timeout(1_000).await.unwrap().unwrap();
+                let request = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+                let request = request.online_request();
+                assert_eq!(request.id, "test-controller");
+                assert_eq!(request.peers, expected_ids);
+                if let Some(states) = states {
+                    let mut response = RendezvousMessage::new();
+                    response.set_online_response(OnlineResponse {
+                        states: states.into(),
+                        ..Default::default()
+                    });
+                    stream.send(&response).await.unwrap();
+                }
+            });
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            let socket = Stream::Tcp(FramedStream::from(stream, addr));
+            let result = query_online_states_on_stream(
+                &ids,
+                "test-controller",
+                socket,
+                std::time::Duration::from_millis(1_000),
             )
             .await;
+            server.await?;
+            result
+        }
+
+        #[tokio::test]
+        async fn online_query_reads_authoritative_status_over_tcp() {
+            let (onlines, offlines) = mock_online_query(Some(vec![0x80])).await.unwrap();
+            assert_eq!(onlines, ["reachable"]);
+            assert_eq!(offlines, ["offline"]);
+        }
+
+        #[tokio::test]
+        async fn unavailable_or_incomplete_response_is_not_all_offline() {
+            assert!(mock_online_query(None).await.is_err());
+            assert!(mock_online_query(Some(vec![])).await.is_err());
         }
     }
 }

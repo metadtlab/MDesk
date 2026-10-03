@@ -12,6 +12,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::OnceLock,
     task::{Context, Poll},
 };
 use tokio::{
@@ -26,6 +27,13 @@ pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
 #[derive(Clone)]
 pub struct Encrypt(pub Key, pub u64, pub u64);
+
+/// Initialize CPU feature dispatch before sessions use the crypto library.
+/// The OnceLock also makes constructor use safe across simultaneous sessions.
+pub fn init_sodium() -> Result<(), ()> {
+    static INITIALIZED: OnceLock<Result<(), ()>> = OnceLock::new();
+    *INITIALIZED.get_or_init(sodiumoxide::init)
+}
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -298,6 +306,9 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
+        // TCP and WebSocket share this constructor. Preserve secretbox framing,
+        // keys and nonces while enabling libsodium's available SIMD routines.
+        init_sodium().expect("failed to initialize libsodium for encrypted stream");
         Self(key, 0, 0)
     }
 
@@ -343,5 +354,45 @@ impl Encrypt {
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key);
         Ok(Key(key))
+    }
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use super::*;
+
+    #[test]
+    fn initialized_cipher_preserves_wire_nonces_and_rejects_tampering() {
+        let key = Key([17; secretbox::KEYBYTES]);
+        let mut sender = Encrypt::new(key.clone());
+        let mut receiver = Encrypt::new(key.clone());
+        let data = vec![0xA5; 128 * 1024];
+        for sequence in 1..=3u64 {
+            let mut nonce = Nonce([0; secretbox::NONCEBYTES]);
+            nonce.0[..8].copy_from_slice(&sequence.to_le_bytes());
+            let encoded = sender.enc(&data);
+            assert_eq!(encoded, secretbox::seal(&data, &nonce, &key));
+            let mut frame = BytesMut::from(encoded.as_slice());
+            receiver.dec(&mut frame).unwrap();
+            assert_eq!(frame.as_ref(), data);
+        }
+        let mut damaged = sender.enc(&data);
+        damaged[32] ^= 1;
+        assert!(receiver
+            .dec(&mut BytesMut::from(damaged.as_slice()))
+            .is_err());
+    }
+
+    #[test]
+    fn crypto_initialization_is_shared_across_concurrent_sessions() {
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(init_sodium(), Ok(()));
+                    let mut enc = Encrypt::new(Key([19; secretbox::KEYBYTES]));
+                    assert!(!enc.enc(b"concurrent session").is_empty());
+                });
+            }
+        });
     }
 }

@@ -16,6 +16,7 @@ pub fn clip_2_msg(clip: ClipboardFile) -> Message {
                 size: f.size,
                 data: f.data.into(),
                 compressed: f.compressed,
+                window_bytes: f.window_bytes,
                 ..Default::default()
             });
             msg.set_cliprdr(clip);
@@ -227,6 +228,7 @@ pub fn msg_2_clip(msg: Cliprdr) -> Option<ClipboardFile> {
                 size: f.size,
                 data: f.data.into(),
                 compressed: f.compressed,
+                window_bytes: f.window_bytes,
             }))
         }
         Some(cliprdr::Union::Ready(_)) => Some(ClipboardFile::MonitorReady),
@@ -490,6 +492,7 @@ mod tests {
             size: (1u64 << 40) + BLOCK_BYTES as u64,
             data: (0..BLOCK_BYTES).map(|i| i as u8).collect(),
             compressed: false,
+            window_bytes: clipboard::file_stream::MAX_WINDOW_BYTES as u32,
         };
         let encoded = clip_2_msg(ClipboardFile::FileStream(original.clone()))
             .write_to_bytes()

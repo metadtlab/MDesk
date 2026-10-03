@@ -26,6 +26,8 @@ fn mini_websocket_policy_is_process_local() {
             config::require_websocket_for_process();
             config::apply_product_default_settings();
             assert!(config::use_ws(), "Mini must override saved and custom N");
+            assert!(config::websocket_required_for_process());
+            assert!(config::relay_required(false), "Mini must remain relay-only");
             assert_eq!(hbb_common::websocket::check_ws("787.kr:21116"), "wss://787.kr/ws/id");
             assert_eq!(hbb_common::websocket::check_ws("787.kr:21117"), "wss://787.kr/ws/relay");
             assert_eq!(fs::read(Config2::file()).unwrap(), saved, "forcing WS must not persist it");
@@ -34,6 +36,9 @@ fn mini_websocket_policy_is_process_local() {
             assert!(!config::use_ws(), "installed process must not inherit Mini's policy");
             Config::set_option(option.into(), "Y".into());
             assert!(config::use_ws(), "installed users can still opt in");
+            assert!(!config::websocket_required_for_process());
+            assert!(!config::relay_required(false), "allowing WS must not disable installed P2P");
+            assert!(config::relay_required(true), "explicit relay requests must still be honored");
             Config::set_option(option.into(), "N".into());
             assert!(!config::use_ws(), "installed users can opt out again");
         }

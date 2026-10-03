@@ -654,6 +654,7 @@ message CliprdrFileStream {
   uint64 size = 6;
   bytes data = 7;
   bool compressed = 8;
+  uint32 window_bytes = 9; // REQUEST receive-credit bound; 0 means legacy 1 MiB, max 4 MiB.
 }
 
 message Cliprdr {

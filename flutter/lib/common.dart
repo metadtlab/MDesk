@@ -2532,6 +2532,10 @@ connect(BuildContext context, String id,
     String? connToken,
     bool? isSharedPassword}) async {
   if (id == '') return;
+
+  if (isDesktop && desktopType == DesktopType.main && gFFI.userModel.isLogin) {
+    if (!await gFFI.userModel.checkLoginSession()) return;
+  }
   
   // 강제 업데이트가 필요하면 연결 차단
   if (stateGlobal.forceUpdate.value) {
@@ -3906,15 +3910,29 @@ void earlyAssert() {
   assert('\1' == '1');
 }
 
+int _favoriteLoadGeneration = 0;
+(String, String)? _favoriteLoadAccount;
+
 /// 즐겨찾기 목록 로드 (서버 API 연동, 로그인 사용자 전용)
 Future<void> loadFavPeers() async {
   const loadFavEvent = 'load_fav_peers';
+  final generation = ++_favoriteLoadGeneration;
+  final account = (gFFI.userModel.userName.value, gFFI.userModel.userPkid.value);
+  final accessToken = bind.mainGetLocalOption(key: 'access_token');
+  bool isCurrent() =>
+      generation == _favoriteLoadGeneration &&
+      account == (gFFI.userModel.userName.value, gFFI.userModel.userPkid.value) &&
+      accessToken == bind.mainGetLocalOption(key: 'access_token');
+  if (_favoriteLoadAccount != account) {
+    _favoriteLoadAccount = account;
+    platformFFI.tryHandle({'name': loadFavEvent, 'peers': jsonEncode([])});
+  }
   if (!gFFI.userModel.isLogin) {
     platformFFI.tryHandle({'name': loadFavEvent, 'peers': jsonEncode([])});
     return;
   }
   final apiServer = await bind.mainGetApiServer();
-  final accessToken = bind.mainGetLocalOption(key: 'access_token');
+  if (!isCurrent()) return;
   if (apiServer.isEmpty || accessToken.isEmpty) {
     platformFFI.tryHandle({'name': loadFavEvent, 'peers': jsonEncode([])});
     return;
@@ -3923,8 +3941,10 @@ Future<void> loadFavPeers() async {
     apiServer: apiServer,
     accessToken: accessToken,
   );
+  if (!isCurrent()) return;
   if (response.isUnauthorized) {
     await gFFI.userModel.recoverUnauthorized();
+    if (!isCurrent()) return;
   }
   final peers = favoriteService.favoritesToPeers(response.data);
   final peerMaps = peers.map((p) => p.toJson()).toList();

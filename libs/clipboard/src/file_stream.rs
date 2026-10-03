@@ -14,6 +14,19 @@ pub const DESCRIPTORS_RESPONSE: u32 = 8;
 pub const FORMAT_PREFIX: &str = "MDesk.FileStream.v1:";
 pub const BLOCK_BYTES: usize = 128 * 1024;
 pub const WINDOW_BYTES: usize = 8 * BLOCK_BYTES;
+pub const MAX_WINDOW_BYTES: usize = 32 * BLOCK_BYTES;
+
+fn negotiated_window(bytes: u32) -> Option<usize> {
+    if bytes == 0 {
+        return Some(WINDOW_BYTES);
+    } // Legacy v1 peers.
+    let bytes = bytes as usize;
+    if (BLOCK_BYTES..=MAX_WINDOW_BYTES).contains(&bytes) && bytes % BLOCK_BYTES == 0 {
+        Some(bytes)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Frame {
@@ -25,6 +38,9 @@ pub struct Frame {
     pub size: u64,
     pub data: Vec<u8>,
     pub compressed: bool,
+    /// Receiver-advertised bound in REQUEST. Absent on legacy v1 peers.
+    #[serde(default)]
+    pub window_bytes: u32,
 }
 
 pub fn generation(formats: &[(i32, String)]) -> u64 {
@@ -135,7 +151,10 @@ mod windows {
                         .ok_or_else(|| anyhow!("clipboard size overflow"))?;
                     if data.len() != remaining.min(BLOCK_BYTES as u64) as usize
                         || data.is_empty()
-                        || self.received - self.consumed + data.len() as u64 > WINDOW_BYTES as u64
+                        || self.received - self.consumed + data.len() as u64
+                            > negotiated_window(self.frame.window_bytes)
+                                .ok_or_else(|| anyhow!("invalid clipboard receive window"))?
+                                as u64
                     {
                         bail!("clipboard stream exceeds receive window or declared size");
                     }
@@ -326,6 +345,10 @@ mod windows {
         if f.request_id == 0 || f.offset > f.size || !f.data.is_empty() || f.compressed {
             bail!("invalid stream request");
         }
+        // A peer may opt into a larger window; old receivers keep the 1 MiB bound.
+        let window_bytes = negotiated_window(f.window_bytes)
+            .ok_or_else(|| anyhow!("invalid clipboard stream window"))?
+            as u64;
         let (path, window) = {
             let mut state = STATE.lock().unwrap();
             if state.sending.len() >= MAX_STREAMS
@@ -392,8 +415,7 @@ mod windows {
                             let guard = lock.lock().unwrap();
                             let (guard, timed) = wake
                                 .wait_timeout_while(guard, TIMEOUT, |s| {
-                                    !s.cancelled
-                                        && s.sent - s.acknowledged + needed > WINDOW_BYTES as u64
+                                    !s.cancelled && s.sent - s.acknowledged + needed > window_bytes
                                 })
                                 .unwrap();
                             if guard.cancelled || timed.timed_out() {
@@ -668,6 +690,7 @@ mod windows {
                 index,
                 offset,
                 size,
+                window_bytes: MAX_WINDOW_BYTES as u32,
                 ..Default::default()
             };
             let r = Arc::new((Mutex::new(Receive::new(frame.clone())), Condvar::new()));
@@ -807,6 +830,84 @@ mod windows {
                     kind: END,
                     offset: WINDOW_BYTES as u64,
                     ..f
+                })
+                .is_err());
+        }
+
+        #[test]
+        fn negotiated_window_preserves_legacy_and_rejects_unbounded_requests() {
+            assert_eq!(negotiated_window(0), Some(WINDOW_BYTES));
+            assert_eq!(
+                negotiated_window(MAX_WINDOW_BYTES as u32),
+                Some(MAX_WINDOW_BYTES)
+            );
+            for bytes in [
+                1,
+                (BLOCK_BYTES - 1) as u32,
+                (MAX_WINDOW_BYTES + BLOCK_BYTES) as u32,
+                u32::MAX,
+            ] {
+                assert_eq!(negotiated_window(bytes), None);
+                assert!(start_send(
+                    8999,
+                    Frame {
+                        window_bytes: bytes,
+                        ..frame(1)
+                    },
+                    1
+                )
+                .is_err());
+            }
+            // Legacy JSON IPC frames also omit the newly added field.
+            let mut json = hbb_common::serde_json::to_value(frame(1)).unwrap();
+            json.as_object_mut().unwrap().remove("window_bytes");
+            let decoded: Frame = hbb_common::serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.window_bytes, 0);
+        }
+
+        #[test]
+        fn extended_receive_window_is_fixed_by_request_not_incoming_blocks() {
+            let f = Frame {
+                window_bytes: MAX_WINDOW_BYTES as u32,
+                ..frame((MAX_WINDOW_BYTES + BLOCK_BYTES) as u64)
+            };
+            let mut r = Receive::new(f.clone());
+            for n in 0..MAX_WINDOW_BYTES / BLOCK_BYTES {
+                r.accept(&Frame {
+                    kind: BLOCK,
+                    offset: (n * BLOCK_BYTES) as u64,
+                    data: vec![0; BLOCK_BYTES],
+                    ..f.clone()
+                })
+                .unwrap();
+            }
+            assert!(r
+                .accept(&Frame {
+                    kind: BLOCK,
+                    offset: MAX_WINDOW_BYTES as u64,
+                    data: vec![0; BLOCK_BYTES],
+                    ..f.clone()
+                })
+                .is_err());
+            let legacy = frame((MAX_WINDOW_BYTES + BLOCK_BYTES) as u64);
+            let mut r = Receive::new(legacy.clone());
+            for n in 0..WINDOW_BYTES / BLOCK_BYTES {
+                r.accept(&Frame {
+                    kind: BLOCK,
+                    window_bytes: MAX_WINDOW_BYTES as u32,
+                    offset: (n * BLOCK_BYTES) as u64,
+                    data: vec![0; BLOCK_BYTES],
+                    ..legacy.clone()
+                })
+                .unwrap();
+            }
+            assert!(r
+                .accept(&Frame {
+                    kind: BLOCK,
+                    window_bytes: MAX_WINDOW_BYTES as u32,
+                    offset: WINDOW_BYTES as u64,
+                    data: vec![0; BLOCK_BYTES],
+                    ..legacy
                 })
                 .is_err());
         }
@@ -967,7 +1068,7 @@ mod windows {
             ));
             std::fs::create_dir(&root).unwrap();
             let path = root.join("payload.zip");
-            let expected = (0..(WINDOW_BYTES * 3 + 51))
+            let expected = (0..(MAX_WINDOW_BYTES * 3 + 51))
                 .map(|n| (n % 251) as u8)
                 .collect::<Vec<_>>();
             std::fs::write(&path, &expected).unwrap();
@@ -1080,6 +1181,90 @@ mod windows {
             }
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir(root).unwrap();
+        }
+
+        /// Real TransferJob/clipboard producer and consumer, with delayed credit.
+        /// Isolates window effects; it does not emulate TCP, encryption or a WAN.
+        #[test]
+        #[ignore = "opt-in throughput benchmark; run in release with --nocapture"]
+        fn benchmark_delayed_credit_windows() {
+            let _guard = SOURCE_TEST.lock().unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "mdesk-credit-bench-{}.zip",
+                hbb_common::uuid::Uuid::new_v4()
+            ));
+            let size = 64 * 1024 * 1024;
+            let expected = (0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+            std::fs::write(&path, &expected).unwrap();
+            let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            println!("window_bytes,credit_delay_ms,run,mib_per_second,content_equal");
+            for window in [0, MAX_WINDOW_BYTES as u32] {
+                for run in 1..=3 {
+                    let generation = announce(1999, true);
+                    snapshot(1999, vec![Some(path.clone())]);
+                    remember_metadata(8991, generation, &[1, 0, 0, 0]);
+                    let source_rx = crate::get_rx_cliprdr_server(8991);
+                    let sink_rx = crate::get_rx_cliprdr_server(8992);
+                    let bytes = expected.clone();
+                    let start = Instant::now();
+                    let reader = std::thread::spawn(move || {
+                        let mut token = 0;
+                        let mut actual = vec![0; size];
+                        let mut offset = 0;
+                        while offset < size {
+                            let end = (offset + 256 * 1024).min(size);
+                            offset += read(
+                                8992,
+                                generation,
+                                0,
+                                size as u64,
+                                offset as u64,
+                                &mut actual[offset..end],
+                                &mut token,
+                            )
+                            .unwrap();
+                        }
+                        assert_eq!(actual, bytes);
+                        assert_eq!(token, 0);
+                    });
+                    rt.block_on(async {
+                        let mut source = source_rx.lock().await;
+                        let mut sink = sink_rx.lock().await;
+                        let mut delayed = VecDeque::<(Instant, Frame)>::new();
+                        while !reader.is_finished() {
+                            assert!(start.elapsed() < Duration::from_secs(20), "benchmark stalled");
+                            hbb_common::tokio::select! {
+                                Some(ClipboardFile::FileStream(f)) = source.recv() => handle(8992, f, 1999),
+                                Some(ClipboardFile::FileStream(mut f)) = sink.recv() => {
+                                    if f.kind == CREDIT { delayed.push_back((Instant::now() + Duration::from_millis(50), f)); }
+                                    else {
+                                        if f.kind == REQUEST { f.window_bytes = window; }
+                                        handle(8991, f, 1999);
+                                    }
+                                },
+                                _ = hbb_common::tokio::time::sleep(Duration::from_millis(1)) => {},
+                            }
+                            while delayed.front().map_or(false, |(at, _)| *at <= Instant::now()) {
+                                handle(8991, delayed.pop_front().unwrap().1, 1999);
+                            }
+                        }
+                    });
+                    reader.join().unwrap();
+                    println!(
+                        "{},50,{run},{:.3},true",
+                        negotiated_window(window).unwrap(),
+                        64.0 / start.elapsed().as_secs_f64()
+                    );
+                    disconnect(8991);
+                    disconnect(8992);
+                    crate::remove_channel_by_conn_id(8991);
+                    crate::remove_channel_by_conn_id(8992);
+                }
+            }
+            std::fs::remove_file(path).unwrap();
         }
     }
 }

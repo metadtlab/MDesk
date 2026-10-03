@@ -378,8 +378,12 @@ fn run_default_serve() {
     let options = ServeOptions::default();
     #[cfg(target_os = "windows")]
     let options = {
-        diagnostic_event("cert.prompt.open", "requesting certificate number");
-        match cert_prompt::show() {
+        diagnostic_event("cert.clipboard.begin", "checking clipboard before prompting");
+        let certnum = resolve_startup_certnum(clipboard_text().as_deref(), || {
+            diagnostic_event("cert.prompt.open", "requesting certificate number");
+            cert_prompt::show()
+        });
+        match certnum {
             Ok(Some(certnum)) => ServeOptions {
                 certnum: Some(certnum),
                 ..options
@@ -399,6 +403,17 @@ fn run_default_serve() {
         }
     };
     run_serve(options);
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn resolve_startup_certnum<E>(
+    clipboard: Option<&str>,
+    prompt: impl FnOnce() -> Result<Option<String>, E>,
+) -> Result<Option<String>, E> {
+    match clipboard.and_then(extract_certnum_from_clipboard_text) {
+        Some(certnum) => Ok(Some(certnum)),
+        None => prompt(),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1412,7 +1427,7 @@ fn apply_host_policy(options: &ServeOptions) {
 
 fn apply_certificate_bootstrap(options: &ServeOptions) -> Result<Option<CertVerification>, String> {
     let certnum = if let Some(certnum) = options.certnum.as_ref() {
-        diagnostic_event("cert.prompt.submitted", "using entered certificate number");
+        diagnostic_event("cert.selected", "using certificate number selected at startup");
         certnum.clone()
     } else {
         diagnostic_event(
@@ -3060,6 +3075,48 @@ mod tests {
         assert!(super::require_certificate::<()>(Ok(None)).is_err());
         assert!(super::require_certificate::<()>(Err("offline".into())).is_err());
         assert_eq!(super::require_certificate(Ok(Some(42))).unwrap(), 42);
+    }
+
+    #[test]
+    fn startup_clipboard_certificate_skips_prompt() {
+        for clipboard in [
+            "certno:001234",
+            "  CERTNO: 001234\r\n",
+            "웹에서 복사한 인증번호\r\ncertno:001234\r\n",
+        ] {
+            let certnum = resolve_startup_certnum::<()>(Some(clipboard), || {
+                panic!("a certificate copied from the website must skip the prompt")
+            });
+            assert_eq!(certnum, Ok(Some("001234".to_owned())));
+        }
+    }
+
+    #[test]
+    fn startup_without_clipboard_certificate_uses_prompt() {
+        for clipboard in [
+            None,
+            Some(""),
+            Some("unrelated text"),
+            Some("certno:"),
+            Some("certno:12x"),
+        ] {
+            let mut prompted = false;
+            let certnum = resolve_startup_certnum::<()>(clipboard, || {
+                prompted = true;
+                Ok(Some("005678".to_owned()))
+            });
+            assert!(prompted);
+            assert_eq!(certnum, Ok(Some("005678".to_owned())));
+        }
+    }
+
+    #[test]
+    fn startup_prompt_cancellation_and_errors_are_preserved() {
+        assert_eq!(resolve_startup_certnum::<()>(None, || Ok(None)), Ok(None));
+        assert_eq!(
+            resolve_startup_certnum(None, || Err("dialog failed")),
+            Err("dialog failed")
+        );
     }
 
     #[test]

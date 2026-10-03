@@ -30,6 +30,7 @@ use crate::{
 
 pub const RENDEZVOUS_TIMEOUT: u64 = 12_000;
 pub const CONNECT_TIMEOUT: u64 = 18_000;
+pub const DIRECT_CONNECT_TIMEOUT: u64 = 3_000;
 pub const READ_TIMEOUT: u64 = 18_000;
 // https://github.com/quic-go/quic-go/issues/525#issuecomment-294531351
 // https://datatracker.ietf.org/doc/html/draft-hamilton-early-deployment-quic-00#section-6.10
@@ -80,6 +81,14 @@ lazy_static::lazy_static! {
 
 lazy_static::lazy_static! {
     pub static ref APP_DIR: RwLock<String> = Default::default();
+}
+
+// Unit tests exercise persistent setters and startup migrations. Keep every
+// config file in a process-specific test profile, never the installed app's.
+#[cfg(test)]
+lazy_static::lazy_static! {
+    static ref TEST_CONFIG_ROOT: PathBuf = std::env::temp_dir()
+        .join(format!("mdesk-config-tests-{}", uuid::Uuid::new_v4()));
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -1136,13 +1145,20 @@ impl Config {
     }
 
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(test)]
+        {
+            return TEST_CONFIG_ROOT
+                .join(APP_NAME.read().unwrap().as_str())
+                .join("config")
+                .join(p);
+        }
+        #[cfg(all(not(test), any(target_os = "android", target_os = "ios")))]
         {
             let mut path: PathBuf = APP_DIR.read().unwrap().clone().into();
             path.push(p);
             return path;
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(all(not(test), not(any(target_os = "android", target_os = "ios"))))]
         {
             #[cfg(not(target_os = "macos"))]
             let org = "".to_owned();
@@ -3187,8 +3203,22 @@ pub fn require_websocket_for_process() {
     REQUIRE_WEBSOCKET.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Mini requires WS; installed clients merely allow it as a fallback transport.
+pub fn websocket_required_for_process() -> bool {
+    REQUIRE_WEBSOCKET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn replace_websocket_requirement_for_test(required: bool) -> bool {
+    REQUIRE_WEBSOCKET.swap(required, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn relay_required(explicit_relay: bool) -> bool {
+    explicit_relay || websocket_required_for_process() || Config::is_proxy()
+}
+
 pub fn use_ws() -> bool {
-    if REQUIRE_WEBSOCKET.load(std::sync::atomic::Ordering::Relaxed) {
+    if websocket_required_for_process() {
         return true;
     }
     let option = keys::OPTION_ALLOW_WEBSOCKET;
@@ -3599,6 +3629,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_config_paths_are_isolated() {
+        assert!(TEST_CONFIG_ROOT.is_absolute());
+        for path in [
+            Config::file(),
+            Config2::file(),
+            Config::file_("_local"),
+            Config::file_("_default"),
+            Config::path("peers/test-peer.toml"),
+        ] {
+            assert!(path.starts_with(TEST_CONFIG_ROOT.as_path()), "{:?}", path);
+        }
+    }
+
+    #[test]
     fn test_password_approval_rollout_migration() {
         for previous in [
             None,
@@ -3693,7 +3737,10 @@ mod tests {
         migrate_password_approval_for_rollout();
         let loaded = Config2::get();
         assert_eq!(loaded.options[keys::OPTION_APPROVE_MODE], "password");
-        assert_eq!(loaded.options["verification-method"], "use-permanent-password");
+        assert_eq!(
+            loaded.options["verification-method"],
+            "use-permanent-password"
+        );
         let persisted: Config2 = Config::load_("2");
         assert_eq!(persisted, loaded);
         DEFAULT_SETTINGS.write().unwrap().clear();

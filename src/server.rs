@@ -65,6 +65,7 @@ pub mod input_service {
 }
 
 mod connection;
+mod password_attempts;
 pub mod display_service;
 #[cfg(windows)]
 pub mod portable_service;
@@ -101,6 +102,15 @@ pub struct Server {
 
 pub type ServerPtr = Arc<RwLock<Server>>;
 pub type ServerPtrWeak = Weak<RwLock<Server>>;
+
+#[cfg(test)]
+pub(crate) fn new_registration_test_server() -> ServerPtr {
+    Arc::new(RwLock::new(Server {
+        connections: HashMap::new(),
+        services: HashMap::new(),
+        id_count: 0,
+    }))
+}
 
 pub fn new() -> ServerPtr {
     let mut server = Server {
