@@ -333,6 +333,7 @@ const Map<String, String> koreanTranslations = {
   "android_permission_may_not_change_tip":
       "설정된 연결에 대한 권한은 다시 연결할 때까지 즉시 변경되지 않을 수 있습니다.",
   "Account": "계정",
+  "Account deletion request": "계정 삭제 요청",
   "Overwrite": "덮어쓰기",
   "This file exists, skip or overwrite this file?":
       "이 파일이 이미 존재합니다, 건너뛰거나 덮어쓰시겠습니까?",

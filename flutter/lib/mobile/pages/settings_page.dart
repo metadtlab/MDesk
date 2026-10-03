@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:get/get.dart';
@@ -36,6 +37,7 @@ class SettingsPage extends StatefulWidget implements PageShape {
 }
 
 const url = 'https://mdesk.co.kr/';
+const _accountDeletionUrl = 'https://admin.787.kr/account-deletion';
 
 enum KeepScreenOn {
   never,
@@ -647,6 +649,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   }
                 },
               ),
+              SettingsTile(
+                title: Text(translate('Account deletion request')),
+                leading: Icon(Icons.person_remove_outlined),
+                trailing: Icon(Icons.open_in_new, size: 20),
+                onPressed: _openAccountDeletion,
+              ),
             ],
           ),
         SettingsSection(title: Text(translate("Settings")), tiles: [
@@ -877,6 +885,26 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     );
       return settings;
     });
+  }
+
+  Future<void> _openAccountDeletion(BuildContext context) async {
+    try {
+      if (await launchUrlString(_accountDeletionUrl,
+          mode: LaunchMode.externalApplication)) {
+        return;
+      }
+    } catch (_) {
+      // Allow users to copy the address if no browser can open the link.
+    }
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('브라우저를 열지 못했습니다. $_accountDeletionUrl'),
+      action: SnackBarAction(
+        label: '주소 복사',
+        onPressed: () =>
+            Clipboard.setData(ClipboardData(text: _accountDeletionUrl)),
+      ),
+    ));
   }
 
   Future<bool> canStartOnBoot() async {
