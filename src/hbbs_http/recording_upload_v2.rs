@@ -1,6 +1,6 @@
 use hbb_common::{
     anyhow, bail,
-    config::{Config, LocalConfig},
+    config::Config,
     ResultType,
 };
 use reqwest::blocking::multipart::{Form, Part};
@@ -42,7 +42,7 @@ pub fn upload_recording(
 ) -> ResultType<RecordingUploadResponse> {
     validate_request(&request)?;
 
-    let access_token = LocalConfig::get_option("access_token");
+    let access_token = crate::get_local_option("access_token");
     if access_token.trim().is_empty() {
         bail!("로그인 정보가 없어 녹화 영상을 서버에 저장할 수 없습니다. 로컬 원본은 유지됩니다.");
     }

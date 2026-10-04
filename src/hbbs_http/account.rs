@@ -262,7 +262,7 @@ impl OidcSession {
                 Ok(HbbHttpResponse::<_>::Data(auth_body)) => {
                     if auth_body.r#type == "access_token" {
                         if remember_me {
-                            LocalConfig::set_option(
+                            crate::ui_interface::set_local_option(
                                 "access_token".to_owned(),
                                 auth_body.access_token.clone(),
                             );

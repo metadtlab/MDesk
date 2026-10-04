@@ -241,6 +241,22 @@ pub fn get_builtin_option(key: &str) -> String {
 
 #[inline]
 pub fn set_local_option(key: String, value: String) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    if key == "biometric-login-enabled" {
+        if value == "Y" && LocalConfig::get_option(&key) != "Y" {
+            crate::mobile_account_token::set(LocalConfig::get_option("access_token"));
+            LocalConfig::set_option("access_token".to_owned(), String::new());
+            LocalConfig::set_option("refresh_token".to_owned(), String::new());
+        } else if value != "Y" {
+            crate::mobile_account_token::set(String::new());
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    if key == "access_token" && LocalConfig::get_option("biometric-login-enabled") == "Y" {
+        crate::mobile_account_token::set(value);
+        LocalConfig::set_option(key, String::new());
+        return;
+    }
     LocalConfig::set_option(key.clone(), value.clone());
 }
 

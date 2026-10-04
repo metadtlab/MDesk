@@ -1,6 +1,6 @@
 use hbb_common::{
     bail,
-    config::{Config, LocalConfig},
+    config::Config,
     ResultType,
 };
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ pub async fn issue_connection_intent(
     source_connection_id: &str,
     connection_type: &str,
 ) -> ResultType<Option<IssuedConnectionIntent>> {
-    let access_token = LocalConfig::get_option("access_token");
+    let access_token = crate::get_local_option("access_token");
     if access_token.trim().is_empty() {
         return Ok(None);
     }

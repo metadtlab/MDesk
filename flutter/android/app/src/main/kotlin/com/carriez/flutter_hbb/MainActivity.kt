@@ -46,6 +46,7 @@ class MainActivity : FlutterActivity() {
 
     private val channelTag = "mChannel"
     private val logTag = "mMainActivity"
+    private var biometricLogin: BiometricLogin? = null
     private var mainService: MainService? = null
     private val isHostRole: Boolean
         get() = BuildConfig.APP_ROLE == "host"
@@ -55,6 +56,9 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        biometricLogin = BiometricLogin(this)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "mdesk/biometric_login")
+            .setMethodCallHandler(biometricLogin)
         if (isHostRole && MainService.isReady) {
             Intent(activity, MainService::class.java).also {
                 bindService(it, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -112,6 +116,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        biometricLogin?.dispose()
         Log.e(logTag, "onDestroy")
         mainService?.let {
             unbindService(serviceConnection)

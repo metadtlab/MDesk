@@ -79,7 +79,7 @@ fn get_api_server() -> String {
 
 /// access_token을 가져옵니다
 fn get_access_token() -> String {
-    hbb_common::config::LocalConfig::get_option("access_token")
+    crate::get_local_option("access_token")
 }
 
 fn register_limit_decision(response: &DeviceRegisterResponse) -> Option<bool> {

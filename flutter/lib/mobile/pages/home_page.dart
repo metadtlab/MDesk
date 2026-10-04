@@ -4,6 +4,7 @@ import 'package:flutter_hbb/mobile/pages/settings_page.dart';
 import 'package:get/get.dart';
 import '../../common.dart';
 import '../../common/widgets/chat_page.dart';
+import '../../common/widgets/login.dart';
 import '../../models/platform_model.dart';
 import 'connection_page.dart';
 import 'page_shape.dart';
@@ -37,6 +38,13 @@ class HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     initPages();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          gFFI.userModel.isBiometricLocked &&
+          !bind.isDisableAccount()) {
+        loginDialog();
+      }
+    });
   }
 
   void initPages() {

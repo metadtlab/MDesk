@@ -39,9 +39,9 @@ class LoginSessionSnapshot {
 class LoginSessionWrites {
   Future<void> _tail = Future<void>.value();
 
-  Future<void> run(Future<void> Function() mutation) {
+  Future<T> run<T>(Future<T> Function() mutation) {
     final next = _tail.then((_) => mutation());
-    _tail = next.catchError((Object _) {});
+    _tail = next.then<void>((_) {}).catchError((Object _) {});
     return next;
   }
 }

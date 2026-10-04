@@ -70,6 +70,8 @@
   <false/>
   <key>io.flutter.embedded_views_preview</key>
   <true/>
+  <key>NSFaceIDUsageDescription</key>
+  <string>Face ID로 저장된 MDesk 계정의 로그인 정보를 잠금 해제합니다.</string>
   <key>NSCameraUsageDescription</key>
   <string>This app needs camera access to scan QR codes</string>
   <key>NSPhotoLibraryUsageDescription</key>

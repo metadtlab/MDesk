@@ -4418,7 +4418,7 @@ pub async fn handle_hash(
 
 #[inline]
 fn try_get_password_from_personal_ab(lc: Arc<RwLock<LoginConfigHandler>>, password: &mut Vec<u8>) {
-    let access_token = LocalConfig::get_option("access_token");
+    let access_token = crate::get_local_option("access_token");
     let ab = config::Ab::load();
     if !access_token.is_empty() && access_token == ab.access_token {
         let id = lc.read().unwrap().id.clone();
@@ -4486,7 +4486,7 @@ async fn prepare_connection_intent(lc: Arc<RwLock<LoginConfigHandler>>) -> Resul
             !lc.audit_connection_ticket.is_empty(),
             requires_verified_enterprise_audit(
                 lc.conn_type,
-                &LocalConfig::get_option("access_token"),
+                &crate::get_local_option("access_token"),
             ),
         )
     };

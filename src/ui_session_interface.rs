@@ -11,7 +11,7 @@ use hbb_common::config::keys;
 use hbb_common::fs;
 use hbb_common::{
     allow_err,
-    config::{Config, LocalConfig, PeerConfig},
+    config::{Config, PeerConfig},
     get_version_number, log,
     message_proto::*,
     rendezvous_proto::ConnType,
@@ -842,7 +842,7 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn get_audit_server(&self, typ: String) -> String {
-        if LocalConfig::get_option("access_token").is_empty() {
+        if crate::get_local_option("access_token").is_empty() {
             return "".to_owned();
         }
         crate::get_audit_server(

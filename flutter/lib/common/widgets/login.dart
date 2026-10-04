@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/hbbs/hbbs.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/user_model.dart';
+import 'package:flutter_hbb/models/biometric_login.dart';
 import 'package:get/get.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -414,6 +415,7 @@ Future<bool?> loginDialog() async {
   String? passwordMsg;
   var isInProgress = false;
   final RxString curOP = ''.obs;
+  var dialogClosed = false;
   // Track hover state for the close icon
   bool isCloseHovered = false;
 
@@ -436,6 +438,8 @@ Future<bool?> loginDialog() async {
     });
 
     onDialogCancel() {
+      dialogClosed = true;
+      gFFI.userModel.cancelBiometricLogin();
       isInProgress = false;
       close(false);
     }
@@ -504,6 +508,7 @@ Future<bool?> loginDialog() async {
     }
 
     onLogin() async {
+      if (isInProgress) return;
       // validate
       if (username.text.isEmpty) {
         setState(() => usernameMsg = translate('Username missed'));
@@ -531,6 +536,29 @@ Future<bool?> loginDialog() async {
       }
       curOP.value = '';
       setState(() => isInProgress = false);
+    }
+
+    onBiometricLogin() async {
+      if (isInProgress) return;
+      curOP.value = 'biometric';
+      setState(() {
+        isInProgress = true;
+        passwordMsg = null;
+      });
+      try {
+        if (await gFFI.userModel.loginWithBiometrics()) {
+          if (!dialogClosed) {
+            dialogClosed = true;
+            close(true);
+          }
+          return;
+        }
+      } catch (error) {
+        passwordMsg = BiometricLogin.errorMessage(error);
+      } finally {
+        curOP.value = '';
+        if (!dialogClosed) setState(() => isInProgress = false);
+      }
     }
 
     thirdAuthWidget() => Obx(() {
@@ -629,6 +657,17 @@ Future<bool?> loginDialog() async {
             onLogin: onLogin,
             userFocusNode: userFocusNode,
           ),
+          if (isMobile)
+            Obx(() => gFFI.userModel.biometricLoginEnabled.value
+                ? Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.fingerprint),
+                      label: const Text('생체인증으로 로그인'),
+                      onPressed: isInProgress ? null : onBiometricLogin,
+                    ),
+                  )
+                : const SizedBox.shrink()),
           thirdAuthWidget(),
         ],
       ),

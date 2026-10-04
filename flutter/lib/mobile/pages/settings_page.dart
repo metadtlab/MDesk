@@ -17,6 +17,7 @@ import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
 import '../../consts.dart';
 import '../../models/model.dart';
+import '../../models/biometric_login.dart';
 import '../../models/platform_model.dart';
 import '../widgets/dialog.dart';
 import 'home_page_shared.dart';
@@ -654,6 +655,30 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 leading: Icon(Icons.person_remove_outlined),
                 trailing: Icon(Icons.open_in_new, size: 20),
                 onPressed: _openAccountDeletion,
+              ),
+              SettingsTile.switchTile(
+                title: const Text('생체인증 로그인'),
+                description: Text(gFFI.userModel.biometricLoginEnabled.value
+                    ? '다음 앱 실행 시 지문 또는 얼굴 인식으로 로그인합니다.'
+                    : '먼저 로그인한 후 설정해 주세요. 세션 만료 시에는 다시 로그인해야 합니다.'),
+                leading: const Icon(Icons.fingerprint),
+                initialValue: gFFI.userModel.biometricLoginEnabled.value,
+                onToggle: !isLoggedIn &&
+                        !gFFI.userModel.biometricLoginEnabled.value
+                    ? null
+                    : (enabled) async {
+                        try {
+                          if (enabled) {
+                            if (await gFFI.userModel.enableBiometricLogin()) {
+                              showToast('생체인증 로그인을 설정했습니다.');
+                            }
+                          } else {
+                            await gFFI.userModel.disableBiometricLogin();
+                          }
+                        } catch (error) {
+                          showToast(BiometricLogin.errorMessage(error));
+                        }
+                      },
               ),
             ],
           ),

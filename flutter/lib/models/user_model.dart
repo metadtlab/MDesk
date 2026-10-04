@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/hbbs/hbbs.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/utils/device_register_service.dart';
@@ -14,6 +15,7 @@ import '../common.dart';
 import '../utils/http_service.dart' as http;
 import 'model.dart';
 import 'login_session_status.dart';
+import 'biometric_login.dart';
 import 'platform_model.dart';
 import '../utils/multi_window_manager.dart';
 
@@ -27,6 +29,15 @@ class UserModel {
   final RxString membershipLevel = 'free'.obs;
   final RxString networkError = ''.obs;
   final RxString userPkid = ''.obs;
+  final RxBool biometricLoginEnabled = false.obs;
+  final _biometricLogin = const BiometricLogin();
+  String? _biometricRefreshToken;
+  bool _biometricLoginBusy = false;
+  static const _biometricEnabledKey = 'biometric-login-enabled';
+  bool get isBiometricLocked =>
+      isMobile && biometricLoginEnabled.value && _biometricRefreshToken == null;
+  String get _refreshToken =>
+      _biometricRefreshToken ?? bind.mainGetLocalOption(key: _refreshTokenKey);
   bool get isLogin => userName.isNotEmpty;
   WeakReference<FFI> parent;
 
@@ -84,8 +95,155 @@ class UserModel {
     });
   }
 
+  /// Run before restoring user state or starting authenticated mobile requests.
+  Future<void> prepareBiometricLogin() async {
+    if (!isMobile) return;
+    var enabled = bind.mainGetLocalOption(key: _biometricEnabledKey) == 'Y';
+    try {
+      enabled = await _biometricLogin.hasSession() || enabled;
+    } catch (_) {
+      // If the native vault is unavailable, an enrolled account stays locked.
+    }
+    if (!enabled) return;
+    biometricLoginEnabled.value = true;
+    await bind.mainSetLocalOption(key: _biometricEnabledKey, value: 'Y');
+    await bind.mainSetLocalOption(key: 'access_token', value: '');
+    await bind.mainSetLocalOption(key: _refreshTokenKey, value: '');
+  }
+
+  Future<bool> enableBiometricLogin() async {
+    if (!isMobile || !isLogin || _biometricLoginBusy) return false;
+    _biometricLoginBusy = true;
+    final generation = _sessionGeneration;
+    try {
+      return await _sessionWrites.run(() async {
+        if (generation != _sessionGeneration) return false;
+        final refresh = _refreshToken;
+        final expiresAt =
+            int.tryParse(bind.mainGetLocalOption(key: _sessionExpiresAtKey)) ??
+                0;
+        final user = getLocalUserInfo();
+        final access = bind.mainGetLocalOption(key: 'access_token');
+        if (refresh.isEmpty ||
+            user == null ||
+            expiresAt <= DateTime.now().millisecondsSinceEpoch) {
+          throw PlatformException(code: 'not_configured');
+        }
+        if (!await _biometricLogin.isAvailable()) {
+          throw PlatformException(code: 'unavailable');
+        }
+        final enrolled = await _biometricLogin.enroll(BiometricSession(
+            refreshToken: refresh,
+            expiresAt: expiresAt,
+            apiServer: await _accountApiServer(),
+            user: user));
+        if (generation != _sessionGeneration) {
+          await _biometricLogin.clear();
+          return false;
+        }
+        if (!enrolled) return false;
+        _biometricRefreshToken = refresh;
+        biometricLoginEnabled.value = true;
+        await bind.mainSetLocalOption(key: _biometricEnabledKey, value: 'Y');
+        // Rust keeps this access token in memory once biometric login is on.
+        await bind.mainSetLocalOption(key: 'access_token', value: access);
+        await bind.mainSetLocalOption(key: _refreshTokenKey, value: '');
+        return true;
+      });
+    } finally {
+      _biometricLoginBusy = false;
+    }
+  }
+
+  Future<void> disableBiometricLogin() => _sessionWrites.run(() async {
+        final access =
+            isLogin ? bind.mainGetLocalOption(key: 'access_token') : '';
+        final refresh = isLogin ? _refreshToken : '';
+        await _clearBiometricLogin();
+        await bind.mainSetLocalOption(key: 'access_token', value: access);
+        await bind.mainSetLocalOption(key: _refreshTokenKey, value: refresh);
+      });
+
+  Future<void> _clearBiometricLogin() async {
+    if (biometricLoginEnabled.value || _biometricLoginBusy) {
+      try {
+        await _biometricLogin.clear();
+      } catch (_) {
+        // Local logout must still finish if native storage is unavailable.
+        debugPrint('Biometric vault cleanup unavailable');
+      }
+      await bind.mainSetLocalOption(key: 'access_token', value: '');
+      await bind.mainSetLocalOption(key: _refreshTokenKey, value: '');
+    }
+    _biometricRefreshToken = null;
+    biometricLoginEnabled.value = false;
+    await bind.mainSetLocalOption(key: _biometricEnabledKey, value: '');
+  }
+
+  Future<void> cancelBiometricLogin() async {
+    if (!_biometricLoginBusy) return;
+    ++_sessionGeneration;
+    try {
+      await _biometricLogin.cancel();
+    } catch (_) {}
+  }
+
+  Future<bool> loginWithBiometrics() async {
+    if (!isMobile || !biometricLoginEnabled.value || _biometricLoginBusy) {
+      return false;
+    }
+    _biometricLoginBusy = true;
+    final generation = ++_sessionGeneration;
+    _accessRefreshFuture = null;
+    try {
+      final session = await _biometricLogin.unlock();
+      if (generation != _sessionGeneration || session == null) return false;
+      if (!session.canRestore(await _accountApiServer(), DateTime.now())) {
+        await reset(resetOther: true);
+        throw PlatformException(code: 'expired');
+      }
+      await _sessionWrites.run(() async {
+        if (generation != _sessionGeneration) return;
+        _biometricRefreshToken = session.refreshToken;
+        await bind.mainSetLocalOption(
+            key: _sessionExpiresAtKey, value: '${session.expiresAt}');
+        await bind.mainSetLocalOption(
+            key: 'user_info', value: jsonEncode(session.user));
+      });
+      if (generation != _sessionGeneration) return false;
+      final refreshed = await refreshAccessToken(force: true);
+      if (generation != _sessionGeneration) return false;
+      if (refreshed == TokenRefreshResult.rejected ||
+          refreshed == TokenRefreshResult.notConfigured) {
+        await reset(resetOther: true);
+        throw PlatformException(code: 'expired');
+      }
+      if (refreshed != TokenRefreshResult.success) {
+        _biometricRefreshToken = null;
+        throw PlatformException(code: 'network');
+      }
+      // Publish the cached identity only after the server has accepted the
+      // refresh credential, even if another user-info request is in flight.
+      await _sessionWrites.run(() async {
+        if (generation != _sessionGeneration) return;
+        _parseAndUpdateUser(UserPayload.fromJson(session.user));
+      });
+      await refreshCurrentUser();
+      return generation == _sessionGeneration && isLogin;
+    } on FormatException {
+      await reset(resetOther: true);
+      throw PlatformException(code: 'invalidated');
+    } on PlatformException catch (error) {
+      if (error.code == 'invalidated') await reset(resetOther: true);
+      rethrow;
+    } finally {
+      _biometricLoginBusy = false;
+    }
+  }
+
   /// Poll immediately before a new connection as well as while idle.
   Future<bool> checkLoginSession() async {
+    if (isBiometricLocked) return false;
     if (bind.isDisableAccount()) return true;
     final pending = _sessionStatusFuture;
     if (pending != null) return pending;
@@ -145,6 +303,7 @@ class UserModel {
   }
 
   Future<void> refreshCurrentUser() async {
+    if (isBiometricLocked) return;
     if (bind.isDisableAccount()) return;
     if (refreshingUser) return;
     refreshingUser = true;
@@ -286,7 +445,7 @@ class UserModel {
   }
 
   bool _shouldRefreshAccessToken() {
-    final refreshToken = bind.mainGetLocalOption(key: _refreshTokenKey);
+    final refreshToken = _refreshToken;
     if (refreshToken.isEmpty) return false;
     final expiresAt =
         int.tryParse(bind.mainGetLocalOption(key: _accessTokenExpiresAtKey));
@@ -297,6 +456,7 @@ class UserModel {
   }
 
   Future<TokenRefreshResult> refreshAccessToken({bool force = false}) async {
+    if (isBiometricLocked) return TokenRefreshResult.notConfigured;
     final pending = _accessRefreshFuture;
     if (pending != null) return pending;
 
@@ -328,7 +488,7 @@ class UserModel {
 
   Future<TokenRefreshResult> _refreshAccessToken({required bool force}) async {
     final refreshGeneration = _sessionGeneration;
-    final refreshToken = bind.mainGetLocalOption(key: _refreshTokenKey);
+    final refreshToken = _refreshToken;
     if (refreshToken.isEmpty) return TokenRefreshResult.notConfigured;
 
     final sessionExpiresAt =
@@ -410,9 +570,26 @@ class UserModel {
     final now = DateTime.now().millisecondsSinceEpoch;
     final accessSeconds = response.expires_in ?? 0;
     final sessionSeconds = response.session_expires_in ?? 0;
+    final sessionExpiresAt =
+        sessionSeconds > 0 ? now + sessionSeconds * 1000 : 0;
+    if (isMobile && biometricLoginEnabled.value) {
+      final user = response.user?.toJson() ?? getLocalUserInfo();
+      if (user == null ||
+          (response.refresh_token ?? '').isEmpty ||
+          sessionExpiresAt <= now) {
+        throw PlatformException(code: 'invalidated');
+      }
+      await _biometricLogin.update(BiometricSession(
+          refreshToken: response.refresh_token!,
+          expiresAt: sessionExpiresAt,
+          apiServer: await _accountApiServer(),
+          user: user));
+      _biometricRefreshToken = response.refresh_token;
+    }
     await bind.mainSetLocalOption(key: 'access_token', value: accessToken);
     await bind.mainSetLocalOption(
-        key: _refreshTokenKey, value: response.refresh_token ?? '');
+        key: _refreshTokenKey,
+        value: biometricLoginEnabled.value ? '' : response.refresh_token ?? '');
     await bind.mainSetLocalOption(
       key: _accessTokenExpiresAtKey,
       value: accessSeconds > 0 ? '${now + accessSeconds * 1000}' : '',
@@ -438,7 +615,13 @@ class UserModel {
     _sessionStatusFuture = null;
     await _sessionWrites.run(() async {
       if (generation != _sessionGeneration) return;
-      if (storeSession) await _storeLoginSession(response);
+      // A password/OIDC/2FA login starts a new account session. Require a new
+      // biometric opt-in instead of silently replacing the enrolled account.
+      final wasBiometric = biometricLoginEnabled.value;
+      if (isMobile) await _clearBiometricLogin();
+      if (storeSession || (isMobile && wasBiometric)) {
+        await _storeLoginSession(response);
+      }
       if (generation != _sessionGeneration) return;
       final user = response.user;
       if (user == null) return;
@@ -471,15 +654,17 @@ class UserModel {
     }
   }
 
-  Future<void> reset({bool resetOther = false}) {
+  Future<void> reset({bool resetOther = false}) async {
     final generation = ++_sessionGeneration;
-    return _sessionWrites.run(() async {
+    if (isMobile && _biometricLoginBusy) await _biometricLogin.cancel();
+    await _sessionWrites.run(() async {
       if (generation != _sessionGeneration) return;
       await _resetSession(resetOther: resetOther);
     });
   }
 
   Future<void> _resetSession({required bool resetOther}) async {
+    if (isMobile) await _clearBiometricLogin();
     debugPrint('UserModel.reset called with resetOther=$resetOther');
     debugPrint('UserModel.reset called from:');
     debugPrint(StackTrace.current.toString().split('\n').take(10).join('\n'));
@@ -623,7 +808,6 @@ class UserModel {
     final loginUrl = '$url/api/login';
     final requestBody = jsonEncode(loginRequest.toJson());
     debugPrint('UserModel: Login request to $loginUrl');
-    debugPrint('UserModel: Request body: $requestBody');
 
     // 직접 Flutter HTTP 사용 (Rust 바인딩 우회)
     final resp = await flutter_http.post(

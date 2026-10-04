@@ -27,7 +27,7 @@ use cidr_utils::cidr::IpCidr;
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
     anyhow::anyhow,
-    config::{self, keys, Config, LocalConfig, TrustedDevice},
+    config::{self, keys, Config, TrustedDevice},
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
     get_time, get_version_number,
@@ -2476,7 +2476,7 @@ impl Connection {
         {
             return crate::common::post_request_checked(url, v.to_string(), "").await;
         }
-        let access_token = LocalConfig::get_option("access_token");
+        let access_token = crate::get_local_option("access_token");
         if access_token.trim().is_empty() {
             bail!("Audit access token is missing; sign in on this device again");
         }
