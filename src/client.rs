@@ -4401,7 +4401,7 @@ pub async fn handle_hash(
         if let Err(err) = send_login(lc.clone(), os_username, os_password, password, peer).await {
             interface.msgbox(
                 "error",
-                "File Transfer Audit Required",
+                "Connection Error",
                 &err.to_string(),
                 "",
             );

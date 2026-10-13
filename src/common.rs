@@ -1269,6 +1269,14 @@ pub async fn post_request_checked(url: String, body: String, header: &str) -> Re
     let status = response.status();
     let response_body = response.text().await?;
     if !status.is_success() {
+        if status.is_server_error() {
+            // Gateways often return HTML. Keep the status actionable without
+            // dumping an internal proxy response into the connection dialog.
+            bail!(
+                "감사 API 서버 연결 오류 (HTTP {}). 잠시 후 다시 시도해 주세요. 오류가 계속되면 운영 서버의 API 백엔드와 Nginx 연결 상태를 확인해야 합니다.",
+                status.as_u16()
+            );
+        }
         bail!("HTTP {} from audit endpoint: {}", status, response_body);
     }
     Ok(response_body)

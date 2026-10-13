@@ -3,6 +3,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
     [
         ("Status", ""),
         ("Your Desktop", ""),
+        ("Allow remote support", ""),
+        ("Show password", ""),
+        ("Hide password", ""),
+        ("remote_support_disabled_tip", ""),
+        ("remote_support_change_failed", ""),
         ("desk_tip", ""),
         ("Password", ""),
         ("Ready", ""),

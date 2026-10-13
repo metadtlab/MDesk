@@ -25,6 +25,7 @@ import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'common.dart';
+import 'common/startup_compatibility.dart';
 import 'consts.dart';
 import 'desktop/widgets/whiteboard_overlay.dart';
 import 'desktop/widgets/log_analysis_result_window.dart';
@@ -85,7 +86,10 @@ bool hasAgentIdInFilename() {
 
 Future<void> main(List<String> args) async {
   earlyAssert();
-  WidgetsFlutterBinding.ensureInitialized();
+  final binding = MDeskWidgetsFlutterBinding();
+  if (binding.suppressNativeSemantics) {
+    debugPrint('[StartupCompat] Windows accessibility bridge disabled');
+  }
 
   // A report viewer has no remote session or Rust FFI state of its own.
   if (args.length >= 3 && args.first == 'multi_window') {

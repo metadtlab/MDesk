@@ -6,14 +6,16 @@ import 'package:auto_size_text/auto_size_text.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart' hide Dialog;
-import 'package:flutter_hbb/common/widgets/animated_rotation_widget.dart';
+import 'package:flutter_hbb/common/remote_support.dart';
 import 'package:flutter_hbb/common/widgets/custom_password.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
+import 'package:flutter_hbb/common/account_management.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/connection_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
+import 'package:flutter_hbb/desktop/widgets/host_password.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -44,6 +46,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var systemError = '';
   StreamSubscription? _uniLinksSubscription;
   var svcStopped = false.obs;
+  bool _serviceStateReady = false;
+  bool _changingService = false;
   var watchIsCanScreenRecording = false;
   var watchIsProcessTrust = false;
   var watchIsInputMonitoring = false;
@@ -374,12 +378,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   buildPasswordBoard2(BuildContext context, ServerModel model) {
-    RxBool refreshHover = false.obs;
-    RxBool editHover = false.obs;
-    final textColor = Theme.of(context).textTheme.titleLarge?.color;
-    final iconIdle = Theme.of(context).brightness == Brightness.dark
-        ? Colors.white
-        : Colors.black;
     final showOneTime = model.approveMode != 'click' &&
         model.verificationMethod != kUsePermanentPassword;
     return Container(
@@ -396,77 +394,19 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           Expanded(
             child: Padding(
               padding: const EdgeInsets.only(left: 7),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  AutoSizeText(
-                    translate("One-time Password"),
-                    style: TextStyle(
-                        fontSize: 14, color: textColor?.withOpacity(0.5)),
-                    maxLines: 1,
-                  ),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: GestureDetector(
-                          onDoubleTap: () {
-                            if (showOneTime) {
-                              Clipboard.setData(
-                                  ClipboardData(text: model.serverPasswd.text));
-                              showToast(translate("Copied"));
-                            }
-                          },
-                          child: TextFormField(
-                            controller: model.serverPasswd,
-                            readOnly: true,
-                            decoration: InputDecoration(
-                              border: InputBorder.none,
-                              filled: true,
-                              fillColor: Colors.transparent,
-                              hoverColor: Colors.transparent,
-                              contentPadding:
-                                  EdgeInsets.only(top: 14, bottom: 10),
-                            ),
-                            style: TextStyle(fontSize: 15),
-                          ).workaroundFreezeLinuxMint(),
-                        ),
-                      ),
-                      if (showOneTime)
-                        AnimatedRotationWidget(
-                          onPressed: () => bind.mainUpdateTemporaryPassword(),
-                          child: Tooltip(
-                            message: translate('Refresh Password'),
-                            child: Obx(() => RotatedBox(
-                                quarterTurns: 2,
-                                child: Icon(
-                                  Icons.refresh,
-                                  color:
-                                      refreshHover.value ? textColor : iconIdle,
-                                  size: 22,
-                                ))),
-                          ),
-                          onHover: (value) => refreshHover.value = value,
-                        ).marginOnly(right: 8, top: 4),
-                      if (!bind.isDisableSettings())
-                        InkWell(
-                          child: Tooltip(
-                            message: translate('Change Password'),
-                            child: Obx(
-                              () => Icon(
-                                Icons.edit,
-                                color: editHover.value ? textColor : iconIdle,
-                                size: 22,
-                              ).marginOnly(right: 8, top: 4),
-                            ),
-                          ),
-                          onTap: () => DesktopSettingPage.switch2page(
-                              SettingsTabKey.safety),
-                          onHover: (value) => editHover.value = value,
-                        ),
-                    ],
-                  ),
-                ],
-              ),
+              child: Obx(() => HostPassword(
+                    controller: model.serverPasswd,
+                    enabled: !svcStopped.value &&
+                        _serviceStateReady &&
+                        !_changingService,
+                    showOneTime: showOneTime,
+                    onRefresh: () => bind.mainUpdateTemporaryPassword(),
+                    onCopied: () => showToast(translate('Copied')),
+                    onSettings: bind.isDisableSettings()
+                        ? null
+                        : () => DesktopSettingPage.switch2page(
+                            SettingsTabKey.safety),
+                  )),
             ),
           ),
         ],
@@ -479,6 +419,68 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       padding: EdgeInsets.only(left: 20, right: 16, top: 4, bottom: 0),
       child: _VersionLabelWithRefresh(),
     );
+  }
+
+  Future<void> _setRemoteSupport(bool enabled) async {
+    if (_changingService ||
+        !_serviceStateReady ||
+        isOptionFixed(kOptionStopService)) {
+      return;
+    }
+    setState(() => _changingService = true);
+    try {
+      await setRemoteSupportEnabled(
+        enabled: enabled,
+        readOptions: () => bind.mainGetOptions(),
+        writeOptions: (json) => bind.mainSetOptions(json: json),
+      );
+      final stopped = await mainGetBoolOption(kOptionStopService);
+      if (mounted) svcStopped.value = stopped;
+    } catch (e) {
+      debugPrint(
+          'Failed to change remote support permission: ${e.runtimeType}');
+      if (mounted) showToast(translate('remote_support_change_failed'));
+    } finally {
+      if (mounted) setState(() => _changingService = false);
+    }
+  }
+
+  Widget buildRemoteSupportSwitch(BuildContext context) {
+    return Obx(() {
+      final allowed = !svcStopped.value;
+      return Row(
+        children: [
+          Expanded(
+            child: Text(translate('Allow remote support'),
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+          if (_changingService)
+            const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          SizedBox(
+            width: 42,
+            height: 32,
+            child: FittedBox(
+              child: Semantics(
+                label: translate('Allow remote support'),
+                child: Switch(
+                  value: _serviceStateReady && allowed,
+                  activeThumbColor: MyTheme.accent,
+                  onChanged: !_serviceStateReady ||
+                          _changingService ||
+                          isOptionFixed(kOptionStopService)
+                      ? null
+                      : _setRemoteSupport,
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    });
   }
 
   buildTip(BuildContext context) {
@@ -505,12 +507,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           SizedBox(
             height: 10.0,
           ),
+          if (!isOutgoingOnly) buildRemoteSupportSwitch(context),
           if (!isOutgoingOnly)
-            Text(
-              translate("desk_tip"),
-              overflow: TextOverflow.clip,
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
+            Obx(() => Text(
+                  translate(svcStopped.value
+                      ? 'remote_support_disabled_tip'
+                      : 'desk_tip'),
+                  overflow: TextOverflow.clip,
+                  style: Theme.of(context).textTheme.bodySmall,
+                )),
           if (isOutgoingOnly)
             Text(
               translate("outgoing_only_desk_tip"),
@@ -886,6 +891,31 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               ],
             );
           }),
+          Obx(() {
+            if (!gFFI.userModel.isLogin) return const SizedBox.shrink();
+            return Column(
+              children: [
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: _glassSecondaryButton(
+                    accent: accent,
+                    onPressed: openAccountPasswordChange,
+                    child: const Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.lock_reset, size: 18),
+                        SizedBox(width: 6),
+                        Text('계정 암호 변경'),
+                        SizedBox(width: 6),
+                        Icon(Icons.open_in_new, size: 14),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            );
+          }),
         ],
       ),
     );
@@ -1182,9 +1212,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         setState(() {});
       }
       final v = await mainGetBoolOption(kOptionStopService);
-      if (v != svcStopped.value) {
-        svcStopped.value = v;
-        setState(() {});
+      if (!mounted) return;
+      if (!_changingService && (!_serviceStateReady || v != svcStopped.value)) {
+        setState(() {
+          svcStopped.value = v;
+          _serviceStateReady = true;
+        });
       }
       if (watchIsCanScreenRecording) {
         if (bind.mainIsCanScreenRecording(prompt: false)) {

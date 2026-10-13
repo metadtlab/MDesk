@@ -2,6 +2,8 @@ lazy_static::lazy_static! {
 pub static ref T: std::collections::HashMap<&'static str, &'static str> =
     [
         ("desk_tip", "Your desktop can be accessed with this ID and password."),
+        ("remote_support_disabled_tip", "Remote support is off. Other devices cannot connect to this device."),
+        ("remote_support_change_failed", "Could not change remote support settings. Please try again."),
         ("connecting_status", "Connecting to the RustDesk network..."),
         ("not_ready_status", "Not ready. Please check your connection"),
         ("ID/Relay Server", "ID/Relay server"),

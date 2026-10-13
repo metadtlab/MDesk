@@ -115,7 +115,7 @@ impl Interface for Session {
         {
             self.msgbox(
                 "error",
-                "File Transfer Audit Required",
+                "Connection Error",
                 &err.to_string(),
                 "",
             );

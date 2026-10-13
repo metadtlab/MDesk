@@ -7,7 +7,6 @@ import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
-import 'package:flutter_hbb/common/hbbs/hbbs.dart';
 import 'package:flutter_hbb/common/widgets/audio_input.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -28,7 +27,9 @@ import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
+import '../../common/account_management.dart';
 import '../../utils/device_register_service.dart';
+import '../../utils/remote_user_verification.dart';
 
 const double _kTabWidth = 200;
 const double _kTabHeight = 42;
@@ -1347,7 +1348,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
 
                       try {
                         final userId = idController.text.trim();
-                        final result = await _loginRemoteUserWithAuth(
+                        final result = await _verifyRemoteUserForRegistration(
                           userId,
                           passwordController.text,
                         );
@@ -1381,7 +1382,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                           Navigator.of(context).pop();
                           showToast('$userName 등록 완료');
                         } else {
-                          showToast(result['message'] ?? '로그인 실패');
+                          showToast(result['message'] ?? '계정 확인에 실패했습니다.');
                         }
                       } catch (e) {
                         showToast('오류: $e');
@@ -1395,7 +1396,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                       height: 20,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : Text('로그인'),
+                  : Text('확인 후 등록'),
             ),
           ],
         ),
@@ -1403,81 +1404,37 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     );
   }
 
-  // ignore: unused_element
-  Future<Map<String, dynamic>> _loginRemoteUser(
-      String id, String password) async {
-    try {
-      // API 호출하여 원격자 자격 증명 검증 (토큰 갱신 없음)
-      final response = await http
-          .post(
-            Uri.parse('$_remoteUserApiBase/api/verify_remote_user'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'username': id,
-              'password': password,
-            }),
-          )
-          .timeout(Duration(seconds: 10));
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['code'] == 1) {
-          return {
-            'success': true,
-            'name': data['data']?['name'] ?? data['data']?['username'] ?? id,
-          };
-        } else {
-          return {
-            'success': false,
-            'message': data['message'] ?? '로그인 실패',
-          };
-        }
-      } else {
-        return {
-          'success': false,
-          'message': '서버 오류: ${response.statusCode}',
-        };
-      }
-    } catch (e) {
-      // API가 없거나 오류 시 임시로 성공 처리 (테스트용)
-      debugPrint('Login API error: $e');
-      return {
-        'success': true,
-        'name': id,
-      };
-    }
-  }
-
-  /// verify_remote_user와 동일한 서버로 register 요청을 보내기 위한 기본 URL
   static const String _remoteUserApiBase = 'https://787.kr';
 
-  Future<Map<String, dynamic>> _loginRemoteUserWithAuth(
+  Future<Map<String, dynamic>> _verifyRemoteUserForRegistration(
       String id, String password) async {
     try {
       final apiServer = await _getRemoteUserApiServer();
-      final response = await http
-          .post(
-            Uri.parse('$apiServer/api/login'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'username': id,
-              'password': password,
-              'id': await bind.mainGetMyId(),
-              'uuid': await bind.mainGetUuid(),
-              'autoLogin': true,
-              'type': HttpType.kAuthReqTypeAccount,
-              'deviceInfo': _getLoginDeviceInfo(),
-            }),
-          )
-          .timeout(Duration(seconds: 10));
-
-      return await _handleRemoteUserAuthResponse(apiServer, response, id);
-    } catch (e) {
-      debugPrint('Remote user login API error: $e');
-      return {
-        'success': false,
-        'message': '로그인 확인 중 오류가 발생했습니다: $e',
-      };
+      final verifier = RemoteUserVerificationClient(
+        apiServer: apiServer,
+        post: http.post,
+      );
+      final result = await verifier.verify(
+        username: id,
+        password: password,
+        remoteId: await bind.mainGetMyId(),
+        hostname: Platform.localHostname,
+      );
+      if (result['tfa_required'] != true) return result;
+      final verified = await _showRemoteUserAuthCodeDialog(
+        title: '원격자 등록 인증',
+        message: result['tfa_message'],
+        methods: result['tfa_methods'],
+        isEmailVerification: false,
+        verify: (code) => verifier.verifySecondFactor(
+          key: result['tfa_key'],
+          code: code,
+          username: id,
+        ),
+      );
+      return verified ?? {'success': false, 'message': '인증이 취소되었습니다.'};
+    } catch (_) {
+      return {'success': false, 'message': '원격자 계정 확인 중 오류가 발생했습니다.'};
     }
   }
 
@@ -1490,232 +1447,6 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       apiServer = apiServer.replaceFirst('http://', 'https://');
     }
     return apiServer;
-  }
-
-  Map<String, dynamic> _getLoginDeviceInfo() {
-    try {
-      final raw = bind.mainGetLoginDeviceInfo();
-      if (raw.isEmpty) return {};
-      final decoded = jsonDecode(raw);
-      if (decoded is Map<String, dynamic>) return decoded;
-      if (decoded is Map) return Map<String, dynamic>.from(decoded);
-    } catch (e) {
-      debugPrint('Failed to decode login device info: $e');
-    }
-    return {};
-  }
-
-  Map<String, dynamic>? _decodeJsonObject(String body) {
-    try {
-      final decoded = jsonDecode(body);
-      if (decoded is Map<String, dynamic>) return decoded;
-      if (decoded is Map) return Map<String, dynamic>.from(decoded);
-    } catch (e) {
-      debugPrint('Failed to decode auth response: $e, body=$body');
-    }
-    return null;
-  }
-
-  Future<Map<String, dynamic>> _handleRemoteUserAuthResponse(
-    String apiServer,
-    http.Response response,
-    String fallbackId,
-  ) async {
-    final data = _decodeJsonObject(response.body);
-    if (data == null) {
-      return {
-        'success': false,
-        'message': '서버 응답을 해석할 수 없습니다.',
-      };
-    }
-    if (response.statusCode != 200) {
-      return {
-        'success': false,
-        'message':
-            data['error'] ?? data['message'] ?? '서버 오류: ${response.statusCode}',
-      };
-    }
-    if (data['error'] != null) {
-      return {
-        'success': false,
-        'message': data['error'].toString(),
-      };
-    }
-
-    LoginResponse? loginResponse;
-    try {
-      loginResponse = LoginResponse.fromJson(data);
-    } catch (e) {
-      debugPrint('Failed to parse LoginResponse: $e');
-    }
-
-    if (loginResponse?.tfaRequired == true) {
-      final tfaKey = loginResponse?.tfaKey ?? '';
-      if (tfaKey.isEmpty) {
-        return {
-          'success': false,
-          'message': '2차 인증 키가 없습니다. 서버 응답을 확인해주세요.',
-        };
-      }
-      final verified = await _showRemoteUserAuthCodeDialog(
-        title: '원격자 등록 인증',
-        message: loginResponse?.tfaMessage,
-        methods: loginResponse?.tfaMethods ?? [],
-        isEmailVerification: false,
-        verify: (code) => _verifyRemoteUserTfa(
-          apiServer: apiServer,
-          tfaKey: tfaKey,
-          code: code,
-          fallbackId: fallbackId,
-        ),
-      );
-      return verified ??
-          {
-            'success': false,
-            'message': '인증이 취소되었습니다.',
-          };
-    }
-
-    if (loginResponse?.type == HttpType.kAuthResTypeEmailCheck ||
-        loginResponse?.type == HttpType.kAuthResTypeTfaCheck) {
-      final isEmailVerification =
-          loginResponse?.type == HttpType.kAuthResTypeEmailCheck ||
-              loginResponse?.tfa_type == null ||
-              loginResponse?.tfa_type == HttpType.kAuthResTypeEmailCheck;
-      final verified = await _showRemoteUserAuthCodeDialog(
-        title: isEmailVerification ? '이메일 인증' : '2차 인증',
-        message: isEmailVerification ? translate('verification_tip') : null,
-        email: loginResponse?.user?.email,
-        isEmailVerification: isEmailVerification,
-        verify: (code) => _verifyRemoteUserEmailOrTfaCode(
-          apiServer: apiServer,
-          code: code,
-          secret: loginResponse?.secret,
-          user: loginResponse?.user,
-          isEmailVerification: isEmailVerification,
-          fallbackId: fallbackId,
-        ),
-      );
-      return verified ??
-          {
-            'success': false,
-            'message': '인증이 취소되었습니다.',
-          };
-    }
-
-    if (loginResponse?.type == HttpType.kAuthResTypeToken &&
-        loginResponse?.access_token != null) {
-      return _remoteUserAuthSuccess(loginResponse, data, fallbackId);
-    }
-
-    if (data['code'] == 1) {
-      return {
-        'success': true,
-        'name':
-            data['data']?['name'] ?? data['data']?['username'] ?? fallbackId,
-      };
-    }
-
-    return {
-      'success': false,
-      'message': data['message'] ?? '로그인 실패',
-    };
-  }
-
-  Map<String, dynamic> _remoteUserAuthSuccess(
-    LoginResponse? loginResponse,
-    Map<String, dynamic> data,
-    String fallbackId,
-  ) {
-    return {
-      'success': true,
-      'name': loginResponse?.user?.name ??
-          data['user']?['name'] ??
-          data['user']?['username'] ??
-          fallbackId,
-    };
-  }
-
-  Future<Map<String, dynamic>> _verifyRemoteUserTfa({
-    required String apiServer,
-    required String tfaKey,
-    required String code,
-    required String fallbackId,
-  }) async {
-    final response = await http
-        .post(
-          Uri.parse('$apiServer/api/login/2fa'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'tfa_key': tfaKey,
-            'tfa_code': code,
-          }),
-        )
-        .timeout(Duration(seconds: 10));
-    return _handleRemoteUserAuthCodeResponse(response, fallbackId);
-  }
-
-  Future<Map<String, dynamic>> _verifyRemoteUserEmailOrTfaCode({
-    required String apiServer,
-    required String code,
-    required String? secret,
-    required UserPayload? user,
-    required bool isEmailVerification,
-    required String fallbackId,
-  }) async {
-    final response = await http
-        .post(
-          Uri.parse('$apiServer/api/login'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'username': user?.name ?? fallbackId,
-            'id': await bind.mainGetMyId(),
-            'uuid': await bind.mainGetUuid(),
-            'autoLogin': true,
-            'type': HttpType.kAuthReqTypeEmailCode,
-            'verificationCode': code,
-            if (!isEmailVerification) 'tfaCode': code,
-            if (secret != null) 'secret': secret,
-            'deviceInfo': _getLoginDeviceInfo(),
-          }),
-        )
-        .timeout(Duration(seconds: 10));
-    return _handleRemoteUserAuthCodeResponse(response, fallbackId);
-  }
-
-  Map<String, dynamic> _handleRemoteUserAuthCodeResponse(
-    http.Response response,
-    String fallbackId,
-  ) {
-    final data = _decodeJsonObject(response.body);
-    if (data == null) {
-      return {
-        'success': false,
-        'message': '서버 응답을 해석할 수 없습니다.',
-      };
-    }
-    if (response.statusCode != 200) {
-      return {
-        'success': false,
-        'message':
-            data['error'] ?? data['message'] ?? '서버 오류: ${response.statusCode}',
-      };
-    }
-    if (data['error'] != null) {
-      return {
-        'success': false,
-        'message': data['error'].toString(),
-      };
-    }
-    final loginResponse = LoginResponse.fromJson(data);
-    if (loginResponse.access_token != null ||
-        loginResponse.type == HttpType.kAuthResTypeToken) {
-      return _remoteUserAuthSuccess(loginResponse, data, fallbackId);
-    }
-    return {
-      'success': false,
-      'message': data['message'] ?? '인증에 실패했습니다.',
-    };
   }
 
   /// 원격자 등록 인증 코드 입력 다이얼로그
@@ -1866,7 +1597,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     return target.isEmpty ? label : '$label: $target';
   }
 
-  /// 기기 등록 API 호출 (피원격지 기기 등록 - 로그인 불필요)
+  /// 자격 확인을 마친 원격자의 피원격지 기기 등록
   Future<bool> _registerDeviceToServer(String userId, String alias) async {
     try {
       var apiServer = await bind.mainGetApiServer();
@@ -3088,7 +2819,13 @@ class _AccountState extends State<_Account> {
     return ListView(
       controller: scrollController,
       children: [
-        _Card(title: 'Account', children: [accountAction(), useInfo()]),
+        _Card(title: 'Account', children: [
+          accountAction(),
+          Obx(() => gFFI.userModel.isLogin
+              ? _Button('계정 암호 변경', openAccountPasswordChange)
+              : const SizedBox.shrink()),
+          useInfo(),
+        ]),
       ],
     ).marginOnly(bottom: _kListViewBottomMargin);
   }

@@ -2167,7 +2167,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         {
             self.msgbox(
                 "error",
-                "File Transfer Audit Required",
+                "Connection Error",
                 &err.to_string(),
                 "",
             );

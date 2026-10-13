@@ -243,6 +243,8 @@ class UserModel {
 
   /// Poll immediately before a new connection as well as while idle.
   Future<bool> checkLoginSession() async {
+    // Temporarily keep Windows accounts signed in across server-side replacement.
+    if (isWindows) return true;
     if (isBiometricLocked) return false;
     if (bind.isDisableAccount()) return true;
     final pending = _sessionStatusFuture;
@@ -288,7 +290,7 @@ class UserModel {
 
   Future<void> _endRevokedSession(LoginSessionStatus status) async {
     final revokedGeneration = _sessionGeneration + 1;
-    await reset(resetOther: true);
+    if (!await _resetAfterAuthenticationFailure(resetOther: true)) return;
     if (_sessionGeneration != revokedGeneration) return;
     if (isDesktop && desktopType == DesktopType.main) {
       try {
@@ -320,7 +322,7 @@ class UserModel {
           return;
         }
         if (recovery != TokenRefreshResult.success) {
-          await reset(resetOther: true);
+          await _resetAfterAuthenticationFailure(resetOther: true);
           return;
         }
         token = bind.mainGetLocalOption(key: 'access_token');
@@ -331,7 +333,7 @@ class UserModel {
         final proactive = await refreshAccessToken();
         if (!isCurrent()) return;
         if (proactive == TokenRefreshResult.rejected) {
-          await reset(resetOther: true);
+          await _resetAfterAuthenticationFailure(resetOther: true);
           return;
         }
         if (proactive == TokenRefreshResult.success) {
@@ -376,8 +378,8 @@ class UserModel {
               'UserModel: Auth error ignored (within login protection period)');
           return;
         }
-        debugPrint('UserModel: Auth error, resetting');
-        await reset(resetOther: status == 401);
+        debugPrint('UserModel: Auth error, handling account state');
+        await _resetAfterAuthenticationFailure(resetOther: status == 401);
         return;
       }
 
@@ -471,8 +473,8 @@ class UserModel {
     }
   }
 
-  /// Returns true when the session should be kept (refreshed or temporarily
-  /// offline). Returns false after a rejected/non-refreshable session is reset.
+  /// Returns true when account state is kept, including Windows authentication
+  /// failures. This does not indicate that a failed server request succeeded.
   Future<bool> recoverUnauthorized({bool resetOther = true}) async {
     if (isWithinLoginProtection()) return true;
     final generation = _sessionGeneration;
@@ -482,8 +484,20 @@ class UserModel {
         result == TokenRefreshResult.unavailable) {
       return true;
     }
+    return !await _resetAfterAuthenticationFailure(resetOther: resetOther);
+  }
+
+  /// Windows auto logout is temporarily disabled; explicit reset/logout still
+  /// clears credentials. Other platforms retain automatic authentication cleanup.
+  Future<bool> _resetAfterAuthenticationFailure(
+      {required bool resetOther}) async {
+    if (isWindows) {
+      networkError.value = '로그인 인증을 갱신하지 못했습니다. 다시 로그인해 주세요.';
+      debugPrint('Windows account retained after authentication failure');
+      return false;
+    }
     await reset(resetOther: resetOther);
-    return false;
+    return true;
   }
 
   Future<TokenRefreshResult> _refreshAccessToken({required bool force}) async {

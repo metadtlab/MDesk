@@ -2,6 +2,11 @@
 const Map<String, String> koreanTranslations = {
   "Status": "상태",
   "Your Desktop": "내 데스크탑",
+  "Allow remote support": "원격 지원 허용",
+  "Show password": "비밀번호 표시",
+  "Hide password": "비밀번호 숨기기",
+  "remote_support_disabled_tip": "원격 지원이 꺼져 있습니다. 다른 기기에서 이 기기에 접속할 수 없습니다.",
+  "remote_support_change_failed": "원격 지원 설정을 변경하지 못했습니다. 다시 시도해 주세요.",
   "desk_tip": "이 ID와 비밀번호로 데스크톱에 액세스할 수 있습니다.",
   "Password": "비밀번호",
   "Ready": "준비 완료",

@@ -15,6 +15,7 @@ import 'package:url_launcher/url_launcher_string.dart';
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
+import '../../common/account_management.dart';
 import '../../consts.dart';
 import '../../models/model.dart';
 import '../../models/biometric_login.dart';
@@ -656,6 +657,15 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 trailing: Icon(Icons.open_in_new, size: 20),
                 onPressed: _openAccountDeletion,
               ),
+              if (isLoggedIn)
+                SettingsTile(
+                  title: const Text('계정 암호 변경'),
+                  description:
+                      const Text('웹사이트에 별도로 로그인한 뒤 암호와 개인정보를 변경합니다.'),
+                  leading: const Icon(Icons.lock_reset),
+                  trailing: const Icon(Icons.open_in_new, size: 20),
+                  onPressed: (_) => openAccountPasswordChange(),
+                ),
               SettingsTile.switchTile(
                 title: const Text('생체인증 로그인'),
                 description: Text(gFFI.userModel.biometricLoginEnabled.value
