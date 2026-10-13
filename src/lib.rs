@@ -12,6 +12,9 @@ mod server;
 pub use self::server::*;
 mod client;
 pub mod connection_diagnostics;
+mod performance_trace;
+#[cfg(feature = "flutter")]
+mod build_capabilities;
 mod camera_diagnostics;
 #[cfg(not(target_os = "ios"))]
 mod device_remote;
@@ -24,6 +27,8 @@ mod rendezvous_mediator;
 pub use self::rendezvous_mediator::*;
 /// cbindgen:ignore
 pub mod common;
+/// Process-local codec restrictions for embedded hosts such as MDeskMini.
+pub use scrap::codec::{disable_hwcodec_for_process, hardware_codec_allowed_for_process};
 #[cfg(any(target_os = "android", target_os = "ios", test))]
 mod mobile_account_token;
 #[cfg(not(any(target_os = "ios")))]

@@ -2,6 +2,13 @@ name: Windows MDesk iOS Hangul Fix
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Comparison candidate: B1 baseline, B2 hwcodec, B3 hwcodec+vram'
+        required: true
+        default: B3
+        type: choice
+        options: [B1, B2, B3]
 
 permissions:
   contents: read
@@ -11,6 +18,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 180
     env:
+      MDESK_BUILD_VARIANT: ${{ inputs.variant }}
       VCPKG_ROOT: C:\vcpkg
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
 
@@ -51,9 +59,8 @@ jobs:
       - name: Install native dependencies
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install libvpx:x64-windows-static --classic
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$env:VCPKG_ROOT\vcpkg.exe" install libyuv:x64-windows-static aom:x64-windows-static opus:x64-windows-static --classic "--overlay-ports=$env:GITHUB_WORKSPACE\res\vcpkg"
+          # Use the checked-in manifest/baseline/overlays, including AMF/NVENC/QSV.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --host-triplet x64-windows-static "--x-install-root=$env:VCPKG_ROOT\installed"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install Flutter and packaging dependencies
@@ -71,7 +78,9 @@ jobs:
         run: |
           call setup_windows_x64_env.bat
           if errorlevel 1 exit /b 1
-          cargo test --features flutter --lib --release android_hangul_tests -- --nocapture
+          call select_windows_build_features.bat
+          if errorlevel 1 exit /b 1
+          cargo test --locked --features %MDESK_CARGO_FEATURES% --lib --release android_hangul_tests -- --nocapture
           if errorlevel 1 exit /b 1
 
       - name: Build MDesk
@@ -79,7 +88,9 @@ jobs:
         run: |
           call setup_windows_x64_env.bat
           if errorlevel 1 exit /b 1
-          cargo build --features flutter --lib --release
+          call select_windows_build_features.bat
+          if errorlevel 1 exit /b 1
+          cargo build --locked --features %MDESK_CARGO_FEATURES% --lib --release
           if errorlevel 1 exit /b 1
           cd flutter
           flutter build windows --release
@@ -92,6 +103,7 @@ jobs:
           if (!(Test-Path "$buildDir\MDesk.exe")) { throw 'MDesk.exe was not created' }
           if (!(Test-Path 'target\release\librustdesk.dll')) { throw 'librustdesk.dll was not created' }
           Copy-Item 'target\release\librustdesk.dll' "$buildDir\libmdesk.dll" -Force
+          & .\tools\verify_windows_dll.ps1 -RustDll target\release\librustdesk.dll -PackagedDll "$buildDir\libmdesk.dll" -Variant $env:MDESK_BUILD_VARIANT
           Remove-Item "$buildDir\librustdesk.dll" -Force -ErrorAction SilentlyContinue
           if (Test-Path 'target\release\deps\dylib_virtual_display.dll') {
             Copy-Item 'target\release\deps\dylib_virtual_display.dll' $buildDir -Force
@@ -139,7 +151,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: mdesk-windows-${{ github.sha }}
+          name: mdesk-windows-${{ inputs.variant }}-${{ github.sha }}
           path: ${{ env.PACKAGE_PATH }}
           if-no-files-found: error
           retention-days: 7

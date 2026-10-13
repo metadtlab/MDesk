@@ -39,8 +39,105 @@ get_filename_component(NASM_EXE_PATH ${NASM} DIRECTORY)
 vcpkg_add_to_path(${NASM_EXE_PATH})
 
 if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
-    # ... (Windows 전용 코드 유지)
-    # 생략 (이 부분은 수정하지 않음)
+
+    file(REMOVE_RECURSE "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-tmp")
+
+    if(VCPKG_CRT_LINKAGE STREQUAL static)
+        set(LIBVPX_CRT_LINKAGE --enable-static-msvcrt)
+        set(LIBVPX_CRT_SUFFIX mt)
+    else()
+        set(LIBVPX_CRT_SUFFIX md)
+    endif()
+
+    if(VCPKG_CMAKE_SYSTEM_NAME STREQUAL WindowsStore AND (VCPKG_PLATFORM_TOOLSET STREQUAL v142 OR VCPKG_PLATFORM_TOOLSET STREQUAL v143))
+        set(LIBVPX_TARGET_OS "uwp")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL x86 OR VCPKG_TARGET_ARCHITECTURE STREQUAL arm)
+        set(LIBVPX_TARGET_OS "win32")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL x64 OR VCPKG_TARGET_ARCHITECTURE STREQUAL arm64)
+        set(LIBVPX_TARGET_OS "win64")
+    endif()
+
+    if(VCPKG_TARGET_ARCHITECTURE STREQUAL x86)
+        set(LIBVPX_TARGET_ARCH "x86-${LIBVPX_TARGET_OS}")
+        set(LIBVPX_ARCH_DIR "Win32")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL x64)
+        set(LIBVPX_TARGET_ARCH "x86_64-${LIBVPX_TARGET_OS}")
+        set(LIBVPX_ARCH_DIR "x64")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL arm64)
+        set(LIBVPX_TARGET_ARCH "arm64-${LIBVPX_TARGET_OS}")
+        set(LIBVPX_ARCH_DIR "ARM64")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL arm)
+        set(LIBVPX_TARGET_ARCH "armv7-${LIBVPX_TARGET_OS}")
+        set(LIBVPX_ARCH_DIR "ARM")
+    endif()
+
+    if(VCPKG_PLATFORM_TOOLSET STREQUAL v143)
+        set(LIBVPX_TARGET_VS "vs17")
+    elseif(VCPKG_PLATFORM_TOOLSET STREQUAL v142)
+        set(LIBVPX_TARGET_VS "vs16")
+    else()
+        set(LIBVPX_TARGET_VS "vs15")
+    endif()
+
+    set(OPTIONS "--disable-examples --disable-tools --disable-docs --enable-pic")
+
+    if("realtime" IN_LIST FEATURES)
+        set(OPTIONS "${OPTIONS} --enable-realtime-only")
+    endif()
+
+    if("highbitdepth" IN_LIST FEATURES)
+        set(OPTIONS "${OPTIONS} --enable-vp9-highbitdepth")
+    endif()
+
+    message(STATUS "Generating makefile")
+    file(MAKE_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-tmp")
+    vcpkg_execute_required_process(
+        COMMAND
+            ${BASH} --noprofile --norc
+            "${SOURCE_PATH}/configure"
+            --target=${LIBVPX_TARGET_ARCH}-${LIBVPX_TARGET_VS}
+            ${LIBVPX_CRT_LINKAGE}
+            ${OPTIONS}
+            --as=nasm
+        WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-tmp"
+        LOGNAME configure-${TARGET_TRIPLET})
+
+    message(STATUS "Generating MSBuild projects")
+    vcpkg_execute_required_process(
+        COMMAND
+            ${BASH} --noprofile --norc -c "make dist"
+        WORKING_DIRECTORY "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-tmp"
+        LOGNAME generate-${TARGET_TRIPLET})
+
+    vcpkg_msbuild_install(
+        SOURCE_PATH "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-tmp"
+        PROJECT_SUBPATH vpx.vcxproj
+    )
+
+    if (VCPKG_TARGET_ARCHITECTURE STREQUAL arm64)
+        set(LIBVPX_INCLUDE_DIR "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel/vpx-vp8-vp9-nopost-nodocs-${LIBVPX_TARGET_ARCH}${LIBVPX_CRT_SUFFIX}-${LIBVPX_TARGET_VS}-v${VERSION}/include/vpx")
+    elseif (VCPKG_TARGET_ARCHITECTURE STREQUAL arm)
+        set(LIBVPX_INCLUDE_DIR "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel/vpx-vp8-vp9-nopost-nomt-nodocs-${LIBVPX_TARGET_ARCH}${LIBVPX_CRT_SUFFIX}-${LIBVPX_TARGET_VS}-v${VERSION}/include/vpx")
+    else()
+        set(LIBVPX_INCLUDE_DIR "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-rel/vpx-vp8-vp9-nodocs-${LIBVPX_TARGET_ARCH}${LIBVPX_CRT_SUFFIX}-${LIBVPX_TARGET_VS}-v${VERSION}/include/vpx")
+    endif()
+    file(
+        INSTALL
+            "${LIBVPX_INCLUDE_DIR}"
+        DESTINATION
+            "${CURRENT_PACKAGES_DIR}/include"
+        RENAME
+            "vpx")
+    if (NOT DEFINED VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "release")
+        set(LIBVPX_PREFIX "${CURRENT_INSTALLED_DIR}")
+        configure_file("${CMAKE_CURRENT_LIST_DIR}/vpx.pc.in" "${CURRENT_PACKAGES_DIR}/lib/pkgconfig/vpx.pc" @ONLY)
+    endif()
+
+    if (NOT DEFINED VCPKG_BUILD_TYPE OR VCPKG_BUILD_TYPE STREQUAL "debug")
+        set(LIBVPX_PREFIX "${CURRENT_INSTALLED_DIR}/debug")
+        configure_file("${CMAKE_CURRENT_LIST_DIR}/vpx.pc.in" "${CURRENT_PACKAGES_DIR}/debug/lib/pkgconfig/vpx.pc" @ONLY)
+    endif()
+
 else()
     set(OPTIONS "--disable-examples --disable-tools --disable-docs --disable-unit-tests --enable-pic")
 
@@ -217,5 +314,12 @@ else()
 
         file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
         file(REMOVE "${CURRENT_PACKAGES_DIR}/debug/lib/libvpx_g.a")
+    endif()
+endif()
+
+if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
+    if(NOT EXISTS "${CURRENT_PACKAGES_DIR}/include/vpx/vp8.h" OR
+       NOT EXISTS "${CURRENT_PACKAGES_DIR}/lib/vpx.lib")
+        message(FATAL_ERROR "libvpx Windows package is missing its headers or static library")
     endif()
 endif()

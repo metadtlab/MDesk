@@ -736,7 +736,11 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
-        let res = match c.frame(spf) {
+        let captured = {
+            let _probe = crate::performance_trace::start(crate::performance_trace::Stage::Capture, display_idx);
+            c.frame(spf)
+        };
+        let res = match captured {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
@@ -787,7 +791,10 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
 
-                    let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                    let frame = {
+                        let _probe = crate::performance_trace::start(crate::performance_trace::Stage::Convert, display_idx);
+                        frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?
+                    };
                     let send_conn_ids = handle_one_frame(
                         display_idx,
                         &sp,
@@ -975,6 +982,7 @@ fn setup_encoder(
     let use_i444 = Encoder::use_i444(&encoder_cfg);
     let mut diagnostic = crate::connection_diagnostics::Span::new("host", &display_idx.to_string(), "encoder.initialize");
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
+    crate::performance_trace::runtime_path(display_idx, &encoder_cfg, record_incoming, use_i444);
     crate::connection_diagnostics::event("host", &display_idx.to_string(), "encoder.ready", &[("codec", &format!("{:?}", codec_format))]);
     diagnostic.success();
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
@@ -1186,17 +1194,24 @@ fn handle_one_frame(
     let mut send_conn_ids: HashSet<i32> = Default::default();
     let first = *first_frame;
     *first_frame = false;
-    match encoder.encode_to_message(frame, ms) {
+    let encoded = {
+        let _probe = crate::performance_trace::start(crate::performance_trace::Stage::Encode, display);
+        encoder.encode_to_message(frame, ms)
+    };
+    match encoded {
         Ok(mut vf) => {
             *encode_fail_counter = 0;
             vf.display = display as _;
             let mut msg = Message::new();
             msg.set_video_frame(vf);
+            let record_probe = crate::performance_trace::start(crate::performance_trace::Stage::Record, display);
             recorder
                 .lock()
                 .unwrap()
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
+            drop(record_probe);
+            let _send_probe = crate::performance_trace::start(crate::performance_trace::Stage::SendEnqueue, display);
             send_conn_ids = sp.send_video_frame(msg);
         }
         Err(e) => {

@@ -1915,6 +1915,7 @@ impl VideoHandler {
         }
         match &vf.union {
             Some(frame) => {
+                let decode_probe = crate::performance_trace::start(crate::performance_trace::Stage::DecodeConvert, self._display);
                 let res = self.decoder.handle_video_frame(
                     frame,
                     &mut self.rgb,
@@ -1922,6 +1923,7 @@ impl VideoHandler {
                     pixelbuffer,
                     chroma,
                 );
+                drop(decode_probe);
                 if res.as_ref().is_ok_and(|x| *x) {
                     self.fail_counter = 0;
                 } else {
@@ -3659,12 +3661,15 @@ pub fn start_video_thread<F, T>(
                                             ("codec", &format!("{:?}", format)),
                                         ]);
                                     }
+                                    let callback_probe = crate::performance_trace::start(crate::performance_trace::Stage::VideoCallback, display);
                                     video_callback(
                                         display,
                                         &mut handler.rgb,
                                         handler.texture.texture,
                                         pixelbuffer,
                                     );
+
+                                    drop(callback_probe);
 
                                     // chroma
                                     if tmp_chroma.is_some() && last_chroma != tmp_chroma {

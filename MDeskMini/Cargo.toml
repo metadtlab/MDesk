@@ -1,10 +1,17 @@
-﻿[package]
+[package]
 name = "mdeskmini"
 version = "0.1.2"
 edition = "2021"
 publish = false
 
 [workspace]
+
+[features]
+# Direct Cargo / dedicated Win7 scripts stay software-only. Build scripts select B3 (x64) or B2 (unified x86).
+default = []
+flutter = ["librustdesk/flutter"]
+hwcodec = ["librustdesk/hwcodec"]
+vram = ["hwcodec", "librustdesk/vram"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

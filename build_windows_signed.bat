@@ -6,6 +6,9 @@ REM 한글 인코딩 설정 (UTF-8)
 chcp 65001 >nul 2>&1
 
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
+call "%~dp0select_windows_build_features.bat"
+if errorlevel 1 exit /b 1
 
 echo ========================================
 echo RustDesk Windows 빌드 및 배포 스크립트
@@ -44,6 +47,11 @@ if not exist "%CERT_FILE%" (
 
 echo 인증서 파일: %CERT_FILE%
 echo.
+
+call "%~dp0prepare_windows_native.bat"
+if errorlevel 1 exit /b 1
+call "%~dp0setup_windows_x64_env.bat"
+if errorlevel 1 exit /b 1
 
 REM 사전 체크: 서브모듈 초기화 확인
 echo [사전 체크] 서브모듈 확인 중...
@@ -127,10 +135,10 @@ echo.
 
 REM 1단계: 전체 빌드 실행
 echo [1/3] 전체 빌드 실행 중...
-echo 명령: python build.py --flutter
+echo 명령: python build.py --flutter %MDESK_PYTHON_FEATURE_ARGS%
 echo VCPKG_ROOT: %VCPKG_ROOT%
 echo.
-python build.py --flutter
+python build.py --flutter %MDESK_PYTHON_FEATURE_ARGS%
 if errorlevel 1 (
     echo.
     echo [오류] 빌드 실패!

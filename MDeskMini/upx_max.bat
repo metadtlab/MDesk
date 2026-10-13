@@ -28,6 +28,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
+upx -t "%TARGET_EXE%"
+if errorlevel 1 (
+  echo ERROR: UPX integrity verification failed.
+  exit /b 1
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ADMIN_VERIFY_SCRIPT%" -Path "%TARGET_EXE%"
 if errorlevel 1 (
   echo ERROR: UPX output is missing the administrator manifest.

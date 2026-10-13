@@ -1,5 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod capabilities;
+mod os_support;
+
 #[cfg(target_os = "windows")]
 mod about;
 #[cfg(target_os = "windows")]
@@ -175,6 +178,12 @@ enum Commands {
     Id,
     /// Print build version
     Version,
+    /// Report compiled engine features without starting the host or probing GPUs
+    Capabilities {
+        /// Write JSON to a new file (recommended for the Windows GUI executable)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Ask the active controller to open file transfer at this file or folder
     SendToController {
         /// Selected Explorer path
@@ -270,12 +279,35 @@ struct CertVerification {
 }
 
 fn main() {
+    // Apply to every entry point, including portable-service and GPU children.
+    // In-memory only; leave the installed application's preferences untouched.
+    os_support::apply_codec_policy();
+    let first_arg = std::env::args().nth(1);
+    // Must precede logging, cleanup guards, configuration, elevation checks and
+    // any host initialization. Build verification must never start a session.
+    if first_arg.as_deref() == Some("capabilities") {
+        match Cli::try_parse() {
+            Ok(Cli {
+                command: Some(Commands::Capabilities { output }),
+            }) => {
+                if let Err(err) = capabilities::write_report(output.as_deref()) {
+                    eprintln!("Unable to write build capabilities: {err}");
+                    std::process::exit(1);
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(err.exit_code());
+            }
+            _ => unreachable!("capabilities command was selected"),
+        }
+        return;
+    }
     let _secure_log_cleanup = SecureLogCleanup;
     common::mark_mdeskmini_process_tree();
     // Applies before internal --server/--cm dispatch too, without changing the
     // installed client's preferences or the existing installed-MDesk handoff.
     config::require_websocket_for_process();
-    let first_arg = std::env::args().nth(1);
     let delegates_to_core_main = is_rustdesk_internal_arg(first_arg.as_deref())
         || internal_mode_from_arg(first_arg.as_deref()).is_some();
     if !delegates_to_core_main {
@@ -289,6 +321,7 @@ fn main() {
                 first_arg.as_deref().unwrap_or("serve")
             ),
         );
+        diagnostic_event("build.capabilities", &capabilities::report().to_string());
     }
 
     #[cfg(target_os = "windows")]
@@ -334,6 +367,7 @@ fn main() {
     if let Some(mode) = internal_mode_from_arg(first_arg.as_deref()) {
         match mode {
             InternalMode::Whiteboard => run_whiteboard_mode(),
+            InternalMode::HwCodec => run_hwcodec_discovery(),
         }
         return;
     }
@@ -369,6 +403,7 @@ fn main() {
         }),
         Some(Commands::Id) => run_id(),
         Some(Commands::Version) => println!("{VERSION}"),
+        Some(Commands::Capabilities { .. }) => unreachable!("handled before host initialization"),
         Some(Commands::SendToController { path }) => run_send_to_controller(path, false, false),
         None => run_default_serve(),
     }
@@ -713,11 +748,13 @@ fn enable_per_monitor_dpi_awareness() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InternalMode {
     Whiteboard,
+    HwCodec,
 }
 
 fn internal_mode_from_arg(arg: Option<&str>) -> Option<InternalMode> {
     match arg {
         Some("--whiteboard") => Some(InternalMode::Whiteboard),
+        Some("--check-hwcodec-config") => Some(InternalMode::HwCodec),
         _ => None,
     }
 }
@@ -727,6 +764,24 @@ fn is_rustdesk_internal_arg(arg: Option<&str>) -> bool {
         arg,
         Some("--portable-service" | "--elevate" | "--run-as-system")
     )
+}
+
+fn run_hwcodec_discovery() {
+    if !librustdesk::hardware_codec_allowed_for_process() {
+        return;
+    }
+    // Use only the shared GPU discovery + IPC handler. core_main/global_init
+    // also migrate approval settings and clear portable passwords, which must
+    // not run in a child spawned after Mini has applied its host policy.
+    #[cfg(feature = "hwcodec")]
+    {
+        if hbb_common::tcp::init_sodium().is_err() {
+            secure_process_exit(1);
+        }
+        // Load the same signed custom-client IPC namespace as the parent.
+        common::load_custom_client();
+        librustdesk::ipc::hwcodec_process();
+    }
 }
 
 fn run_whiteboard_mode() {
@@ -3039,6 +3094,23 @@ fn to_wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_discovery_child_uses_dedicated_handler() {
+        assert_eq!(
+            internal_mode_from_arg(Some("--check-hwcodec-config")),
+            Some(InternalMode::HwCodec)
+        );
+        assert!(!is_rustdesk_internal_arg(Some("--check-hwcodec-config")));
+        assert!(!is_rustdesk_internal_arg(Some("capabilities")));
+        assert!(!is_rustdesk_internal_arg(Some("serve")));
+        assert!(matches!(
+            Cli::try_parse_from(["mdeskmini", "capabilities", "--output", "build.json"])
+                .unwrap()
+                .command,
+            Some(Commands::Capabilities { output: Some(_) })
+        ));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn tray_information_lifecycle() {

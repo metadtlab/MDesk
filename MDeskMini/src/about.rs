@@ -19,8 +19,18 @@ const UPSTREAM_ID: i32 = 204;
 const CLOSE_ID: i32 = 2;
 
 fn notice_text() -> String {
+    let included = |value| if value { "포함" } else { "미포함" };
+    let hwcodec = included(super::flutter_ffi::main_has_hwcodec().0);
+    let vram = included(super::flutter_ffi::main_has_vram().0);
+    let os_policy = if super::os_support::hardware_codec_allowed() {
+        "현재 Windows에서 하드웨어 가속 사용 가능"
+    } else {
+        "현재 Windows에서는 소프트웨어 코덱 사용 (가속은 Windows 10 이상)"
+    };
     format!(
-        "MDeskMini는 RustDesk 기반으로 수정한 원격지원 프로그램입니다.\n\
+        "하드웨어 가속 지원: {hwcodec} / VRAM 경로: {vram}\n{os_policy}\n\
+         실제 사용 여부는 GPU, 드라이버, 연결 상대 및 설정에 따라 자동 결정됩니다.\n\n\
+         MDeskMini는 RustDesk 기반으로 수정한 원격지원 프로그램입니다.\n\
          Copyright (c) 2025 MetaDataLab.\n\
          Portions Copyright (c) Purslane Ltd.\n\
          기타 기여자의 저작권과 라이선스 고지는 유지됩니다.\n\n\

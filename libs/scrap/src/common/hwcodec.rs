@@ -62,6 +62,9 @@ impl EncoderApi for HwRamEncoder {
     where
         Self: Sized,
     {
+        if !crate::codec::hardware_codec_allowed_for_process() {
+            bail!("Hardware codecs are disabled for this process");
+        }
         match cfg {
             EncoderCfg::HWRAM(config) => {
                 let rc = Self::rate_control(&config);
@@ -534,6 +537,11 @@ impl HwCodecConfig {
     }
 
     pub fn get() -> HwCodecConfig {
+        // Do not read cached GPU capabilities or inspect drivers on a host
+        // whose OS policy requires software codecs.
+        if !crate::codec::hardware_codec_allowed_for_process() {
+            return HwCodecConfig::default();
+        }
         #[cfg(target_os = "android")]
         {
             let info = crate::android::ffi::get_codec_info();
@@ -678,6 +686,9 @@ impl HwCodecConfig {
 }
 
 pub fn check_available_hwcodec() -> String {
+    if !crate::codec::hardware_codec_allowed_for_process() {
+        return serde_json::to_string(&HwCodecConfig::default()).unwrap_or_default();
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     hwcodec::common::setup_parent_death_signal();
     let ctx = EncodeContext {

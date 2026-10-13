@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "MDesk"
-version = "1.6.4"
+version = "1.7.0"
 dependencies = [
  "android-wakelock",
  "android_logger",
@@ -3552,6 +3552,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
+name = "hwcodec"
+version = "0.7.1"
+source = "git+https://github.com/rustdesk-org/hwcodec#398e5a8938dd8768ade0fcdc27ea80e8b4b38738"
+dependencies = [
+ "bindgen 0.59.2",
+ "cc",
+ "log",
+ "serde 1.0.228",
+ "serde_derive",
+ "serde_json 1.0.149",
+]
+
+[[package]]
 name = "hyper"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6995,6 +7008,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "hbb_common",
+ "hwcodec",
  "image 0.24.9",
  "jni 0.21.1",
  "lazy_static",

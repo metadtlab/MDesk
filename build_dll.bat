@@ -3,8 +3,14 @@ chcp 65001 >nul 2>&1
 setlocal
 
 cd /d "%~dp0"
+call "%~dp0select_windows_build_features.bat"
+if errorlevel 1 exit /b 1
+call "%~dp0prepare_windows_native.bat"
+if errorlevel 1 exit /b 1
 call "%~dp0setup_windows_x64_env.bat"
 if errorlevel 1 exit /b 1
+set "CARGO_TARGET_DIR=%~dp0target"
+if not defined LIBCLANG_PATH if exist "C:\Program Files\LLVM\bin\libclang.dll" set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
 
 :: VCPKG 경로 설정
 if "%VCPKG_ROOT%"=="" set VCPKG_ROOT=D:\IMedix\Rust\vcpkg
@@ -24,13 +30,16 @@ set RELEASE_DEST=flutter\build\windows\x64\runner\Release
 if "%choice%"=="1" (
     echo.
     echo [Release 모드] 빌드를 시작합니다...
-    cargo build --lib --release --features flutter
-    if %ERRORLEVEL% NEQ 0 goto error
+    cargo build --locked --lib --release --features %MDESK_CARGO_FEATURES%
+    if errorlevel 1 goto error
     
     echo.
     echo [복사] target\release\librustdesk.dll 파일을 libmdesk.dll 이름으로 플러터 빌드 폴더에 복사합니다...
     if exist "%RELEASE_DEST%" (
         copy /y "target\release\librustdesk.dll" "%RELEASE_DEST%\libmdesk.dll"
+        if errorlevel 1 goto error
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\verify_windows_dll.ps1" -RustDll "target\release\librustdesk.dll" -PackagedDll "%RELEASE_DEST%\libmdesk.dll" -Variant "%MDESK_BUILD_VARIANT%"
+        if errorlevel 1 goto error
         if exist "%RELEASE_DEST%\librustdesk.dll" del /f /q "%RELEASE_DEST%\librustdesk.dll" 2>nul
         echo Release 폴더로 복사 완료.
     ) else (
@@ -40,13 +49,16 @@ if "%choice%"=="1" (
 ) else if "%choice%"=="2" (
     echo.
     echo [Debug 모드] 빌드를 시작합니다...
-    cargo build --lib --features flutter
-    if %ERRORLEVEL% NEQ 0 goto error
+    cargo build --locked --lib --features %MDESK_CARGO_FEATURES%
+    if errorlevel 1 goto error
     
     echo.
     echo [복사] target\debug\librustdesk.dll 파일을 libmdesk.dll 이름으로 플러터 빌드 폴더에 복사합니다...
     if exist "%DEBUG_DEST%" (
         copy /y "target\debug\librustdesk.dll" "%DEBUG_DEST%\libmdesk.dll"
+        if errorlevel 1 goto error
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\verify_windows_dll.ps1" -RustDll "target\debug\librustdesk.dll" -PackagedDll "%DEBUG_DEST%\libmdesk.dll" -Variant "%MDESK_BUILD_VARIANT%"
+        if errorlevel 1 goto error
         if exist "%DEBUG_DEST%\librustdesk.dll" del /f /q "%DEBUG_DEST%\librustdesk.dll" 2>nul
         echo Debug 폴더로 복사 완료.
     ) else (
@@ -67,7 +79,8 @@ pause
 exit /b 0
 
 :error
+set "MDESK_BUILD_ERROR=%ERRORLEVEL%"
 echo.
 echo [ERROR] 컴파일 중 오류가 발생했습니다.
 pause
-exit /b %ERRORLEVEL%
+exit /b %MDESK_BUILD_ERROR%

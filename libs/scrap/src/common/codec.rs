@@ -47,6 +47,19 @@ lazy_static::lazy_static! {
 
 pub const ENCODE_NEED_SWITCH: &'static str = "ENCODE_NEED_SWITCH";
 
+// A host can forbid GPU codecs for this process before starting any workers.
+// This does not change saved preferences or the default behavior of other hosts.
+static HARDWARE_CODEC_BLOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn disable_hwcodec_for_process() {
+    HARDWARE_CODEC_BLOCKED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn hardware_codec_allowed_for_process() -> bool {
+    !HARDWARE_CODEC_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub enum EncoderCfg {
     VPX(VpxEncoderConfig),
@@ -851,6 +864,9 @@ impl Decoder {
 pub fn enable_hwcodec_option() -> bool {
     use hbb_common::config::keys::OPTION_ENABLE_HWCODEC;
 
+    if !hardware_codec_allowed_for_process() {
+        return false;
+    }
     if !cfg!(target_os = "ios") {
         return option2bool(
             OPTION_ENABLE_HWCODEC,
@@ -863,6 +879,9 @@ pub fn enable_hwcodec_option() -> bool {
 pub fn enable_vram_option(encode: bool) -> bool {
     use hbb_common::config::keys::OPTION_ENABLE_HWCODEC;
 
+    if !hardware_codec_allowed_for_process() {
+        return false;
+    }
     if cfg!(windows) {
         let enable = option2bool(
             OPTION_ENABLE_HWCODEC,

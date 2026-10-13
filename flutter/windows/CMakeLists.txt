@@ -108,6 +108,15 @@ message(STATUS "rustdesk lib build type: ${RUSTDESK_LIB_BUILD_TYPE}")
 set(RUSTDESK_LIB "../../target/${RUSTDESK_LIB_BUILD_TYPE}/librustdesk.dll")
 install(FILES "${RUSTDESK_LIB}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
 COMPONENT Runtime RENAME libmdesk.dll)
+# Reject a stale/wrong Rust DLL at the final Flutter bundle boundary.
+install(CODE "
+  file(SHA256 \"${CMAKE_CURRENT_SOURCE_DIR}/${RUSTDESK_LIB}\" MDESK_SOURCE_HASH)
+  file(SHA256 \"${INSTALL_BUNDLE_LIB_DIR}/libmdesk.dll\" MDESK_PACKAGE_HASH)
+  if(NOT MDESK_SOURCE_HASH STREQUAL MDESK_PACKAGE_HASH)
+    message(FATAL_ERROR \"Bundled libmdesk.dll does not match this Rust build\")
+  endif()
+  message(STATUS \"MDesk Rust DLL SHA256 verified\")
+" COMPONENT Runtime)
 
 # res/windows_install_extra/tools/*.exe → 설치 루트/tools (예: DeviceRemote.exe)
 set(WINDOWS_EXTRA_TOOLS "${CMAKE_CURRENT_SOURCE_DIR}/../../res/windows_install_extra/tools")
