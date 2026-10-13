@@ -3955,7 +3955,7 @@ Future<void> loadFavPeers() async {
 }
 
 void checkUpdate() {
-  if (!isWeb) {
+  if (!isWeb && !isMacOS) {
     // MDesk 자체 버전 체크 API 사용
     Timer(const Duration(seconds: 3), () async {
       await checkMDeskUpdate();
@@ -4064,6 +4064,10 @@ void _scheduleMDeskAutomaticUpdate(
 /// MDesk 버전 체크 - admin.787.kr API 사용
 /// 반환: 새 버전 있음 `true`, 이미 최신 `false`, 실패·응답 오류 `null`
 Future<bool?> checkMDeskUpdate() async {
+  if (isMacOS) {
+    return false;
+  }
+
   try {
     final currentVersion = await bind.mainGetVersion();
     debugPrint('MDesk Update Check: Current version = $currentVersion');

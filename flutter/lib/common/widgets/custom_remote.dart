@@ -13,6 +13,7 @@ import '../../models/state_model.dart';
 import 'login.dart';
 import '../../utils/device_register_service.dart';
 import '../../utils/connection_diagnostics.dart';
+import '../../utils/apple_billing.dart';
 
 /// 상담사 추가 버튼·관련 안내 표시. 추후 사용 시 true로 변경.
 const bool _kShowAddCounselorButton = false;
@@ -1813,7 +1814,7 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               ),
               const SizedBox(height: 16),
               Text(
-                '유료 사용자만 사용이 가능합니다',
+                isIOS ? '이 계정에서는 사용할 수 없습니다' : '유료 사용자만 사용이 가능합니다',
                 style: TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.bold,
@@ -1822,7 +1823,9 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
               ),
               const SizedBox(height: 8),
               Text(
-                '상담사 관리 및 다이렉트 연결 기능을 사용하시려면\n멤버십을 업그레이드 해주세요.',
+                isIOS
+                    ? '현재 계정에 상담사 관리 및 다이렉트 연결 기능의\n사용 권한이 없습니다.'
+                    : '상담사 관리 및 다이렉트 연결 기능을 사용하시려면\n멤버십을 업그레이드 해주세요.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,
@@ -1833,6 +1836,13 @@ class _CustomRemoteViewState extends State<CustomRemoteView>
                       ?.withOpacity(0.7),
                 ),
               ),
+              if (isIOS) ...[
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: () => openAppleSubscriptionPage(context),
+                  child: const Text('App Store 구독 보기'),
+                ),
+              ],
             ],
           ),
         );

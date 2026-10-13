@@ -2,23 +2,28 @@ import UIKit
 import Flutter
 
 @main
-@objc class AppDelegate: FlutterAppDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private let biometricLogin = BiometricLogin()
   private var biometricChannel: FlutterMethodChannel?
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    GeneratedPluginRegistrant.register(with: self)
-    if let controller = window?.rootViewController as? FlutterViewController {
-      let channel = FlutterMethodChannel(name: "mdesk/biometric_login", binaryMessenger: controller.binaryMessenger)
-      channel.setMethodCallHandler { [weak self] call, result in
-        self?.biometricLogin.handle(call, result: result)
-      }
-      biometricChannel = channel
-    }
     dummyMethodToEnforceBundling();
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let channel = FlutterMethodChannel(
+      name: "mdesk/biometric_login",
+      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+    )
+    channel.setMethodCallHandler { [weak self] call, result in
+      self?.biometricLogin.handle(call, result: result)
+    }
+    biometricChannel = channel
   }
     
   public func dummyMethodToEnforceBundling() {

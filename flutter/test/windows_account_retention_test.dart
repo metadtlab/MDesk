@@ -19,7 +19,11 @@ class _AccountModel extends UserModel {
   int resetCalls = 0;
 
   @override
-  Future<TokenRefreshResult> refreshAccessToken({bool force = false}) async {
+  Future<TokenRefreshResult> refreshAccessToken({
+    bool force = false,
+    String? expectedOrigin,
+    int? expectedGeneration,
+  }) async {
     refreshCalls++;
     return refreshResult;
   }

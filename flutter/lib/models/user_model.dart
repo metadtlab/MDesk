@@ -13,6 +13,8 @@ import 'package:http/http.dart' as flutter_http;
 
 import '../common.dart';
 import '../utils/http_service.dart' as http;
+import '../utils/session_refresh_coordinator.dart';
+import '../utils/session_write_coordinator.dart';
 import 'model.dart';
 import 'login_session_status.dart';
 import 'biometric_login.dart';
@@ -42,11 +44,20 @@ class UserModel {
   WeakReference<FFI> parent;
 
   Timer? _refreshTimer;
-  Future<TokenRefreshResult>? _accessRefreshFuture;
   Future<bool>? _sessionStatusFuture;
-  final _sessionWrites = LoginSessionWrites();
   DateTime _nextUserRefresh = DateTime.now();
+  final _accessRefreshCoordinator =
+      SessionRefreshCoordinator<TokenRefreshResult>();
+  final _sessionWrites = SessionWriteCoordinator();
   int _sessionGeneration = 0;
+  int? _sessionTransition;
+  int _serverInfoRevision = 0;
+
+  /// Read-only identity/version markers for account-bound StoreKit operations.
+  int get sessionGeneration => _sessionGeneration;
+  int get serverInfoRevision => _serverInfoRevision;
+  bool get isSessionTransitioning => _sessionTransition != null;
+  Future<String> accountApiServer() => _accountApiServer();
 
   static const _refreshTokenKey = 'refresh_token';
   static const _accessTokenExpiresAtKey = 'access_token_expires_at';
@@ -116,8 +127,9 @@ class UserModel {
     _biometricLoginBusy = true;
     final generation = _sessionGeneration;
     try {
-      return await _sessionWrites.run(() async {
-        if (generation != _sessionGeneration) return false;
+      var enabled = false;
+      await _sessionWrites.run(() async {
+        if (generation != _sessionGeneration) return;
         final refresh = _refreshToken;
         final expiresAt =
             int.tryParse(bind.mainGetLocalOption(key: _sessionExpiresAtKey)) ??
@@ -132,37 +144,48 @@ class UserModel {
         if (!await _biometricLogin.isAvailable()) {
           throw PlatformException(code: 'unavailable');
         }
+        final server = await _accountApiServer();
+        if (generation != _sessionGeneration) return;
         final enrolled = await _biometricLogin.enroll(BiometricSession(
             refreshToken: refresh,
             expiresAt: expiresAt,
-            apiServer: await _accountApiServer(),
+            apiServer: server,
             user: user));
         if (generation != _sessionGeneration) {
           await _biometricLogin.clear();
-          return false;
+          return;
         }
-        if (!enrolled) return false;
+        if (!enrolled) return;
         _biometricRefreshToken = refresh;
         biometricLoginEnabled.value = true;
         await bind.mainSetLocalOption(key: _biometricEnabledKey, value: 'Y');
+        if (generation != _sessionGeneration) return;
         // Rust keeps this access token in memory once biometric login is on.
         await bind.mainSetLocalOption(key: 'access_token', value: access);
+        if (generation != _sessionGeneration) return;
         await bind.mainSetLocalOption(key: _refreshTokenKey, value: '');
-        return true;
+        enabled = generation == _sessionGeneration;
       });
+      return enabled;
     } finally {
       _biometricLoginBusy = false;
     }
   }
 
-  Future<void> disableBiometricLogin() => _sessionWrites.run(() async {
-        final access =
-            isLogin ? bind.mainGetLocalOption(key: 'access_token') : '';
-        final refresh = isLogin ? _refreshToken : '';
-        await _clearBiometricLogin();
-        await bind.mainSetLocalOption(key: 'access_token', value: access);
-        await bind.mainSetLocalOption(key: _refreshTokenKey, value: refresh);
-      });
+  Future<void> disableBiometricLogin() {
+    final generation = _sessionGeneration;
+    return _sessionWrites.run(() async {
+      if (generation != _sessionGeneration) return;
+      final access =
+          isLogin ? bind.mainGetLocalOption(key: 'access_token') : '';
+      final refresh = isLogin ? _refreshToken : '';
+      await _clearBiometricLogin();
+      if (generation != _sessionGeneration) return;
+      await bind.mainSetLocalOption(key: 'access_token', value: access);
+      if (generation != _sessionGeneration) return;
+      await bind.mainSetLocalOption(key: _refreshTokenKey, value: refresh);
+    });
+  }
 
   Future<void> _clearBiometricLogin() async {
     if (biometricLoginEnabled.value || _biometricLoginBusy) {
@@ -194,11 +217,13 @@ class UserModel {
     }
     _biometricLoginBusy = true;
     final generation = ++_sessionGeneration;
-    _accessRefreshFuture = null;
+    _sessionStatusFuture = null;
     try {
       final session = await _biometricLogin.unlock();
       if (generation != _sessionGeneration || session == null) return false;
-      if (!session.canRestore(await _accountApiServer(), DateTime.now())) {
+      final server = await _accountApiServer();
+      if (generation != _sessionGeneration) return false;
+      if (!session.canRestore(server, DateTime.now())) {
         await reset(resetOther: true);
         throw PlatformException(code: 'expired');
       }
@@ -207,6 +232,7 @@ class UserModel {
         _biometricRefreshToken = session.refreshToken;
         await bind.mainSetLocalOption(
             key: _sessionExpiresAtKey, value: '${session.expiresAt}');
+        if (generation != _sessionGeneration) return;
         await bind.mainSetLocalOption(
             key: 'user_info', value: jsonEncode(session.user));
       });
@@ -226,14 +252,20 @@ class UserModel {
       // refresh credential, even if another user-info request is in flight.
       await _sessionWrites.run(() async {
         if (generation != _sessionGeneration) return;
-        _parseAndUpdateUser(UserPayload.fromJson(session.user));
+        final user = UserPayload.fromJson(session.user);
+        await _storeUserInfo(user, generation: generation);
+        if (generation != _sessionGeneration) return;
+        _lastLoginTime = DateTime.now();
+        _parseAndUpdateUser(user);
       });
       await refreshCurrentUser();
       return generation == _sessionGeneration && isLogin;
     } on FormatException {
+      if (generation != _sessionGeneration) return false;
       await reset(resetOther: true);
       throw PlatformException(code: 'invalidated');
     } on PlatformException catch (error) {
+      if (generation != _sessionGeneration) return false;
       if (error.code == 'invalidated') await reset(resetOther: true);
       rethrow;
     } finally {
@@ -307,16 +339,22 @@ class UserModel {
   Future<void> refreshCurrentUser() async {
     if (isBiometricLocked) return;
     if (bind.isDisableAccount()) return;
+    if (isSessionTransitioning) return;
     if (refreshingUser) return;
     refreshingUser = true;
     final generation = _sessionGeneration;
-    bool isCurrent() => generation == _sessionGeneration;
+    String? requestedName;
+    String? requestedUserId;
+    bool isCurrentSession() =>
+        generation == _sessionGeneration &&
+        (requestedName == null || requestedName == userName.value) &&
+        (requestedUserId == null || requestedUserId == userPkid.value);
     networkError.value = '';
     try {
       var token = bind.mainGetLocalOption(key: 'access_token');
       if (token.isEmpty) {
         final recovery = await refreshAccessToken(force: true);
-        if (!isCurrent()) return;
+        if (!isCurrentSession()) return;
         if (recovery == TokenRefreshResult.unavailable) {
           debugPrint('UserModel: No access token, skipping refresh');
           return;
@@ -328,10 +366,12 @@ class UserModel {
         token = bind.mainGetLocalOption(key: 'access_token');
       }
       _updateLocalUserInfo();
+      requestedName = userName.value;
+      requestedUserId = userPkid.value;
 
       if (_shouldRefreshAccessToken()) {
         final proactive = await refreshAccessToken();
-        if (!isCurrent()) return;
+        if (!isCurrentSession()) return;
         if (proactive == TokenRefreshResult.rejected) {
           await _resetAfterAuthenticationFailure(resetOther: true);
           return;
@@ -342,10 +382,10 @@ class UserModel {
       }
 
       final url = await _accountApiServer();
-      if (!isCurrent()) return;
+      if (!isCurrentSession()) return;
       debugPrint('UserModel: Refreshing user from $url/api/userInfo');
       var response = await _requestCurrentUser(url, token);
-      if (!isCurrent() ||
+      if (!isCurrentSession() ||
           token != bind.mainGetLocalOption(key: 'access_token')) {
         return;
       }
@@ -353,11 +393,11 @@ class UserModel {
       debugPrint('UserModel: Refresh response status: $status');
       if (status == 401 || status == 400) {
         final recovery = await refreshAccessToken(force: true);
-        if (!isCurrent()) return;
+        if (!isCurrentSession()) return;
         if (recovery == TokenRefreshResult.success) {
           token = bind.mainGetLocalOption(key: 'access_token');
           response = await _requestCurrentUser(url, token);
-          if (!isCurrent() ||
+          if (!isCurrentSession() ||
               token != bind.mainGetLocalOption(key: 'access_token')) {
             return;
           }
@@ -389,6 +429,8 @@ class UserModel {
       }
 
       final Map<String, dynamic> responseData = json.decode(response.body);
+      final currentUrl = await _accountApiServer();
+      if (!isCurrentSession() || currentUrl != url) return;
 
       // 새로운 API 형식 처리 (code: 1, data: { ... })
       if (responseData['code'] == 1 && responseData['data'] != null) {
@@ -399,18 +441,29 @@ class UserModel {
         }
 
         final user = UserPayload.fromJson(userData);
+        if (requestedUserId.isNotEmpty &&
+            user.userPkid.isNotEmpty &&
+            requestedUserId != user.userPkid) {
+          networkError.value =
+              'Account information does not match this session';
+          return;
+        }
         debugPrint(
             'UserModel: Refreshed user info from userInfo API - Name: ${user.name}, Membership: ${user.membershipLevel}, UserPkid: ${user.userPkid}');
         debugPrint('UserModel: Raw userData keys: ${userData.keys.toList()}');
         debugPrint('UserModel: Raw user_pkid value: ${userData['user_pkid']}');
         await _sessionWrites.run(() async {
-          if (!isCurrent() ||
+          if (!isCurrentSession() ||
               token != bind.mainGetLocalOption(key: 'access_token')) {
             return;
           }
-          await bind.mainSetLocalOption(
-              key: 'user_info', value: jsonEncode(user));
-          if (isCurrent()) _parseAndUpdateUser(user);
+          await _storeUserInfo(user, generation: generation);
+          if (!isCurrentSession() ||
+              token != bind.mainGetLocalOption(key: 'access_token')) {
+            return;
+          }
+          _parseAndUpdateUser(user);
+          _serverInfoRevision++;
         });
 
         // 기기 등록은 "원격자 등록" 다이얼로그에서만 수행
@@ -419,7 +472,7 @@ class UserModel {
         debugPrint('UserModel: API response code is not 1 or data is null');
       }
     } catch (e) {
-      if (!isCurrent()) return;
+      if (!isCurrentSession()) return;
       networkError.value = e.toString();
       debugPrint('Failed to refreshCurrentUser: $e');
     } finally {
@@ -457,20 +510,64 @@ class UserModel {
         expiresAt;
   }
 
-  Future<TokenRefreshResult> refreshAccessToken({bool force = false}) async {
+  Future<TokenRefreshResult> refreshAccessToken({
+    bool force = false,
+    String? expectedOrigin,
+    int? expectedGeneration,
+  }) async {
     if (isBiometricLocked) return TokenRefreshResult.notConfigured;
-    final pending = _accessRefreshFuture;
-    if (pending != null) return pending;
-
-    final request = _refreshAccessToken(force: force);
-    _accessRefreshFuture = request;
-    try {
-      return await request;
-    } finally {
-      if (identical(_accessRefreshFuture, request)) {
-        _accessRefreshFuture = null;
+    if (isSessionTransitioning) return TokenRefreshResult.unavailable;
+    final generation = _sessionGeneration;
+    final configuredUrl = await _accountApiServer();
+    if (generation != _sessionGeneration ||
+        (expectedGeneration != null && expectedGeneration != generation)) {
+      return TokenRefreshResult.rejected;
+    }
+    // Billing pins the first-party origin. A mutable server-setting change must
+    // never redirect its refresh token, even between two asynchronous reads.
+    if (expectedOrigin != null) {
+      final configured = Uri.tryParse(configuredUrl);
+      final expected = Uri.tryParse(expectedOrigin);
+      if (configured == null ||
+          expected == null ||
+          configured.scheme != 'https' ||
+          expected.scheme != 'https' ||
+          configured.host.isEmpty ||
+          expected.host.isEmpty ||
+          configured.origin != expected.origin ||
+          configured.userInfo.isNotEmpty ||
+          expected.userInfo.isNotEmpty ||
+          configured.hasQuery ||
+          configured.hasFragment ||
+          expected.hasQuery ||
+          expected.hasFragment ||
+          (configured.path.isNotEmpty && configured.path != '/') ||
+          (expected.path.isNotEmpty && expected.path != '/')) {
+        return TokenRefreshResult.rejected;
       }
     }
+    if (_refreshToken.isEmpty) {
+      return TokenRefreshResult.notConfigured;
+    }
+    final sessionExpiresAt =
+        int.tryParse(bind.mainGetLocalOption(key: _sessionExpiresAtKey));
+    if (sessionExpiresAt != null &&
+        DateTime.now().millisecondsSinceEpoch >= sessionExpiresAt) {
+      return TokenRefreshResult.rejected;
+    }
+    // Do not pool no-op refreshes with a forced retry after an HTTP 401.
+    if (!force && !_shouldRefreshAccessToken()) {
+      return TokenRefreshResult.success;
+    }
+    return _accessRefreshCoordinator.run(
+      generation: generation,
+      server: configuredUrl,
+      request: () => _refreshAccessToken(
+        generation: generation,
+        configuredUrl: configuredUrl,
+        requestUrl: expectedOrigin ?? configuredUrl,
+      ),
+    );
   }
 
   /// Returns true when account state is kept, including Windows authentication
@@ -500,8 +597,12 @@ class UserModel {
     return true;
   }
 
-  Future<TokenRefreshResult> _refreshAccessToken({required bool force}) async {
-    final refreshGeneration = _sessionGeneration;
+  Future<TokenRefreshResult> _refreshAccessToken({
+    required int generation,
+    required String configuredUrl,
+    required String requestUrl,
+  }) async {
+    if (generation != _sessionGeneration) return TokenRefreshResult.rejected;
     final refreshToken = _refreshToken;
     if (refreshToken.isEmpty) return TokenRefreshResult.notConfigured;
 
@@ -511,25 +612,35 @@ class UserModel {
         DateTime.now().millisecondsSinceEpoch >= sessionExpiresAt) {
       return TokenRefreshResult.rejected;
     }
-    if (!force && !_shouldRefreshAccessToken()) {
-      return TokenRefreshResult.success;
-    }
-
     try {
-      final url = await _accountApiServer();
-      final response = await flutter_http
-          .post(
-            Uri.parse('$url/api/token/refresh'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'refresh_token': refreshToken,
-              'id': await bind.mainGetMyId(),
-              'uuid': await bind.mainGetUuid(),
-            }),
-          )
-          .timeout(const Duration(seconds: 10));
-
-      if (refreshGeneration != _sessionGeneration) {
+      final id = await bind.mainGetMyId();
+      final uuid = await bind.mainGetUuid();
+      final currentUrl = await _accountApiServer();
+      if (generation != _sessionGeneration || currentUrl != configuredUrl) {
+        return TokenRefreshResult.rejected;
+      }
+      final request = flutter_http.Request(
+          'POST', Uri.parse('$requestUrl/api/token/refresh'))
+        ..followRedirects = false
+        ..headers['Content-Type'] = 'application/json'
+        ..body = jsonEncode({
+          'refresh_token': refreshToken,
+          'id': id,
+          'uuid': uuid,
+        });
+      final client = flutter_http.Client();
+      final flutter_http.Response response;
+      try {
+        response = await (() async {
+          final streamed = await client.send(request);
+          return flutter_http.Response.fromStream(streamed);
+        })()
+            .timeout(const Duration(seconds: 10));
+      } finally {
+        client.close();
+      }
+      final responseUrl = await _accountApiServer();
+      if (generation != _sessionGeneration || responseUrl != configuredUrl) {
         return TokenRefreshResult.rejected;
       }
 
@@ -540,11 +651,15 @@ class UserModel {
             (refreshed.refresh_token ?? '').isEmpty) {
           return TokenRefreshResult.unavailable;
         }
-        if (refreshGeneration != _sessionGeneration) {
+        if (generation != _sessionGeneration) {
           return TokenRefreshResult.rejected;
         }
-        await storeLoginSession(refreshed, generation: refreshGeneration);
-        if (refreshGeneration != _sessionGeneration) {
+        await storeLoginSession(refreshed,
+            expectedGeneration: generation, expectedServer: configuredUrl);
+        final storedServer = await _accountApiServer();
+        if (generation != _sessionGeneration ||
+            isSessionTransitioning ||
+            storedServer != configuredUrl) {
           return TokenRefreshResult.rejected;
         }
         debugPrint('UserModel: Access token refreshed');
@@ -569,15 +684,24 @@ class UserModel {
     }
   }
 
-  Future<void> storeLoginSession(LoginResponse response, {int? generation}) {
-    final expectedGeneration = generation ?? _sessionGeneration;
-    return _sessionWrites.run(() async {
-      if (expectedGeneration != _sessionGeneration) return;
-      await _storeLoginSession(response);
-    });
+  Future<void> storeLoginSession(
+    LoginResponse response, {
+    int? expectedGeneration,
+    String? expectedServer,
+  }) {
+    final generation = expectedGeneration ?? _sessionGeneration;
+    return _sessionWrites.run(() => _storeLoginSession(response,
+        generation: generation, expectedServer: expectedServer));
   }
 
-  Future<void> _storeLoginSession(LoginResponse response) async {
+  /// Runs inside the FIFO writer; calling the public wrapper here would enqueue
+  /// a nested operation and deadlock login/refresh publication.
+  Future<void> _storeLoginSession(
+    LoginResponse response, {
+    required int generation,
+    String? expectedServer,
+  }) async {
+    if (generation != _sessionGeneration) return;
     final accessToken = response.access_token ?? '';
     if (accessToken.isEmpty) return;
 
@@ -586,6 +710,11 @@ class UserModel {
     final sessionSeconds = response.session_expires_in ?? 0;
     final sessionExpiresAt =
         sessionSeconds > 0 ? now + sessionSeconds * 1000 : 0;
+    final server = await _accountApiServer();
+    if (generation != _sessionGeneration ||
+        (expectedServer != null && server != expectedServer)) {
+      return;
+    }
     if (isMobile && biometricLoginEnabled.value) {
       final user = response.user?.toJson() ?? getLocalUserInfo();
       if (user == null ||
@@ -596,18 +725,28 @@ class UserModel {
       await _biometricLogin.update(BiometricSession(
           refreshToken: response.refresh_token!,
           expiresAt: sessionExpiresAt,
-          apiServer: await _accountApiServer(),
+          apiServer: server,
           user: user));
+      if (generation != _sessionGeneration) return;
       _biometricRefreshToken = response.refresh_token;
     }
+    if (expectedServer != null) {
+      final currentServer = await _accountApiServer();
+      if (generation != _sessionGeneration || currentServer != expectedServer) {
+        return;
+      }
+    }
     await bind.mainSetLocalOption(key: 'access_token', value: accessToken);
+    if (generation != _sessionGeneration) return;
     await bind.mainSetLocalOption(
         key: _refreshTokenKey,
         value: biometricLoginEnabled.value ? '' : response.refresh_token ?? '');
+    if (generation != _sessionGeneration) return;
     await bind.mainSetLocalOption(
       key: _accessTokenExpiresAtKey,
       value: accessSeconds > 0 ? '${now + accessSeconds * 1000}' : '',
     );
+    if (generation != _sessionGeneration) return;
     await bind.mainSetLocalOption(
       key: _sessionExpiresAtKey,
       value: sessionSeconds > 0 ? '${now + sessionSeconds * 1000}' : '',
@@ -623,27 +762,33 @@ class UserModel {
     LoginResponse response, {
     required bool storeSession,
   }) async {
-    // A new login invalidates responses and refreshes from the previous session.
+    // A fresh login invalidates a purchase/refresh started by the old session,
+    // even when the account name is the same. Token rotation does not use this.
     final generation = ++_sessionGeneration;
-    _accessRefreshFuture = null;
+    _sessionTransition = generation;
     _sessionStatusFuture = null;
-    await _sessionWrites.run(() async {
-      if (generation != _sessionGeneration) return;
-      // A password/OIDC/2FA login starts a new account session. Require a new
-      // biometric opt-in instead of silently replacing the enrolled account.
-      final wasBiometric = biometricLoginEnabled.value;
-      if (isMobile) await _clearBiometricLogin();
-      if (storeSession || (isMobile && wasBiometric)) {
-        await _storeLoginSession(response);
-      }
-      if (generation != _sessionGeneration) return;
-      final user = response.user;
-      if (user == null) return;
-      await bind.mainSetLocalOption(key: 'user_info', value: jsonEncode(user));
-      if (generation != _sessionGeneration) return;
-      _lastLoginTime = DateTime.now();
-      _parseAndUpdateUser(user);
-    });
+    try {
+      await _sessionWrites.run(() async {
+        if (generation != _sessionGeneration) return;
+        // Require a new biometric opt-in after password/OIDC/2FA login rather
+        // than silently replacing the account enrolled in the native vault.
+        final wasBiometric = biometricLoginEnabled.value;
+        if (isMobile) await _clearBiometricLogin();
+        if (generation != _sessionGeneration) return;
+        if (storeSession || (isMobile && wasBiometric)) {
+          await _storeLoginSession(response, generation: generation);
+        }
+        if (generation != _sessionGeneration) return;
+        final user = response.user;
+        if (user == null) return;
+        await _storeUserInfo(user, generation: generation);
+        if (generation != _sessionGeneration) return;
+        _lastLoginTime = DateTime.now();
+        _parseAndUpdateUser(user);
+      });
+    } finally {
+      if (_sessionTransition == generation) _sessionTransition = null;
+    }
   }
 
   static Map<String, dynamic>? getLocalUserInfo() {
@@ -653,8 +798,8 @@ class UserModel {
     }
     try {
       return json.decode(userInfo);
-    } catch (e) {
-      debugPrint('Failed to get local user info "$userInfo": $e');
+    } catch (_) {
+      debugPrint('UserModel: Saved account information could not be decoded');
     }
     return null;
   }
@@ -670,45 +815,68 @@ class UserModel {
 
   Future<void> reset({bool resetOther = false}) async {
     final generation = ++_sessionGeneration;
-    if (isMobile && _biometricLoginBusy) await _biometricLogin.cancel();
-    await _sessionWrites.run(() async {
-      if (generation != _sessionGeneration) return;
-      await _resetSession(resetOther: resetOther);
-    });
-  }
-
-  Future<void> _resetSession({required bool resetOther}) async {
-    if (isMobile) await _clearBiometricLogin();
+    _sessionTransition = generation;
+    _sessionStatusFuture = null;
     debugPrint('UserModel.reset called with resetOther=$resetOther');
     debugPrint('UserModel.reset called from:');
     debugPrint(StackTrace.current.toString().split('\n').take(10).join('\n'));
-    await bind.mainSetLocalOption(key: 'access_token', value: '');
-    await bind.mainSetLocalOption(key: _refreshTokenKey, value: '');
-    await bind.mainSetLocalOption(key: _accessTokenExpiresAtKey, value: '');
-    await bind.mainSetLocalOption(key: _sessionExpiresAtKey, value: '');
-    await bind.mainSetLocalOption(key: 'user_info', value: '');
-    userName.value = '';
-    isAdmin.value = false;
-    _lastLoginTime = null;
-    membershipLevel.value = 'free';
-    userPkid.value = '';
-    if (resetOther) {
-      await gFFI.abModel.reset();
-      await gFFI.groupModel.reset();
+    try {
+      if (isMobile && _biometricLoginBusy) {
+        try {
+          await _biometricLogin.cancel();
+        } catch (_) {
+          // Native cancellation errors must not prevent explicit logout.
+        }
+      }
+      await _sessionWrites.run(() async {
+        if (generation != _sessionGeneration) return;
+        if (isMobile) await _clearBiometricLogin();
+        for (final key in [
+          'access_token',
+          _refreshTokenKey,
+          _accessTokenExpiresAtKey,
+          _sessionExpiresAtKey,
+          'user_info',
+        ]) {
+          if (generation != _sessionGeneration) return;
+          await bind.mainSetLocalOption(key: key, value: '');
+        }
+      });
+      if (generation != _sessionGeneration) return;
+      if (resetOther) {
+        await gFFI.abModel.reset();
+        if (generation != _sessionGeneration) return;
+        await gFFI.groupModel.reset();
+      }
+      if (generation != _sessionGeneration) return;
+      userName.value = '';
+      isAdmin.value = false;
+      _lastLoginTime = null;
+      membershipLevel.value = 'free';
+      userPkid.value = '';
+    } finally {
+      if (_sessionTransition == generation) _sessionTransition = null;
     }
   }
 
-  _parseAndUpdateUser(UserPayload user) {
+  /// The caller owns the FIFO writer and publishes only after this completes.
+  Future<void> _storeUserInfo(UserPayload user,
+      {required int generation}) async {
+    if (generation != _sessionGeneration) return;
+    await bind.mainSetLocalOption(key: 'user_info', value: jsonEncode(user));
+    if (isWeb && generation == _sessionGeneration) {
+      await bind.mainSetLocalOption(
+          key: 'verifier', value: user.verifier ?? '');
+    }
+  }
+
+  void _parseAndUpdateUser(UserPayload user) {
     userName.value = user.name;
     isAdmin.value = user.isAdmin;
     membershipLevel.value = user.membershipLevel;
     // userPkid: 새 값이 있으면 업데이트, 없으면 기존 값 유지
     if (user.userPkid.isNotEmpty) {
       userPkid.value = user.userPkid;
-    }
-    if (isWeb) {
-      // ugly here, tmp solution
-      bind.mainSetLocalOption(key: 'verifier', value: user.verifier ?? '');
     }
   }
 

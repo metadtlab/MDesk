@@ -923,7 +923,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   Widget buildHelpCards(String updateUrl) {
     // MDesk 업데이트 체크 - 새 버전이 있으면 표시
-    if (updateUrl.isNotEmpty && !isCardClosed) {
+    if (!isMacOS && updateUrl.isNotEmpty && !isCardClosed) {
       final latestVersion = stateGlobal.latestVersion.value;
       final appName = bind.mainGetAppNameSync();
 

@@ -20,7 +20,9 @@ import '../../consts.dart';
 import '../../models/model.dart';
 import '../../models/biometric_login.dart';
 import '../../models/platform_model.dart';
+import '../../utils/apple_billing.dart';
 import '../widgets/dialog.dart';
+import 'account_deletion_page.dart';
 import 'home_page_shared.dart';
 import 'scan_page.dart';
 
@@ -651,10 +653,18 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   }
                 },
               ),
+              if (isIOS)
+                SettingsTile(
+                  title: const Text('App Store 구독 및 구매 복원'),
+                  leading: const Icon(Icons.credit_card),
+                  onPressed: (context) => openAppleSubscriptionPage(context),
+                ),
               SettingsTile(
                 title: Text(translate('Account deletion request')),
                 leading: Icon(Icons.person_remove_outlined),
-                trailing: Icon(Icons.open_in_new, size: 20),
+                trailing: Icon(
+                    isIOS ? Icons.chevron_right : Icons.open_in_new,
+                    size: 20),
                 onPressed: _openAccountDeletion,
               ),
               if (isLoggedIn)
@@ -911,7 +921,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             SettingsTile(
               title: Text(translate("Privacy Statement")),
               onPressed: (context) =>
-                  launchUrlString('https://www.mdesk.co.kr/#privacy-policy'),
+                  launchUrlString('https://www.mdesk.co.kr/privacy-policy.html'),
               leading: Icon(Icons.privacy_tip),
             )
           ],
@@ -923,6 +933,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   }
 
   Future<void> _openAccountDeletion(BuildContext context) async {
+    if (isIOS) {
+      await Navigator.of(context).push(MaterialPageRoute<void>(
+        builder: (_) => const AccountDeletionPage(),
+      ));
+      return;
+    }
     try {
       if (await launchUrlString(_accountDeletionUrl,
           mode: LaunchMode.externalApplication)) {

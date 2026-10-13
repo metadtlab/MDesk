@@ -309,6 +309,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
   }
   // record
   if (!(isDesktop || isWeb) &&
+      !isIOS &&
       (ffi.recordingModel.start || (perms["recording"] != false))) {
     v.add(TTextMenu(
         child: Row(
